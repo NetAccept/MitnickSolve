@@ -111,6 +111,9 @@ struct Cli {
     /// Component trust store; defaults to trust.json next to the manifest.
     #[arg(long)]
     component_trust: Option<PathBuf>,
+    /// Run the component in this out-of-process host binary.
+    #[arg(long)]
+    component_host: Option<PathBuf>,
     /// Ask before executing commands in a session; allow runs them directly.
     #[arg(long, value_enum, default_value_t = Approvals::Ask)]
     approvals: Approvals,
@@ -1049,9 +1052,11 @@ fn provider_kind_str(kind: ProviderKind) -> &'static str {
 
 fn build_provider(cli: &Cli, demo: bool) -> Result<Box<dyn LlmProvider>> {
     if cli.provider != ProviderKind::Component
-        && (cli.component_manifest.is_some() || cli.component_trust.is_some())
+        && (cli.component_manifest.is_some()
+            || cli.component_trust.is_some()
+            || cli.component_host.is_some())
     {
-        bail!("--component-manifest/--component-trust require --provider component");
+        bail!("--component-* flags require --provider component");
     }
     Ok(match cli.provider {
         ProviderKind::Scripted => {
@@ -1080,7 +1085,11 @@ fn build_provider(cli: &Cli, demo: bool) -> Result<Box<dyn LlmProvider>> {
                     .unwrap_or_else(|| PathBuf::from("trust.json"))
             });
             let provider = msk_kernel::component::ComponentLlmProvider::load(
-                &msk_kernel::component::ComponentOptions { manifest, trust },
+                &msk_kernel::component::ComponentOptions {
+                    manifest,
+                    trust,
+                    host: cli.component_host.clone(),
+                },
             )
             .context("load component provider")?;
             Box::new(provider)

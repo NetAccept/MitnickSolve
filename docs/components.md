@@ -111,6 +111,7 @@ log line 8 KiB. The current host rejects activation on non-64-bit targets.
 msk --provider component \
   --component-manifest .msk/component/manifest.json \
   [--component-trust .msk/component/trust.json] \
+  [--component-host target/debug/msk-component-host] \
   --goal "solve the challenge" --envd target/debug/envd
 ```
 
@@ -120,12 +121,14 @@ rejects `provider=component` at `task.create`.
 
 ## Security boundary
 
-Signatures, hashes, ABI, and vtable checks are install gates, not a sandbox. An
-in-process component can read kernel memory, hang the turn thread, or abort the
-process. `thread_safety` does not grant concurrency. Use only first-party or
-audited components in-process; untrusted components require the future
-out-of-process host. Component configuration/secrets are not injected in this
-slice.
+Signatures, hashes, ABI, and vtable checks are install gates, not a sandbox.
+With `--component-host`, the component runs in `msk-component-host`; a component
+abort kills that child and the kernel receives a protocol error, as covered by
+the abort test. The host is still trusted code with process access and no
+restart policy, resource limits, or syscall sandbox; a hung call blocks the turn
+thread. In-process mode (no `--component-host`) can read kernel memory and abort
+the process. `thread_safety` does not grant concurrency. Component
+configuration/secrets are not injected in this slice.
 
 ## Test fixture
 
@@ -136,7 +139,7 @@ is for tests only.
 
 ## Remaining M2 work
 
-- Out-of-process component host with restart/containment.
+- Restart policy, resource limits, and syscall sandbox for the component host.
 - C header (`crates/msk-abi/include/msk_abi.h`) and cross-language conformance.
 - TOCTOU-hardened loading (memfd/`/proc/self/fd` on Linux, handle-based loading
   on Windows) and DLL search hardening.

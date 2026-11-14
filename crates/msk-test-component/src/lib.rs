@@ -103,6 +103,11 @@ unsafe extern "C" fn component_complete(
             unsafe { std::slice::from_raw_parts(request, request_len) }
         };
         let mode = detect_mode(request);
+        if mode == "abort" {
+            // Only used by the out-of-process host test; kills this host
+            // process, not the kernel.
+            std::process::exit(7);
+        }
         if mode == "panic" {
             panic!("test component panic");
         }
@@ -151,7 +156,14 @@ unsafe extern "C" fn component_complete(
 }
 
 fn detect_mode(request: &[u8]) -> &'static str {
-    for mode in ["empty", "oversize", "unregistered", "error", "panic"] {
+    for mode in [
+        "abort",
+        "empty",
+        "oversize",
+        "unregistered",
+        "error",
+        "panic",
+    ] {
         if request
             .windows(mode.len())
             .any(|window| window == mode.as_bytes())

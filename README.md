@@ -95,8 +95,9 @@ M0 scaffold plus the P1 session/turn slice:
   exactly once. `msk --provider component --component-manifest ...` uses a
   signed cdylib as the model provider; the kernel keeps an allocation ledger,
   copies and frees responses, serializes calls, and never unloads the library.
-  See [`docs/components.md`](docs/components.md). The out-of-process host is the
-  remaining M2 hardening step.
+  `--component-host <binary>` runs the same component in
+  `msk-component-host`, so a component abort kills only that process. See
+  [`docs/components.md`](docs/components.md).
 - Subagents: `spawn_agent` creates a headless child task and `agent_result`
   waits for its state/transcript. Both require `agent.spawn`; spawning is
   approval-gated by default, the child runs with delegated `approvals=allow`,
@@ -192,9 +193,12 @@ target/debug/msk --envd target/debug/envd --root .msk/component-cli \
   --goal "hello component"
 ```
 
-On Linux/macOS the artifact is `libmsk_test_component.so` / `.dylib`. The
-daemon accepts `--component-manifest` and `--component-trust` and forwards them
-to tasks created with `--provider component`. See
+Add `--component-host target/debug/msk-component-host` to isolate the component
+in a child process. The daemon accepts `--component-manifest`,
+`--component-trust`, and `--component-host` and forwards them to tasks created
+with `--provider component`.
+
+On Linux/macOS the artifact is `libmsk_test_component.so` / `.dylib`. See
 [`docs/components.md`](docs/components.md) for the ABI, ownership rules, limits,
 and security boundary.
 

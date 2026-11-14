@@ -1,14 +1,21 @@
 //! Kernel-side adapter for signed `llm.provider` components.
 
 use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use msk_core::ToolCall;
 use msk_llm::{LlmError, LlmProvider, LlmRequest, LlmResponse, Message, ToolSchema};
-use msk_loader::{ComponentManifest, LlmCallError, LlmInstance, LoadedComponent, TrustStore};
+use msk_loader::{
+    ComponentManifest, LlmCallError, LlmInstance, LoadedComponent, TrustStore, verify_component,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 
@@ -16,6 +23,9 @@ const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 pub struct ComponentOptions {
     pub manifest: PathBuf,
     pub trust: PathBuf,
+    /// Optional out-of-process host binary. When set, the component is loaded
+    /// and called in that process instead of the kernel.
+    pub host: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -38,8 +48,139 @@ struct WireResponse {
     usage_tokens: u64,
 }
 
+enum Backend {
+    InProcess(Mutex<LlmInstance>),
+    Process(Mutex<ProcessHost>),
+}
+
+impl Backend {
+    fn complete(&self, request: &[u8]) -> std::result::Result<Vec<u8>, LlmCallError> {
+        match self {
+            Self::InProcess(instance) => instance
+                .lock()
+                .map_err(|_| LlmCallError::Protocol("component call lock poisoned".into()))?
+                .complete(request),
+            Self::Process(process) => process
+                .lock()
+                .map_err(|_| LlmCallError::Protocol("component host lock poisoned".into()))?
+                .complete(request),
+        }
+    }
+}
+
+struct ProcessHost {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+impl ProcessHost {
+    fn spawn(
+        host: &std::path::Path,
+        manifest: &std::path::Path,
+        trust: &std::path::Path,
+    ) -> Result<Self> {
+        let mut command = Command::new(host);
+        command
+            .arg("--manifest")
+            .arg(manifest)
+            .arg("--trust")
+            .arg(trust)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = command.spawn().context("spawn component host")?;
+        let stdin = child.stdin.take().context("component host stdin")?;
+        let stdout = BufReader::new(child.stdout.take().context("component host stdout")?);
+        let mut host = Self {
+            child,
+            stdin,
+            stdout,
+            next_id: 0,
+        };
+        let ready = host.read_json().context("component host ready line")?;
+        if ready.get("type").and_then(Value::as_str) != Some("ready") {
+            bail!("component host did not become ready: {ready}");
+        }
+        if ready.get("ok").and_then(Value::as_bool) != Some(true) {
+            bail!(
+                "component host failed: {}",
+                ready
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+            );
+        }
+        Ok(host)
+    }
+
+    fn read_json(&mut self) -> Result<Value> {
+        let mut line = String::new();
+        let read = self.stdout.read_line(&mut line)?;
+        if read == 0 {
+            bail!("component host closed the stream");
+        }
+        serde_json::from_str(&line).context("component host JSON")
+    }
+
+    fn complete(&mut self, request: &[u8]) -> std::result::Result<Vec<u8>, LlmCallError> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let value = serde_json::json!({
+            "type": "complete",
+            "id": id,
+            "request_base64": BASE64.encode(request)
+        });
+        writeln!(self.stdin, "{value}")
+            .and_then(|_| self.stdin.flush())
+            .map_err(|error| LlmCallError::Protocol(format!("component host write: {error}")))?;
+        let response = self
+            .read_json()
+            .map_err(|error| LlmCallError::Protocol(format!("component host read: {error}")))?;
+        if response.get("type").and_then(Value::as_str) != Some("response")
+            || response.get("id").and_then(Value::as_u64) != Some(id)
+        {
+            return Err(LlmCallError::Protocol(format!(
+                "component host protocol: {response}"
+            )));
+        }
+        if response.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(LlmCallError::Protocol(format!(
+                "component host error: {}",
+                response
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+            )));
+        }
+        let encoded = response
+            .get("response_base64")
+            .and_then(Value::as_str)
+            .ok_or_else(|| LlmCallError::Protocol("component host omitted response".into()))?;
+        BASE64
+            .decode(encoded)
+            .map_err(|error| LlmCallError::Protocol(format!("component host response: {error}")))
+    }
+}
+
+impl Drop for ProcessHost {
+    fn drop(&mut self) {
+        let _ = writeln!(self.stdin, "{}", serde_json::json!({"type": "shutdown"}));
+        let _ = self.stdin.flush();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 pub struct ComponentLlmProvider {
-    instance: Mutex<LlmInstance>,
+    backend: Backend,
     id: String,
     manifest_id: String,
     version: String,
@@ -65,15 +206,31 @@ impl ComponentLlmProvider {
             .manifest
             .parent()
             .context("component manifest has no parent directory")?;
-        let loaded =
-            LoadedComponent::load(&manifest, &trust, base_dir).context("load signed component")?;
-        let manifest_id = loaded.id().to_string();
-        let version = loaded.version().to_string();
-        let instance = loaded
-            .into_llm_instance(std::collections::HashMap::new())
-            .context("initialize component")?;
+        let (backend, manifest_id, version) = if let Some(host) = &options.host {
+            verify_component(&manifest, &trust, base_dir).context("verify signed component")?;
+            let process = ProcessHost::spawn(host, &options.manifest, &options.trust)
+                .context("start component host")?;
+            (
+                Backend::Process(Mutex::new(process)),
+                manifest.component.id.clone(),
+                manifest.component.version.clone(),
+            )
+        } else {
+            let loaded = LoadedComponent::load(&manifest, &trust, base_dir)
+                .context("load signed component")?;
+            let manifest_id = loaded.id().to_string();
+            let version = loaded.version().to_string();
+            let instance = loaded
+                .into_llm_instance(std::collections::HashMap::new())
+                .context("initialize component")?;
+            (
+                Backend::InProcess(Mutex::new(instance)),
+                manifest_id,
+                version,
+            )
+        };
         Ok(Self {
-            instance: Mutex::new(instance),
+            backend,
             id: format!("component:{manifest_id}"),
             manifest_id,
             version,
@@ -105,15 +262,7 @@ impl LlmProvider for ComponentLlmProvider {
         };
         let bytes = serde_json::to_vec(&wire)
             .map_err(|err| LlmError::Protocol(format!("component request: {err}")))?;
-        let response_bytes = {
-            let instance = self
-                .instance
-                .lock()
-                .map_err(|_| LlmError::Provider("component call lock poisoned".into()))?;
-            instance
-                .complete(&bytes)
-                .map_err(|err| map_component_error(err))?
-        };
+        let response_bytes = self.backend.complete(&bytes).map_err(map_component_error)?;
         let response: WireResponse = serde_json::from_slice(&response_bytes)
             .map_err(|err| LlmError::Protocol(format!("component response JSON: {err}")))?;
         if response.schema_version != 1 {
@@ -175,7 +324,6 @@ fn map_component_error(error: LlmCallError) -> LlmError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use ed25519_dalek::{Signer, SigningKey};
     use msk_llm::Message;
@@ -235,15 +383,7 @@ mod tests {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
-    #[test]
-    fn loads_component_and_returns_a_response() {
-        let Some(artifact) = component_artifact() else {
-            if std::env::var("CI").is_ok() {
-                panic!("msk-test-component artifact is missing in CI");
-            }
-            eprintln!("msk-test-component artifact not built; skipping provider test");
-            return;
-        };
+    fn signed_fixture(artifact: &Path) -> (PathBuf, PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "msk-component-provider-{}",
             std::time::SystemTime::now()
@@ -254,9 +394,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file_name = artifact.file_name().unwrap().to_string_lossy().into_owned();
         let copied = dir.join(&file_name);
-        std::fs::copy(&artifact, &copied).unwrap();
+        std::fs::copy(artifact, &copied).unwrap();
         let bytes = std::fs::read(&copied).unwrap();
-
         let signing = SigningKey::from_bytes(&[9u8; 32]);
         let mut manifest = ComponentManifest {
             component: msk_loader::ComponentInfo {
@@ -289,10 +428,23 @@ mod tests {
             }
         });
         std::fs::write(&trust_path, serde_json::to_vec_pretty(&trust).unwrap()).unwrap();
+        (dir, manifest_path, trust_path)
+    }
 
+    #[test]
+    fn loads_component_and_returns_a_response() {
+        let Some(artifact) = component_artifact() else {
+            if std::env::var("CI").is_ok() {
+                panic!("msk-test-component artifact is missing in CI");
+            }
+            eprintln!("msk-test-component artifact not built; skipping provider test");
+            return;
+        };
+        let (dir, manifest_path, trust_path) = signed_fixture(&artifact);
         let provider = ComponentLlmProvider::load(&ComponentOptions {
             manifest: manifest_path,
             trust: trust_path,
+            host: None,
         })
         .unwrap();
         assert_eq!(provider.id(), "component:test.llm");
@@ -305,6 +457,66 @@ mod tests {
             .unwrap();
         assert!(response.text.contains("component hello"));
         assert!(response.tool_calls.is_empty());
+        drop(provider);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn component_host_binary() -> Option<PathBuf> {
+        let target = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .canonicalize()
+            .ok()?;
+        for name in ["msk-component-host.exe", "msk-component-host"] {
+            let candidate = target.join("debug").join(name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn out_of_process_host_isolates_a_component_abort() {
+        let Some(artifact) = component_artifact() else {
+            return;
+        };
+        let Some(host) = component_host_binary() else {
+            eprintln!("msk-component-host not built; skipping process host test");
+            return;
+        };
+        let (dir, manifest_path, trust_path) = signed_fixture(&artifact);
+        let provider = ComponentLlmProvider::load(&ComponentOptions {
+            manifest: manifest_path,
+            trust: trust_path,
+            host: Some(host),
+        })
+        .unwrap();
+        let response = provider
+            .complete(&LlmRequest {
+                messages: vec![Message::text("user", "hello component")],
+                tools: Vec::new(),
+                max_tokens: Some(64),
+            })
+            .unwrap();
+        assert!(response.text.contains("component hello"));
+        let error = provider
+            .complete(&LlmRequest {
+                messages: vec![Message::text("user", "abort the host")],
+                tools: Vec::new(),
+                max_tokens: Some(64),
+            })
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Protocol(_)), "{error}");
+        // The kernel survives; the next call reports the dead host, not a panic.
+        assert!(
+            provider
+                .complete(&LlmRequest {
+                    messages: vec![Message::text("user", "after abort")],
+                    tools: Vec::new(),
+                    max_tokens: Some(64),
+                })
+                .is_err()
+        );
         drop(provider);
         let _ = std::fs::remove_dir_all(dir);
     }

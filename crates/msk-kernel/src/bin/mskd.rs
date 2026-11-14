@@ -40,6 +40,9 @@ struct Cli {
     /// Trust store for the component manifest.
     #[arg(long)]
     component_trust: Option<PathBuf>,
+    /// Out-of-process component host binary.
+    #[arg(long)]
+    component_host: Option<PathBuf>,
     /// Directory containing tool manifests and WAT modules.
     #[arg(long, default_value = "tools/wasm")]
     tools_dir: PathBuf,
@@ -160,6 +163,7 @@ struct Daemon {
     envd_token: Option<String>,
     component_manifest: Option<PathBuf>,
     component_trust: Option<PathBuf>,
+    component_host: Option<PathBuf>,
     tools_dir: PathBuf,
     agent_bin: PathBuf,
     token: String,
@@ -205,6 +209,10 @@ fn main() -> Result<()> {
         .component_trust
         .as_ref()
         .map(|path| msk_ipc::normalize_root(path));
+    let component_host = cli
+        .component_host
+        .as_ref()
+        .map(|path| msk_ipc::normalize_root(path));
     let tools_dir = msk_ipc::normalize_root(&cli.tools_dir);
     if !tools_dir.exists() {
         bail!("tools directory not found: {}", tools_dir.display());
@@ -238,6 +246,7 @@ fn main() -> Result<()> {
         envd_token,
         component_manifest,
         component_trust,
+        component_host,
         tools_dir,
         agent_bin,
         token,
@@ -706,6 +715,9 @@ impl Daemon {
             }
             if let Some(trust) = &self.component_trust {
                 command.arg("--component-trust").arg(trust);
+            }
+            if let Some(host) = &self.component_host {
+                command.arg("--component-host").arg(host);
             }
         }
         if interactive {

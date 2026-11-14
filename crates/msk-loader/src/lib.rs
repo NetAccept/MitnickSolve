@@ -314,6 +314,21 @@ fn hex_digest(bytes: &[u8]) -> String {
     text
 }
 
+/// Verifies the signature, trust, artifact name, and artifact hash without
+/// loading code. Used for process-host mode and install-time checks.
+pub fn verify_component(
+    manifest: &ComponentManifest,
+    trust: &TrustStore,
+    base_dir: &Path,
+) -> Result<PathBuf, LoadError> {
+    trust.verify(manifest)?;
+    let artifact = manifest
+        .artifact
+        .as_ref()
+        .ok_or_else(|| LoadError::Manifest("artifact is required for activation".into()))?;
+    artifact.verify(base_dir)
+}
+
 /// A verified, loaded component library. Dropping it deliberately does not
 /// unload the library: `dlclose`/`FreeLibrary` after component code has run is
 /// unsafe and the architecture never unloads components.
@@ -336,12 +351,7 @@ impl LoadedComponent {
                 "component activation currently requires a 64-bit target".into(),
             ));
         }
-        trust.verify(manifest)?;
-        let artifact = manifest
-            .artifact
-            .as_ref()
-            .ok_or_else(|| LoadError::Manifest("artifact is required for activation".into()))?;
-        let path = artifact.verify(base_dir)?;
+        let path = verify_component(manifest, trust, base_dir)?;
 
         let library = ManuallyDrop::new(
             unsafe { libloading::Library::new(&path) }

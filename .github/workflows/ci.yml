@@ -66,6 +66,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo build -p msk-test-component
+          cargo build -p msk-loader --bin msk-component-host
           artifact=$(find target/debug -type f \
             \( -name 'libmsk_test_component*.so' -o -name 'libmsk_test_component*.dylib' -o -name 'msk_test_component*.dll' \) \
             | head -1)
@@ -80,6 +81,7 @@ jobs:
             --tools-dir tools/wasm \
             --component-manifest .msk/component-fixture/manifest.json \
             --component-trust .msk/component-fixture/trust.json \
+            --component-host target/debug/msk-component-host \
             >.msk/ci/daemon.log 2>&1 &
           daemon=$!
           trap 'kill "$daemon" 2>/dev/null || true' EXIT
