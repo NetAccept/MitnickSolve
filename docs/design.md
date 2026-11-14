@@ -470,6 +470,8 @@ export:  func(object: object-ref, new-label: string) -> result<object-ref, error
 - 大工具输出自动落为工件，模型只看到摘要与引用。
 - 工件可被多个任务引用；删除走引用计数。
 
+M0 实现：`msk-data::FileObjectStore` 落盘到 `<root>/artifacts/{objects,meta}`，对象 ID 为 SHA-256；`artifact_read` 支持 offset/limit，UTF-8 片段直接返回，二进制片段以 base64 返回。
+
 ### 10.7 数据面帧格式
 
 数据面是传输无关的帧协议，v2 支持三种绑定：

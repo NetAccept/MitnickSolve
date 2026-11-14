@@ -8,7 +8,7 @@ use base64::engine::general_purpose::STANDARD;
 use clap::{Parser, ValueEnum};
 use msk_core::context::{ContextLimits, ContextManager, Role, summarize_output};
 use msk_core::{Capability, DataLabel, ToolCall};
-use msk_data::{MemoryObjectStore, ObjectStore};
+use msk_data::{FileObjectStore, ObjectStore};
 use msk_events::{Event, EventSink, JsonlSink};
 use msk_kernel::policy;
 use msk_llm::{
@@ -85,7 +85,7 @@ struct Cli {
 /// M0 host bridge: the only native capability exposed to WASM tools.
 struct EnvHost {
     client: Mutex<EnvClient>,
-    artifacts: Arc<MemoryObjectStore>,
+    artifacts: Arc<dyn ObjectStore>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -108,13 +108,17 @@ impl EnvHost {
         let offset = args.offset.unwrap_or(0).min(bytes.len());
         let limit = args.limit.unwrap_or(64 * 1024).min(1024 * 1024);
         let end = offset.saturating_add(limit).min(bytes.len());
-        let data = String::from_utf8(bytes[offset..end].to_vec())
-            .map_err(|_| "artifact is not UTF-8 in M0".to_string())?;
+        let chunk = &bytes[offset..end];
+        let (data, encoding) = match std::str::from_utf8(chunk) {
+            Ok(text) => (text.to_string(), "utf8"),
+            Err(_) => (STANDARD.encode(chunk), "base64"),
+        };
         let response = json!({
             "id": args.id,
             "offset": offset,
             "next_offset": end,
             "eof": end >= bytes.len(),
+            "encoding": encoding,
             "data": data
         });
         serde_json::to_vec(&response).map_err(|err| err.to_string())
@@ -276,7 +280,8 @@ fn main() -> Result<()> {
     )?;
     emit(&sink, "file.write_large", large_write)?;
 
-    let object_store = Arc::new(MemoryObjectStore::new());
+    let object_store: Arc<dyn ObjectStore> =
+        Arc::new(FileObjectStore::open(cli.root.join("artifacts")).context("open artifact store")?);
     let env_host = Arc::new(EnvHost {
         client: Mutex::new(client),
         artifacts: object_store.clone(),
@@ -588,7 +593,7 @@ fn build_observation(
     _tool: &str,
     data: &Value,
     limits: &ContextLimits,
-    store: &MemoryObjectStore,
+    store: &dyn ObjectStore,
 ) -> Result<(String, Option<msk_core::ObjectRef>)> {
     let text = serde_json::to_string(data)?;
     if text.len() <= limits.inline_tool_bytes {

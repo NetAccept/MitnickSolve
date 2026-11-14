@@ -26,6 +26,9 @@ M0 scaffold:
   `msk-data` by hash and replaced with a head/tail summary plus an ObjectRef.
 - Artifact reads: the `artifact_read` tool (capability `artifact.read`) retrieves
   a slice of a stored output by ObjectRef.
+- Persistent artifact store: `msk-data::FileObjectStore` writes objects and
+  metadata under `.msk/artifacts`; IDs are SHA-256 and reads fall back to base64
+  for binary chunks.
 - OpenAI-compatible provider: `--provider openai` sends manifest-derived tool
   schemas to `/chat/completions`; `--provider openai-responses` uses the native
   Responses API function_call/function_call_output items. Scripted remains the
@@ -118,7 +121,7 @@ cargo run -p msk-tui -- --events .msk/events.jsonl
 | `crates/msk-abi` | C ABI definitions for kernel components |
 | `crates/msk-events` | Append-only event log |
 | `crates/msk-ipc` | Frontend JSON-RPC types |
-| `crates/msk-data` | Shared objects and views |
+| `crates/msk-data` | Content-addressed artifact store |
 | `crates/msk-llm` | LLM provider port and scripted provider |
 | `crates/msk-mcp` | MCP client and embedded stdio frame transport |
 | `crates/msk-wasm` | WASM tool runtime boundary (stub) |
