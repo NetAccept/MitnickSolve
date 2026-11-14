@@ -6,7 +6,9 @@ use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use clap::{Parser, ValueEnum};
-use msk_core::{Capability, ToolCall};
+use msk_core::context::{ContextLimits, ContextManager, Role, summarize_output};
+use msk_core::{Capability, DataLabel, ToolCall};
+use msk_data::{MemoryObjectStore, ObjectStore};
 use msk_events::{Event, EventSink, JsonlSink};
 use msk_kernel::policy;
 use msk_llm::{LlmError, LlmProvider, LlmRequest, LlmResponse, Message, ScriptedProvider};
@@ -38,6 +40,12 @@ struct Cli {
     /// Scripted agent demo to run.
     #[arg(long, value_enum, default_value_t = Demo::Session)]
     demo: Demo,
+    /// Approximate token budget for the agent context.
+    #[arg(long, default_value_t = 100_000)]
+    max_context_tokens: usize,
+    /// Minimum recent observations kept during compaction.
+    #[arg(long, default_value_t = 4)]
+    min_recent_observations: usize,
 }
 
 /// M0 host bridge: the only native capability exposed to WASM tools.
@@ -178,6 +186,20 @@ fn main() -> Result<()> {
     }
     println!("file roundtrip: ok ({} bytes)", decoded.len());
 
+    let large_content: String = (0..500).map(|index| format!("line-{index}\n")).collect();
+    let large_write = tool_data(
+        &mut client,
+        "write_file",
+        json!({
+            "env_id": env_id.clone(),
+            "path": "large.txt",
+            "data": STANDARD.encode(large_content.as_bytes()),
+            "atomic": true
+        }),
+        &sink,
+    )?;
+    emit(&sink, "file.write_large", large_write)?;
+
     let env_host = Arc::new(EnvHost {
         client: Mutex::new(client),
     });
@@ -194,17 +216,18 @@ fn main() -> Result<()> {
         json!({"tools": tool_names, "dir": cli.tools_dir.display().to_string()}),
     )?;
 
+    let context_limits = ContextLimits::default()
+        .with_max_tokens(cli.max_context_tokens)
+        .with_min_recent_observations(cli.min_recent_observations);
+    let mut context = ContextManager::new(context_limits.clone());
+    context.push_pinned(Role::User, "run the M0 agent demo");
+    context.push_pinned(Role::System, format!("env_id={env_id}"));
+    let object_store = MemoryObjectStore::new();
+
     let provider = ScriptedProvider::new("scripted", demo_responses(cli.demo));
-    let mut transcript = vec![Message {
-        role: "user".into(),
-        content: "run the M0 agent demo".into(),
-    }];
-    let request = LlmRequest {
-        messages: transcript.clone(),
-        tools: Vec::new(),
-        max_tokens: Some(512),
-    };
-    let mut response = provider.complete(&request).context("scripted LLM")?;
+    let mut response = provider
+        .complete(&llm_request(&context))
+        .context("scripted LLM")?;
     let mut last_session: Option<String> = None;
 
     loop {
@@ -217,10 +240,7 @@ fn main() -> Result<()> {
                 "usage_tokens": response.usage_tokens
             }),
         )?;
-        transcript.push(Message {
-            role: "assistant".into(),
-            content: response.text.clone(),
-        });
+        context.push(Role::Assistant, response.text.clone());
         if response.tool_calls.is_empty() {
             break;
         }
@@ -253,36 +273,76 @@ fn main() -> Result<()> {
             let value: Value =
                 serde_json::from_slice(&output).context("WASM tool returned non-JSON")?;
             let data = extract_data(&value)?;
+
+            let (observation, artifact) =
+                build_observation(&call.tool, &data, &context_limits, &object_store)?;
+            if let Some(object) = &artifact {
+                emit(
+                    &sink,
+                    "data.put",
+                    json!({
+                        "id": object.id,
+                        "bytes": object.size,
+                        "label": object.label,
+                        "hash": object.hash
+                    }),
+                )?;
+            }
             emit(
                 &sink,
                 "wasm.result",
-                json!({"tool": call.tool, "duration_ms": duration_ms, "data": data}),
+                json!({
+                    "tool": call.tool,
+                    "duration_ms": duration_ms,
+                    "artifact": artifact.as_ref().map(|object| object.id.clone()),
+                    "observation": observation.clone()
+                }),
             )?;
-            println!("[{}] {}", call.tool, serde_json::to_string(&data)?);
+            println!(
+                "[{}] {}",
+                call.tool,
+                summarize_output(&observation, 200, 80)
+            );
+            context.push_observation(&call.tool, observation);
 
             if call.tool == "session_create" {
                 last_session = data
                     .get("session_id")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                if last_session.is_none() {
+                if let Some(session) = &last_session {
+                    context.push_pinned(Role::System, format!("session_id={session}"));
+                } else {
                     bail!("session_create did not return session_id");
                 }
             } else if call.tool == "session_close" {
+                context.push_pinned(Role::System, "session_id=closed");
                 last_session = None;
             }
-
-            transcript.push(Message {
-                role: "user".into(),
-                content: format!("observation {}: {}", call.tool, data),
-            });
         }
 
-        match provider.complete(&LlmRequest {
-            messages: transcript.clone(),
-            tools: Vec::new(),
-            max_tokens: Some(512),
-        }) {
+        let removed = context.compact();
+        if removed > 0 {
+            emit(
+                &sink,
+                "context.compact",
+                json!({
+                    "removed": removed,
+                    "messages": context.messages().len(),
+                    "approx_tokens": context.approx_tokens()
+                }),
+            )?;
+        }
+        emit(
+            &sink,
+            "context.state",
+            json!({
+                "messages": context.messages().len(),
+                "approx_tokens": context.approx_tokens()
+            }),
+        )?;
+
+        match provider.complete(&llm_request(&context)) {
             Ok(next) => response = next,
             Err(LlmError::Exhausted) => break,
             Err(err) => return Err(err.into()),
@@ -323,6 +383,44 @@ fn load_registry(
     Ok(tools)
 }
 
+fn llm_request(context: &ContextManager) -> LlmRequest {
+    LlmRequest {
+        messages: context
+            .messages()
+            .iter()
+            .map(|message| Message {
+                role: message.role.as_llm_role().to_string(),
+                content: message.content.clone(),
+            })
+            .collect(),
+        tools: Vec::new(),
+        max_tokens: Some(512),
+    }
+}
+
+fn build_observation(
+    _tool: &str,
+    data: &Value,
+    limits: &ContextLimits,
+    store: &MemoryObjectStore,
+) -> Result<(String, Option<msk_core::ObjectRef>)> {
+    let text = serde_json::to_string(data)?;
+    if text.len() <= limits.inline_tool_bytes {
+        return Ok((text, None));
+    }
+    let object = store.put(text.as_bytes(), DataLabel::Derived)?;
+    let summary = summarize_output(&text, limits.summary_head_chars, limits.summary_tail_chars);
+    Ok((
+        format!(
+            "[artifact {} ({} bytes)] {}",
+            object.id,
+            text.len(),
+            summary
+        ),
+        Some(object),
+    ))
+}
+
 fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
     match demo {
         Demo::Echo => vec![
@@ -346,6 +444,11 @@ fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
                 "set MSK_DEMO=42 && echo !MSK_DEMO!"
             } else {
                 "MSK_DEMO=42; echo $MSK_DEMO"
+            };
+            let large_command = if cfg!(windows) {
+                "type large.txt"
+            } else {
+                "cat large.txt"
             };
             vec![
                 LlmResponse {
@@ -376,9 +479,18 @@ fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
                     usage_tokens: 10,
                 },
                 LlmResponse {
-                    text: "close the session".into(),
+                    text: "produce a large output".into(),
                     tool_calls: vec![ToolCall {
                         id: "c4".into(),
+                        tool: "session_exec".into(),
+                        args: json!({"session_id": "$SESSION", "command": large_command}),
+                    }],
+                    usage_tokens: 10,
+                },
+                LlmResponse {
+                    text: "close the session".into(),
+                    tool_calls: vec![ToolCall {
+                        id: "c5".into(),
                         tool: "session_close".into(),
                         args: json!({"session_id": "$SESSION"}),
                     }],

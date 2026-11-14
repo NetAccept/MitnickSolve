@@ -23,6 +23,7 @@ rust-version = "1.96"
 
 [workspace.dependencies]
 msk-core = { path = "crates/msk-core" }
+msk-data = { path = "crates/msk-data" }
 msk-events = { path = "crates/msk-events" }
 msk-llm = { path = "crates/msk-llm" }
 msk-mcp = { path = "crates/msk-mcp" }

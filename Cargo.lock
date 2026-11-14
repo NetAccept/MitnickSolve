@@ -909,6 +909,7 @@ dependencies = [
  "base64",
  "clap",
  "msk-core",
+ "msk-data",
  "msk-events",
  "msk-llm",
  "msk-mcp",

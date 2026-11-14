@@ -579,6 +579,8 @@ Created -> Planning -> Executing -> Waiting -> Reflecting -> Replanning
 - 在 70% 与 85% 预算处触发压缩；压缩由独立的小模型调用完成，输出固定结构，压缩前后上下文写事件日志。
 - 每层分别计量 token；TUI 提供上下文检查器，显示各层占用与被丢弃的内容。
 
+M0 实现：`msk-core::context::ContextManager` 负责 token 估算、pinned facts 与观察压缩；超过 2 KiB 的工具输出写入 `msk-data` 内容寻址工件存储，上下文只保留头尾数字摘要与 ObjectRef。事件 `data.put` 与 `context.state` 暴露给前端。
+
 ### 12.4 记忆
 
 | 类型 | 存储 | 内容 |

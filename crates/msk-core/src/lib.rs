@@ -1,5 +1,7 @@
 //! Domain types shared by the kernel, ports, and components.
 
+pub mod context;
+
 use std::collections::HashMap;
 use std::str::FromStr;
 

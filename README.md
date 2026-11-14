@@ -21,6 +21,9 @@ M0 scaffold:
 - Multi-turn scripted agent loop: each LLM turn can issue tool calls, observations
   feed the next turn. The default demo creates a session, runs commands, verifies
   shell state, and closes it through WASM + manifest policy.
+- Context budgeting and artifacts: `msk-core::context` tracks tokens, pins key
+  facts, and compacts old observations; outputs above 2 KiB are stored in
+  `msk-data` by hash and replaced with a head/tail summary plus an ObjectRef.
 - Scripted LLM provider exercising LLM -> tool call -> WASM -> host bridge -> envd;
   `exec.session` is granted by the kernel and checked in `EnvHost`.
 - Real streaming providers, session/PTY, and service-mode envd are next.
@@ -56,6 +59,10 @@ tool boundary:
 ```sh
 cargo run -p msk-kernel --bin msk -- --envd target/debug/envd --root .msk --demo echo
 ```
+
+The context budget defaults to 100k tokens; pass `--max-context-tokens 32000`
+to exercise compaction. Large session output is stored as a `data.put` artifact
+and summarized in the transcript.
 
 Benchmarks:
 
