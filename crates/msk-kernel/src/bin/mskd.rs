@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -39,6 +39,7 @@ struct Cli {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskState {
     Running,
+    WaitingInput,
     Done,
     Failed,
     Cancelled,
@@ -48,6 +49,7 @@ impl TaskState {
     fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::WaitingInput => "waiting_input",
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -60,10 +62,15 @@ struct Task {
     goal: String,
     demo: String,
     provider: String,
+    interactive: bool,
+    stream: bool,
     state: TaskState,
     dir: PathBuf,
     child: Arc<Mutex<Option<Child>>>,
+    input: Arc<Mutex<Option<ChildStdin>>>,
     events: u64,
+    turns: u64,
+    last_error: Option<String>,
     created_ms: u128,
 }
 
@@ -74,9 +81,13 @@ impl Task {
             "goal": self.goal,
             "demo": self.demo,
             "provider": self.provider,
+            "interactive": self.interactive,
+            "stream": self.stream,
             "state": self.state.as_str(),
             "dir": self.dir.display().to_string(),
             "events": self.events,
+            "turns": self.turns,
+            "last_error": self.last_error,
             "created_ms": self.created_ms
         })
     }
@@ -216,6 +227,7 @@ fn handle_client(stream: Stream, daemon: Arc<Daemon>) -> Result<()> {
 
     let mut reader = BufReader::new(reader_stream);
     let mut subscriptions = Vec::new();
+    let mut authenticated = false;
     while let Some(value) = msk_ipc::read_json_line(&mut reader)? {
         let request: RpcRequest = match serde_json::from_value(value) {
             Ok(request) => request,
@@ -224,7 +236,7 @@ fn handle_client(stream: Stream, daemon: Arc<Daemon>) -> Result<()> {
                 continue;
             }
         };
-        let (response, subscription) = daemon.handle(request, &event_tx);
+        let (response, subscription) = daemon.handle(request, &event_tx, &mut authenticated);
         if let Some(id) = subscription {
             subscriptions.push(id);
         }
@@ -248,25 +260,32 @@ impl Daemon {
         self: &Arc<Self>,
         request: RpcRequest,
         tx: &mpsc::Sender<Value>,
+        authenticated: &mut bool,
     ) -> (RpcResponse, Option<u64>) {
         let id = request.id;
+        let method = request.method;
         let params = request.params;
-        match request.method.as_str() {
+        if method != methods::HELLO && !*authenticated {
+            return (RpcResponse::err(id, -32001, "unauthorized"), None);
+        }
+        match method.as_str() {
             methods::HELLO => {
                 let token = params
                     .get("token")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if token != self.token {
+                if !token_eq(token, &self.token) {
+                    *authenticated = false;
                     return (RpcResponse::err(id, -32001, "unauthorized"), None);
                 }
+                *authenticated = true;
                 (
                     RpcResponse::ok(
                         id,
                         json!({
                             "protocol": msk_ipc::IPC_PROTOCOL_VERSION,
                             "server": "mskd",
-                            "capabilities": ["tasks", "events", "approvals"]
+                            "capabilities": ["tasks", "events", "sessions", "approvals", "terminal"]
                         }),
                     ),
                     None,
@@ -288,9 +307,31 @@ impl Daemon {
                     .and_then(Value::as_str)
                     .unwrap_or("scripted")
                     .to_string();
-                match self.create_task(goal, demo, provider) {
+                let interactive = params
+                    .get("interactive")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let stream = params
+                    .get("stream")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                match self.create_task(goal, demo, provider, interactive, stream) {
                     Ok(snapshot) => (RpcResponse::ok(id, snapshot), None),
                     Err(err) => (RpcResponse::err(id, -32000, err.to_string()), None),
+                }
+            }
+            methods::TASK_MESSAGE => {
+                let task_id = params
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let text = params
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                match self.message_task(task_id, text) {
+                    Ok(snapshot) => (RpcResponse::ok(id, snapshot), None),
+                    Err(err) => (RpcResponse::err(id, -32002, err.to_string()), None),
                 }
             }
             methods::TASK_LIST => {
@@ -328,6 +369,16 @@ impl Daemon {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 match self.cancel_task(task_id) {
+                    Ok(snapshot) => (RpcResponse::ok(id, snapshot), None),
+                    Err(err) => (RpcResponse::err(id, -32002, err.to_string()), None),
+                }
+            }
+            methods::TASK_INTERRUPT => {
+                let task_id = params
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                match self.interrupt_task(task_id) {
                     Ok(snapshot) => (RpcResponse::ok(id, snapshot), None),
                     Err(err) => (RpcResponse::err(id, -32002, err.to_string()), None),
                 }
@@ -390,20 +441,32 @@ impl Daemon {
         goal: String,
         demo: String,
         provider: String,
+        interactive: bool,
+        stream: bool,
     ) -> Result<Value> {
-        let id = format!("task-{}", self.next_task.fetch_add(1, Ordering::SeqCst));
+        let id = format!(
+            "task-{}-{}",
+            now_ms(),
+            self.next_task.fetch_add(1, Ordering::SeqCst)
+        );
         let dir = self.root.join("tasks").join(&id);
         fs::create_dir_all(&dir)?;
         let child = Arc::new(Mutex::new(None));
+        let input = Arc::new(Mutex::new(None));
         let task = Task {
             id: id.clone(),
             goal,
             demo,
             provider,
+            interactive,
+            stream,
             state: TaskState::Running,
             dir,
             child: child.clone(),
+            input: input.clone(),
             events: 0,
+            turns: 0,
+            last_error: None,
             created_ms: now_ms(),
         };
         let snapshot = task.snapshot();
@@ -419,7 +482,7 @@ impl Daemon {
     }
 
     fn run_task(self: Arc<Self>, task_id: String) {
-        let (dir, goal, demo, provider, child_handle) = {
+        let (dir, goal, demo, provider, interactive, stream, child_handle, input_handle) = {
             let inner = match self.inner.lock() {
                 Ok(inner) => inner,
                 Err(_) => return,
@@ -430,7 +493,10 @@ impl Daemon {
                     task.goal.clone(),
                     task.demo.clone(),
                     task.provider.clone(),
+                    task.interactive,
+                    task.stream,
                     task.child.clone(),
+                    task.input.clone(),
                 ),
                 None => return,
             }
@@ -456,22 +522,63 @@ impl Daemon {
             .arg(&dir)
             .arg("--tools-dir")
             .arg(&self.tools_dir)
-            .arg("--demo")
-            .arg(&demo)
+            .arg("--wasm")
+            .arg(self.tools_dir.join("exec.wat"))
             .arg("--provider")
-            .arg(&provider)
-            .arg("--goal")
-            .arg(&goal)
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr));
-        let child = match command.spawn() {
+            .arg(&provider);
+        if interactive {
+            command
+                .arg("--session")
+                .arg("--stdio-json")
+                .arg("--task-id")
+                .arg(&task_id)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            if stream {
+                command.arg("--stream");
+            }
+        } else {
+            command
+                .arg("--demo")
+                .arg(&demo)
+                .arg("--goal")
+                .arg(&goal)
+                .stdout(Stdio::null());
+        }
+        command.stderr(Stdio::from(stderr));
+
+        let mut child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
                 self.finish_task(&task_id, TaskState::Failed, Some(err.to_string()));
                 return;
             }
         };
-        if let Ok(mut slot) = child_handle.lock() {
+
+        if interactive {
+            let stdout = match child.stdout.take() {
+                Some(stdout) => stdout,
+                None => {
+                    let _ = child.kill();
+                    self.finish_task(
+                        &task_id,
+                        TaskState::Failed,
+                        Some("agent stdout unavailable".into()),
+                    );
+                    return;
+                }
+            };
+            if let Ok(mut slot) = input_handle.lock() {
+                *slot = child.stdin.take();
+            }
+            if let Ok(mut slot) = child_handle.lock() {
+                *slot = Some(child);
+            }
+            let daemon = self.clone();
+            let reader_task = task_id.clone();
+            thread::spawn(move || daemon.read_agent_stdout(&reader_task, stdout));
+            self.set_state(&task_id, TaskState::WaitingInput, None);
+        } else if let Ok(mut slot) = child_handle.lock() {
             *slot = Some(child);
         }
 
@@ -499,22 +606,39 @@ impl Daemon {
             };
 
             if let Some(result) = status {
-                let error = result.as_ref().err().cloned();
-                let cancelled = self
+                let (cancelled, last_error) = self
                     .inner
                     .lock()
                     .ok()
-                    .and_then(|inner| inner.tasks.get(&task_id).map(|task| task.state))
-                    == Some(TaskState::Cancelled);
+                    .and_then(|inner| {
+                        inner.tasks.get(&task_id).map(|task| {
+                            (task.state == TaskState::Cancelled, task.last_error.clone())
+                        })
+                    })
+                    .unwrap_or((false, None));
+                let mut error = result.as_ref().err().cloned();
                 let state = if cancelled {
                     TaskState::Cancelled
                 } else {
                     match &result {
-                        Ok(status) if status.success() => TaskState::Done,
+                        Ok(status) if status.success() && !interactive => TaskState::Done,
+                        Ok(status) if status.success() => {
+                            // A session that exited after an error is still a
+                            // failed task, even if the process returned 0.
+                            if last_error.is_some() {
+                                error = last_error;
+                                TaskState::Failed
+                            } else {
+                                TaskState::Done
+                            }
+                        }
                         _ => TaskState::Failed,
                     }
                 };
                 if let Ok(mut slot) = child_handle.lock() {
+                    *slot = None;
+                }
+                if let Ok(mut slot) = input_handle.lock() {
                     *slot = None;
                 }
                 self.finish_task(&task_id, state, error);
@@ -523,6 +647,240 @@ impl Daemon {
 
             thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    /// Reads the strict stdout protocol of an interactive agent. Anything
+    /// that is not protocol JSON is logged to the daemon's stderr instead of
+    /// being forwarded, so a stray `println!` cannot corrupt the channel.
+    fn read_agent_stdout(&self, task_id: &str, stdout: std::process::ChildStdout) {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => break,
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = match serde_json::from_str(&line) {
+                Ok(value) => value,
+                Err(err) => {
+                    eprintln!("mskd task {task_id}: non-protocol stdout ({err}): {line}");
+                    continue;
+                }
+            };
+            match value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+            {
+                "agent.text" => {
+                    let notification = serde_json::to_value(RpcNotification::new(
+                        "agent.text",
+                        json!({
+                            "task_id": task_id,
+                            "text": value.get("text").cloned().unwrap_or(Value::Null),
+                            "delta": value.get("delta").and_then(Value::as_bool).unwrap_or(false)
+                        }),
+                    ))
+                    .unwrap_or(Value::Null);
+                    self.broadcast(notification, task_id);
+                }
+                "turn.end" => {
+                    let status = value
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("awaiting_input");
+                    let message = value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let snapshot = self.record_turn_end(task_id, status, message.clone());
+                    let notification = serde_json::to_value(RpcNotification::new(
+                        "turn.end",
+                        json!({
+                            "task_id": task_id,
+                            "status": status,
+                            "turns": snapshot.as_ref().and_then(|snapshot| snapshot.get("turns")).cloned().unwrap_or(Value::Null),
+                            "message": message
+                        }),
+                    ))
+                    .unwrap_or(Value::Null);
+                    self.broadcast(notification, task_id);
+                }
+                "error" => {
+                    eprintln!("mskd task {task_id}: agent protocol error: {value}");
+                }
+                "pong" => {}
+                other => {
+                    eprintln!("mskd task {task_id}: unknown protocol frame: {other}");
+                }
+            }
+        }
+    }
+
+    fn interrupt_task(&self, task_id: &str) -> Result<Value> {
+        let (input, snapshot, running) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("task map poisoned"))?;
+            let task = inner
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            if !task.interactive {
+                bail!("task {task_id} is not interactive");
+            }
+            match task.state {
+                TaskState::WaitingInput => (None, task.snapshot(), false),
+                TaskState::Running => (Some(task.input.clone()), task.snapshot(), true),
+                TaskState::Done | TaskState::Failed => bail!("task {task_id} has exited"),
+                TaskState::Cancelled => bail!("task {task_id} is cancelled"),
+            }
+        };
+
+        if !running {
+            let mut snapshot = snapshot;
+            snapshot["interrupted"] = json!(false);
+            return Ok(snapshot);
+        }
+
+        let write_result = (|| -> Result<()> {
+            let input =
+                input.ok_or_else(|| anyhow::anyhow!("task {task_id} stdin is not available"))?;
+            let mut slot = input
+                .lock()
+                .map_err(|_| anyhow::anyhow!("task input poisoned"))?;
+            let stdin = slot
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("task {task_id} stdin is not available"))?;
+            writeln!(stdin, "{}", json!({"type": "interrupt"}))?;
+            stdin.flush()?;
+            Ok(())
+        })();
+        if let Err(err) = write_result {
+            self.set_state(task_id, TaskState::Failed, Some(err.to_string()));
+            return Err(err);
+        }
+        let mut snapshot = snapshot;
+        snapshot["interrupted"] = json!(true);
+        Ok(snapshot)
+    }
+
+    fn message_task(&self, task_id: &str, text: &str) -> Result<Value> {
+        if text.trim().is_empty() {
+            bail!("message text is empty");
+        }
+        let (input, snapshot) = {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("task map poisoned"))?;
+            let task = inner
+                .tasks
+                .get_mut(task_id)
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            if !task.interactive {
+                bail!("task {task_id} is not interactive");
+            }
+            match task.state {
+                TaskState::Running => bail!("task {task_id} is still running a turn"),
+                TaskState::Done | TaskState::Failed => bail!("task {task_id} has exited"),
+                TaskState::Cancelled => bail!("task {task_id} is cancelled"),
+                TaskState::WaitingInput => {}
+            }
+            task.state = TaskState::Running;
+            task.last_error = None;
+            (task.input.clone(), task.snapshot())
+        };
+
+        let line = serde_json::to_string(&json!({"type": "user", "text": text}))?;
+        let write_result = (|| -> Result<()> {
+            let mut slot = input
+                .lock()
+                .map_err(|_| anyhow::anyhow!("task input poisoned"))?;
+            let Some(stdin) = slot.as_mut() else {
+                drop(slot);
+                self.set_state(
+                    task_id,
+                    TaskState::WaitingInput,
+                    Some("task stdin is not available".into()),
+                );
+                bail!("task {task_id} stdin is not available");
+            };
+            writeln!(stdin, "{line}")?;
+            stdin.flush()?;
+            Ok(())
+        })();
+        if let Err(err) = write_result {
+            if self
+                .inner
+                .lock()
+                .ok()
+                .and_then(|inner| inner.tasks.get(task_id).map(|task| task.state))
+                != Some(TaskState::WaitingInput)
+            {
+                self.set_state(task_id, TaskState::Failed, Some(err.to_string()));
+            }
+            return Err(err);
+        }
+        self.broadcast_state(task_id, &snapshot);
+        let notification = serde_json::to_value(RpcNotification::new(
+            "task.message",
+            json!({"task_id": task_id, "text": text}),
+        ))
+        .unwrap_or(Value::Null);
+        self.broadcast(notification, task_id);
+        Ok(snapshot)
+    }
+
+    fn record_turn_end(
+        &self,
+        task_id: &str,
+        status: &str,
+        message: Option<String>,
+    ) -> Option<Value> {
+        let snapshot = {
+            let mut inner = self.inner.lock().ok()?;
+            let task = inner.tasks.get_mut(task_id)?;
+            match task.state {
+                TaskState::Done | TaskState::Failed | TaskState::Cancelled => return None,
+                TaskState::Running | TaskState::WaitingInput => {}
+            }
+            task.turns += 1;
+            task.state = TaskState::WaitingInput;
+            if status == "awaiting_input" {
+                task.last_error = None;
+            } else {
+                task.last_error = message;
+            }
+            task.snapshot()
+        };
+        self.broadcast_state(task_id, &snapshot);
+        Some(snapshot)
+    }
+
+    fn set_state(&self, task_id: &str, state: TaskState, error: Option<String>) {
+        let snapshot = {
+            let mut inner = match self.inner.lock() {
+                Ok(inner) => inner,
+                Err(_) => return,
+            };
+            match inner.tasks.get_mut(task_id) {
+                Some(task) => {
+                    if task.state != TaskState::Cancelled {
+                        task.state = state;
+                        if let Some(error) = error {
+                            task.last_error = Some(error);
+                        }
+                    }
+                    task.snapshot()
+                }
+                None => return,
+            }
+        };
+        self.broadcast_state(task_id, &snapshot);
     }
 
     fn tail_events(&self, task_id: &str, path: &Path, mut offset: u64) -> u64 {
@@ -831,7 +1189,7 @@ fn handle_data_client(stream: Stream, daemon: Arc<Daemon>) -> Result<()> {
         .get("token")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if token != daemon.token {
+    if !token_eq(token, &daemon.token) {
         send_data_error(&writer, "unauthorized");
         return Ok(());
     }
@@ -1035,9 +1393,36 @@ fn send_data_error(writer: &Arc<Mutex<Stream>>, message: &str) {
     }
 }
 
+fn token_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (left, right) in left.iter().zip(right) {
+        difference |= left ^ right;
+    }
+    difference == 0
+}
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_comparison_is_exact() {
+        assert!(token_eq("abc", "abc"));
+        assert!(!token_eq("abc", "abd"));
+        assert!(!token_eq("abc", "ab"));
+        assert!(!token_eq("", "x"));
+        assert!(token_eq("", ""));
+    }
 }

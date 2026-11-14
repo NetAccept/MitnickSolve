@@ -34,7 +34,22 @@ enum Command {
         demo: String,
         #[arg(long, default_value = "scripted")]
         provider: String,
+        /// Keep the agent session alive and accept task.message calls.
+        #[arg(long)]
+        interactive: bool,
+        /// Ask the agent to stream text deltas.
+        #[arg(long)]
+        stream: bool,
     },
+    /// Send a user message to an interactive task.
+    Send {
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        text: String,
+    },
+    /// Cooperatively interrupt the running turn of an interactive task.
+    Interrupt { task: String },
     /// Print one task snapshot.
     State { task: String },
     /// Cancel a running task.
@@ -112,11 +127,30 @@ fn main() -> Result<()> {
             goal,
             demo,
             provider,
+            interactive,
+            stream,
         } => {
             let result = client.request(
                 methods::TASK_CREATE,
-                json!({"goal": goal, "demo": demo, "provider": provider}),
+                json!({
+                    "goal": goal,
+                    "demo": demo,
+                    "provider": provider,
+                    "interactive": interactive,
+                    "stream": stream
+                }),
             )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::Send { task, text } => {
+            let result = client.request(
+                methods::TASK_MESSAGE,
+                json!({"task_id": task, "text": text}),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::Interrupt { task } => {
+            let result = client.request(methods::TASK_INTERRUPT, json!({"task_id": task}))?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::State { task } => {

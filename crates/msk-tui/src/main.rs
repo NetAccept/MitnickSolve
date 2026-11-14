@@ -21,12 +21,66 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap};
 use serde_json::{Value, json};
 use unicode_width::UnicodeWidthStr;
 
 const MAX_EVENTS: usize = 5000;
 const MAX_DETAIL_LINES: usize = 400;
+const MAX_CHAT_LINES: usize = 4000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatRole {
+    User,
+    Assistant,
+    System,
+}
+
+#[derive(Debug, Clone)]
+struct ChatLine {
+    task_id: String,
+    role: ChatRole,
+    text: String,
+    streaming: bool,
+}
+
+fn append_agent_text(chat: &mut Vec<ChatLine>, task_id: &str, text: &str, delta: bool) {
+    if task_id.is_empty() || text.is_empty() {
+        return;
+    }
+    if delta {
+        if let Some(line) = chat.iter_mut().rev().find(|line| {
+            line.task_id == task_id && line.role == ChatRole::Assistant && line.streaming
+        }) {
+            line.text.push_str(text);
+        } else {
+            chat.push(ChatLine {
+                task_id: task_id.to_string(),
+                role: ChatRole::Assistant,
+                text: text.to_string(),
+                streaming: true,
+            });
+        }
+    } else {
+        chat.push(ChatLine {
+            task_id: task_id.to_string(),
+            role: ChatRole::Assistant,
+            text: text.to_string(),
+            streaming: false,
+        });
+    }
+}
+
+fn finish_streaming(chat: &mut [ChatLine], task_id: &str) {
+    if let Some(line) = chat
+        .iter_mut()
+        .rev()
+        .find(|line| line.task_id == task_id && line.role == ChatRole::Assistant && line.streaming)
+    {
+        line.streaming = false;
+    }
+}
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -444,6 +498,10 @@ struct DaemonApp {
     tasks: Vec<Value>,
     selected_task: usize,
     events: Vec<(String, Event)>,
+    chat: Vec<ChatLine>,
+    composing: bool,
+    input: String,
+    input_cursor: usize,
     terminal: Option<TerminalView>,
     terminal_data: Option<DataClient>,
     terminal_size: Cell<(u16, u16)>,
@@ -467,6 +525,10 @@ impl DaemonApp {
             tasks: Vec::new(),
             selected_task: 0,
             events: Vec::new(),
+            chat: Vec::new(),
+            composing: false,
+            input: String::new(),
+            input_cursor: 0,
             terminal: None,
             terminal_data: None,
             terminal_size: Cell::new((0, 0)),
@@ -522,11 +584,83 @@ impl DaemonApp {
                             .get("task_id")
                             .and_then(Value::as_str)
                             .unwrap_or_default();
+                        let state = snapshot
+                            .get("state")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let finished = matches!(state, "failed" | "done" | "cancelled");
                         if let Some(existing) = self.tasks.iter_mut().find(|task| {
                             task.get("task_id").and_then(Value::as_str) == Some(task_id)
                         }) {
                             *existing = snapshot.clone();
                         }
+                        if finished {
+                            finish_streaming(&mut self.chat, task_id);
+                        }
+                    }
+                }
+                Some("task.message") => {
+                    let params = value.get("params").cloned().unwrap_or(Value::Null);
+                    let task_id = params
+                        .get("task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let text = params.get("text").and_then(Value::as_str).unwrap_or("");
+                    if !task_id.is_empty() && !text.is_empty() {
+                        self.chat.push(ChatLine {
+                            task_id,
+                            role: ChatRole::User,
+                            text: text.to_string(),
+                            streaming: false,
+                        });
+                        self.trim_chat();
+                    }
+                }
+                Some("agent.text") => {
+                    let params = value.get("params").cloned().unwrap_or(Value::Null);
+                    let task_id = params
+                        .get("task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let text = params.get("text").and_then(Value::as_str).unwrap_or("");
+                    let delta = params
+                        .get("delta")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    append_agent_text(&mut self.chat, &task_id, text, delta);
+                    self.trim_chat();
+                }
+                Some("turn.end") => {
+                    let params = value.get("params").cloned().unwrap_or(Value::Null);
+                    let task_id = params
+                        .get("task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let status = params
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("awaiting_input");
+                    finish_streaming(&mut self.chat, &task_id);
+                    if status != "awaiting_input" {
+                        let message = params
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let text = if message.is_empty() {
+                            format!("[{status}]")
+                        } else {
+                            format!("[{status}] {message}")
+                        };
+                        self.chat.push(ChatLine {
+                            task_id,
+                            role: ChatRole::System,
+                            text,
+                            streaming: false,
+                        });
+                        self.trim_chat();
                     }
                 }
                 _ => {}
@@ -611,13 +745,131 @@ impl DaemonApp {
             .collect()
     }
 
-    fn selected_event(&self) -> Option<&Event> {
-        let task_id = self.selected_task_id()?;
-        self.events
-            .iter()
-            .rev()
-            .find(|(id, _)| *id == task_id)
-            .map(|(_, event)| event)
+    fn selected_state(&self) -> &str {
+        self.tasks
+            .get(self.selected_task)
+            .and_then(|task| task.get("state"))
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+    }
+
+    fn trim_chat(&mut self) {
+        if self.chat.len() > MAX_CHAT_LINES {
+            let excess = self.chat.len() - MAX_CHAT_LINES;
+            self.chat.drain(0..excess);
+        }
+    }
+
+    fn enter_compose(&mut self) {
+        if self.selected_task_id().is_none() {
+            self.status = "no task selected".into();
+            return;
+        }
+        self.composing = true;
+        self.status = "message: Enter sends, Esc leaves the editor".into();
+    }
+
+    fn send_message(&mut self) {
+        let Some(task_id) = self.selected_task_id() else {
+            self.status = "no task selected".into();
+            return;
+        };
+        if self.input.trim().is_empty() {
+            return;
+        }
+        let text = self.input.clone();
+        match self.client.request(
+            methods::TASK_MESSAGE,
+            json!({"task_id": task_id, "text": text}),
+        ) {
+            Ok(_) => {
+                self.input.clear();
+                self.input_cursor = 0;
+                self.status = "message sent".into();
+            }
+            Err(err) => self.status = format!("send failed: {err}"),
+        }
+    }
+
+    fn interrupt_task(&mut self) {
+        let Some(task_id) = self.selected_task_id() else {
+            self.status = "no task selected".into();
+            return;
+        };
+        match self
+            .client
+            .request(methods::TASK_INTERRUPT, json!({"task_id": task_id}))
+        {
+            Ok(snapshot) => {
+                if snapshot
+                    .get("interrupted")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    self.status = format!("interrupt sent to {task_id}");
+                } else {
+                    self.status = format!("{task_id} is not running a turn");
+                }
+            }
+            Err(err) => self.status = format!("interrupt failed: {err}"),
+        }
+    }
+
+    fn compose_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c') => {
+                    self.composing = false;
+                    self.input.clear();
+                    self.input_cursor = 0;
+                    self.status = "message cancelled".into();
+                }
+                KeyCode::Char('u') => {
+                    self.input.clear();
+                    self.input_cursor = 0;
+                }
+                _ => {}
+            }
+            return false;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.composing = false;
+                self.status = "editor closed".into();
+            }
+            KeyCode::Enter => self.send_message(),
+            KeyCode::Backspace => {
+                if let Some((index, _)) = self.input[..self.input_cursor].char_indices().last() {
+                    self.input.remove(index);
+                    self.input_cursor = index;
+                }
+            }
+            KeyCode::Delete => {
+                if self.input_cursor < self.input.len() {
+                    self.input.remove(self.input_cursor);
+                }
+            }
+            KeyCode::Left => {
+                if let Some((index, _)) = self.input[..self.input_cursor].char_indices().last() {
+                    self.input_cursor = index;
+                }
+            }
+            KeyCode::Right => {
+                if let Some(character) = self.input[self.input_cursor..].chars().next() {
+                    self.input_cursor += character.len_utf8();
+                }
+            }
+            KeyCode::Home => self.input_cursor = 0,
+            KeyCode::End => self.input_cursor = self.input.len(),
+            KeyCode::Char(character)
+                if !key.modifiers.contains(KeyModifiers::ALT) && !character.is_control() =>
+            {
+                self.input.insert(self.input_cursor, character);
+                self.input_cursor += character.len_utf8();
+            }
+            _ => {}
+        }
+        false
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -637,11 +889,16 @@ impl DaemonApp {
             return false;
         }
 
+        if self.composing {
+            return self.compose_key(key);
+        }
+
         match key.code {
             KeyCode::Char('q') => {
                 self.close_terminal();
                 return true;
             }
+            KeyCode::Enter | KeyCode::Char('i') => self.enter_compose(),
             KeyCode::Char('?') => self.show_help = !self.show_help,
             KeyCode::Char('j') | KeyCode::Down => {
                 if !self.tasks.is_empty() {
@@ -663,10 +920,14 @@ impl DaemonApp {
             }
             KeyCode::Char('n') => self.create_task(),
             KeyCode::Char('x') => self.cancel_task(),
+            KeyCode::Char('s') => self.interrupt_task(),
             KeyCode::Char('a') => {
                 self.status = "approvals: none pending (M0 agent has no approval calls yet)".into();
             }
-            KeyCode::Char('t') => self.toggle_terminal(),
+            KeyCode::Char('t') => {
+                self.composing = false;
+                self.toggle_terminal();
+            }
             _ => {}
         }
         false
@@ -676,9 +937,11 @@ impl DaemonApp {
         let result = self.client.request(
             methods::TASK_CREATE,
             json!({
-                "goal": "Create a persistent shell, run a command, and close it.",
+                "goal": "Interactive session",
                 "demo": "session",
-                "provider": "scripted"
+                "provider": "scripted",
+                "interactive": true,
+                "stream": true
             }),
         );
         match result {
@@ -693,6 +956,7 @@ impl DaemonApp {
                 if let Err(err) = self.reload_tasks() {
                     self.status = format!("reload failed: {err}");
                 }
+                self.selected_task = self.tasks.len().saturating_sub(1);
             }
             Err(err) => self.status = format!("create failed: {err}"),
         }
@@ -707,7 +971,16 @@ impl DaemonApp {
             .client
             .request(methods::TASK_CANCEL, json!({"task_id": task_id}))
         {
-            Ok(_) => self.status = format!("cancelled {task_id}"),
+            Ok(_) => {
+                self.chat.push(ChatLine {
+                    task_id: task_id.clone(),
+                    role: ChatRole::System,
+                    text: "[cancelled]".into(),
+                    streaming: false,
+                });
+                self.trim_chat();
+                self.status = format!("cancelled {task_id}");
+            }
             Err(err) => self.status = format!("cancel failed: {err}"),
         }
     }
@@ -755,6 +1028,7 @@ impl DaemonApp {
                 Constraint::Length(3),
                 Constraint::Length(7),
                 Constraint::Min(1),
+                Constraint::Length(3),
                 Constraint::Length(1),
             ])
             .split(frame.area());
@@ -766,18 +1040,23 @@ impl DaemonApp {
             if self.follow { "on" } else { "off" },
             self.status
         ))
-        .block(Block::default().borders(Borders::ALL).title("task list"));
+        .block(Block::default().borders(Borders::ALL).title("session"));
         frame.render_widget(header, areas[0]);
 
         let items: Vec<ListItem> = self
             .tasks
             .iter()
             .map(|task| {
+                let interactive = task
+                    .get("interactive")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 ListItem::new(format!(
-                    "{}  {:<10} {}",
+                    "{} {}  {:<12} {}",
+                    if interactive { "◆" } else { " " },
                     task.get("task_id").and_then(Value::as_str).unwrap_or("?"),
                     task.get("state").and_then(Value::as_str).unwrap_or("?"),
-                    truncate(task.get("goal").and_then(Value::as_str).unwrap_or(""), 70)
+                    truncate(task.get("goal").and_then(Value::as_str).unwrap_or(""), 60)
                 ))
             })
             .collect();
@@ -816,14 +1095,79 @@ impl DaemonApp {
                     }
                 }
             }
-            frame.render_widget(Paragraph::new("terminal focused: Ctrl+Q detach"), areas[3]);
+            frame.render_widget(
+                Paragraph::new("terminal focused: Ctrl+Q detach").style(Style::default()),
+                areas[3],
+            );
+            frame.render_widget(Paragraph::new("Ctrl+Q detach  q quit  ? help"), areas[4]);
             return;
         }
 
         let panes = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
             .split(areas[2]);
+
+        let task_id = self.selected_task_id();
+        let mut transcript: Vec<Line> = Vec::new();
+        for line in self
+            .chat
+            .iter()
+            .filter(|line| Some(line.task_id.as_str()) == task_id.as_deref())
+        {
+            let (label, style) = match line.role {
+                ChatRole::User => ("you: ", Style::default().fg(Color::Cyan)),
+                ChatRole::Assistant => ("agent: ", Style::default().fg(Color::White)),
+                ChatRole::System => (
+                    "",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            };
+            let parts: Vec<&str> = line.text.split('\n').collect();
+            for (index, part) in parts.iter().enumerate() {
+                let prefix = if index == 0 {
+                    label.to_string()
+                } else {
+                    " ".repeat(label.len())
+                };
+                let suffix = if line.streaming && index + 1 == parts.len() {
+                    "▍"
+                } else {
+                    ""
+                };
+                transcript.push(Line::from(vec![Span::styled(
+                    format!("{prefix}{part}{suffix}"),
+                    style,
+                )]));
+            }
+            transcript.push(Line::from(""));
+        }
+        if transcript.is_empty() {
+            transcript.push(Line::from(Span::styled(
+                "No transcript in this TUI session. Press Enter or i to send a message.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        let transcript_title = match (&task_id, self.selected_state()) {
+            (Some(id), state) => format!("conversation — {id} [{state}]"),
+            (None, _) => "conversation".to_string(),
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(transcript_title);
+        let inner = block.inner(panes[0]);
+        frame.render_widget(block, panes[0]);
+        let paragraph = Paragraph::new(Text::from(transcript)).wrap(Wrap { trim: false });
+        if inner.width > 0 && inner.height > 0 {
+            let line_count = paragraph.line_count(inner.width);
+            let scroll = line_count.saturating_sub(inner.height as usize);
+            frame.render_widget(
+                paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+                inner,
+            );
+        }
 
         let visible = self.selected_events();
         let event_items: Vec<ListItem> = visible
@@ -833,58 +1177,71 @@ impl DaemonApp {
             .map(|index| {
                 let (_, event) = &self.events[*index];
                 ListItem::new(format!(
-                    "{}  {:<20} {}",
+                    "{}  {:<18} {}",
                     short_time(&event.ts),
                     event.kind,
-                    summarize(event, 90)
+                    summarize(event, 60)
                 ))
             })
             .collect();
-        let event_title = format!(
-            "events{}",
-            self.selected_task_id()
-                .map(|id| format!(" for {id}"))
-                .unwrap_or_default()
-        );
         let event_list =
-            List::new(event_items).block(Block::default().borders(Borders::ALL).title(event_title));
-        frame.render_widget(event_list, panes[0]);
+            List::new(event_items).block(Block::default().borders(Borders::ALL).title("events"));
+        frame.render_widget(event_list, panes[1]);
 
-        if let Some(terminal) = &self.terminal {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title(format!("terminal {} [t] focus", terminal.session_id));
-            let inner = block.inner(panes[1]);
-            frame.render_widget(block, panes[1]);
-            frame.render_widget(
-                TerminalWidget {
-                    screen: terminal.screen(),
-                },
-                inner,
-            );
+        let input_title = match (&task_id, self.selected_state()) {
+            (Some(id), state) => format!("message to {id} [{state}]"),
+            (None, _) => "message".to_string(),
+        };
+        let input_block = Block::default().borders(Borders::ALL).title(input_title);
+        let input_inner = input_block.inner(areas[3]);
+        frame.render_widget(input_block, areas[3]);
+        if self.composing {
+            let cursor_chars = self.input[..self.input_cursor].chars().count();
+            let available = input_inner.width.saturating_sub(2).max(1) as usize;
+            let start = cursor_chars.saturating_sub(available.saturating_sub(1));
+            let visible: String = self.input.chars().skip(start).collect();
+            let display = format!("> {visible}");
+            frame.render_widget(Paragraph::new(display), input_inner);
+            if input_inner.width > 2 && input_inner.height > 0 {
+                let x = input_inner.x + 2 + (cursor_chars - start) as u16;
+                frame.set_cursor_position((
+                    x.min(input_inner.right().saturating_sub(1)),
+                    input_inner.y,
+                ));
+            }
         } else {
-            let detail = self
-                .selected_event()
-                .map(detail_text)
-                .unwrap_or_else(|| "no events for the selected task".into());
-            let detail = Paragraph::new(detail)
-                .block(Block::default().borders(Borders::ALL).title("latest event"))
-                .wrap(Wrap { trim: false });
-            frame.render_widget(detail, panes[1]);
+            let hint = if task_id.is_some() {
+                "press Enter or i to write"
+            } else {
+                "select or create a task"
+            };
+            frame.render_widget(
+                Paragraph::new(format!("> {hint}")).style(Style::default().fg(Color::DarkGray)),
+                input_inner,
+            );
         }
 
-        let footer = "q quit  j/k task  n new  x cancel  t terminal  r reload  f follow  a approvals  ? help";
-        frame.render_widget(Paragraph::new(footer), areas[3]);
+        let footer = if self.composing {
+            "Enter send  Esc close editor  ←/→ move  Ctrl+U clear  Ctrl+C cancel"
+        } else {
+            "Enter/i message  s interrupt  n new  x cancel  t terminal  j/k task  r reload  q quit  ? help"
+        };
+        frame.render_widget(Paragraph::new(footer), areas[4]);
 
         if self.show_help {
-            let area = centered_rect(64, 56, frame.area());
+            let area = centered_rect(70, 62, frame.area());
             frame.render_widget(Clear, area);
             let help = Paragraph::new(
-                "mskd task inspector\n\n\
-                 q          quit\n\
+                "mskd conversational workbench\n\n\
+                 Enter / i  write a message to the selected task\n\
+                 Enter      send (in the editor)\n\
+                 Esc        leave the editor without sending\n\
+                 ← / →      move the input cursor\n\
+                 Ctrl+U     clear the input\n\
+                 s          interrupt the running turn\n\
                  j / k      previous / next task\n\
                  g / G      first / last task\n\
-                 n          create a scripted session task\n\
+                 n          create an interactive scripted task\n\
                  x          cancel the selected task\n\
                  t          open/focus the PTY terminal\n\
                  Ctrl+Q     detach from terminal focus\n\
@@ -892,8 +1249,8 @@ impl DaemonApp {
                  f          follow new events\n\
                  a          show pending approvals\n\
                  ?          toggle this help\n\n\
-                 Tasks run as isolated agent processes supervised by mskd.\n\
-                 Event and task.state notifications stream over the IPC socket.",
+                 ◆ marks an interactive task. Messages are accepted while the\n\
+                 task is waiting_input; agent.text and turn.end stream over IPC.",
             )
             .block(Block::default().borders(Borders::ALL).title("help"))
             .wrap(Wrap { trim: false });
@@ -1202,6 +1559,7 @@ fn dump_events(path: &Path) -> Result<Vec<Event>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
     use serde_json::json;
 
     #[test]
@@ -1237,5 +1595,80 @@ mod tests {
         assert_eq!(buffer[(1, 0)].symbol(), "i");
         let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(terminal_key_bytes(key), Some(vec![b'\r']));
+    }
+
+    #[test]
+    fn streamed_agent_text_accumulates_and_turns_end() {
+        let mut chat = Vec::new();
+        append_agent_text(&mut chat, "task-1", "hel", true);
+        append_agent_text(&mut chat, "task-1", "lo", true);
+        assert_eq!(chat.len(), 1);
+        assert_eq!(chat[0].text, "hello");
+        assert!(chat[0].streaming);
+        finish_streaming(&mut chat, "task-1");
+        assert!(!chat[0].streaming);
+        append_agent_text(&mut chat, "task-1", "done", false);
+        assert_eq!(chat.len(), 2);
+        assert_eq!(chat[1].text, "done");
+    }
+
+    #[test]
+    fn streamed_text_is_scoped_to_one_task() {
+        let mut chat = Vec::new();
+        append_agent_text(&mut chat, "task-1", "one", true);
+        append_agent_text(&mut chat, "task-2", "two", true);
+        assert_eq!(chat.len(), 2);
+        assert_eq!(chat[0].task_id, "task-1");
+        assert_eq!(chat[1].task_id, "task-2");
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn daemon_chat_draws_transcript() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app = DaemonApp::connect(PathBuf::from(root), 100).unwrap();
+        app.create_task();
+        for _ in 0..100 {
+            let _ = app.refresh();
+            let _ = app.reload_tasks();
+            if app.selected_state() == "waiting_input" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(app.selected_state(), "waiting_input");
+
+        app.enter_compose();
+        app.input = "hello tui".into();
+        app.input_cursor = app.input.len();
+        app.send_message();
+        for _ in 0..100 {
+            let _ = app.refresh();
+            if app.chat.iter().any(|line| {
+                line.role == ChatRole::Assistant && line.text.contains("echo: hello tui")
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(app.chat.iter().any(|line| {
+            line.role == ChatRole::Assistant && line.text.contains("echo: hello tui")
+        }));
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(content.contains("conversation"));
+        assert!(content.contains("echo: hello tui"));
+        app.cancel_task();
     }
 }

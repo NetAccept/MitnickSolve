@@ -6,6 +6,7 @@ response. The kernel should execute the tool and then finish the loop.
 
 import json
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
@@ -19,6 +20,8 @@ class Handler(BaseHTTPRequestHandler):
             request = json.loads(raw or b"{}")
         except json.JSONDecodeError:
             request = {}
+        if "slow" in json.dumps(request):
+            time.sleep(3)
         Handler.calls += 1
         if request.get("stream") and not self.path.endswith("/responses"):
             self.send_chat_stream()

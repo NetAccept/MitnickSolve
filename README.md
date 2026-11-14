@@ -6,7 +6,7 @@ results are in [`docs/performance.md`](docs/performance.md).
 
 ## Status
 
-M0 scaffold:
+M0 scaffold plus the P1 session/turn slice:
 
 - Rust workspace with the kernel/TUI skeleton and core types.
 - Embedded `envd` over stdio frames (Go; `go-pty` for cross-platform PTY).
@@ -24,6 +24,22 @@ M0 scaffold:
 - Multi-turn scripted agent loop: each LLM turn can issue tool calls, observations
   feed the next turn. The default demo creates a session, runs commands, verifies
   shell state, and closes it through WASM + manifest policy.
+- Persistent session/turn engine: `msk --session` keeps one agent session alive
+  and reads user turns from stdin. `--stdio-json` is the strict daemon protocol
+  on stdout (human output goes to stderr). Tool failures and provider failures
+  end only the current turn, not the process.
+- Daemon message channel: `task.create {"interactive": true}` spawns a persistent
+  agent; `task.message` appends a user turn and `turn.end`/`agent.text`
+  notifications report progress. `mskctl create --interactive` and
+  `mskctl send` expose it from the CLI.
+- Connection authentication: every IPC connection starts unauthenticated; the
+  only allowed call is `kernel.hello` with the per-root token (constant-time
+  comparison), and all other methods are rejected until it succeeds.
+- Event envelope: `schema_version` and a process-local monotonic `seq` are
+  written with every event; older logs without these fields still load.
+- Pair-aware context compaction: an assistant tool-call message is removed only
+  together with every matching tool result, so long sessions stay valid for
+  providers that enforce call/result pairing.
 - Context budgeting and artifacts: `msk-core::context` tracks tokens, pins key
   facts, and compacts old observations; outputs above 2 KiB are stored in
   `msk-data` by hash and replaced with a head/tail summary plus an ObjectRef.
@@ -48,9 +64,12 @@ M0 scaffold:
   credit-based backpressure; `Ctrl+Q` detaches. The TUI renders it through a
   `vt100` parser (colors, cursor, alternate screen), so full-screen programs are
   usable. `mskctl terminal-*` exposes the control-plane path for scripting.
+- Conversational daemon TUI: task list, transcript, message editor, streamed
+  assistant text, cooperative interrupt, and a live event pane. `n` creates an
+  interactive task; `Enter`/`i` writes, `s` interrupts, `t` opens the PTY.
 - Scripted LLM provider exercising LLM -> tool call -> WASM -> host bridge -> envd;
   `exec.session` is granted by the kernel and checked in `EnvHost`.
-- Real streaming providers, session/PTY, and service-mode envd are next.
+- Approvals and service-mode envd are next.
 
 The Go side is not compiled in this repository yet; see
 [`tools/envd/README.md`](tools/envd/README.md).
@@ -88,7 +107,37 @@ The context budget defaults to 100k tokens; pass `--max-context-tokens 32000`
 to exercise compaction. Large session output is stored as a `data.put` artifact
 and summarized in the transcript.
 
-Real provider (OpenAI-compatible, non-streaming):
+## Interactive session
+
+`--session` starts one long-lived agent session, creates one envd environment,
+and reads user messages as lines from stdin. `/quit` or EOF ends the session;
+`/interrupt` cooperatively stops the current turn. The offline `scripted`
+provider echoes the current user turn, so this path is usable without a model:
+
+```sh
+target/debug/msk --envd target/debug/envd --root .msk/session --session
+```
+
+Use `--provider openai` (or `openai-responses`) with the usual model environment
+variables for a real conversation. `--goal` is only used by the one-shot demo;
+in session mode the first turn is whatever the user sends.
+
+The daemon uses the same engine with a strict protocol:
+
+```sh
+target/debug/msk --envd target/debug/envd --root .msk/session \
+  --session --stdio-json --stream
+```
+
+In this mode stdout carries only JSON lines: `{"type":"user","text":"..."}` or
+`{"type":"interrupt"}` on stdin, and `agent.text`, `turn.end`, `pong`, or
+`error` frames on stdout. All setup messages go to stderr. `turn.end` has
+`status` `awaiting_input`, `interrupted`, `stopped`, or `error`; errors do not
+terminate the session. Interrupts are cooperative: the current blocking model
+or tool call finishes, the engine stops before the next step, and every
+assistant tool call still gets a paired result so the next turn is valid.
+
+## Real provider
 
 ```sh
 export MSK_LLM_API_KEY=...
@@ -146,10 +195,30 @@ target/debug/msk-tui --connect .msk
 automatically. On Unix the socket and token are mode 0600; Windows named pipes
 currently rely on local-user access rather than an explicit DACL.
 
-The TUI in daemon mode supports `j`/`k` task selection, `n` to create a default
-session task, `x` to cancel, `t` to open/focus the daemon-managed PTY terminal
-(`Ctrl+Q` detaches), `r` to reload, `a` for the approvals placeholder, and `?`
-for help.
+Interactive tasks stay alive between messages:
+
+```sh
+target/debug/mskctl --root .msk create --interactive
+target/debug/mskctl --root .msk send --task task-... --text "list the workspace"
+target/debug/mskctl --root .msk interrupt task-...
+target/debug/mskctl --root .msk watch --task task-...
+target/debug/mskctl --root .msk state task-...
+```
+
+`task.message` is accepted only when the task is `waiting_input`; while a turn
+is running it returns an error instead of interleaving messages. `turn.end`
+notifications carry the turn number and any error message, and the agent stays
+available for the next turn. Use `--provider openai` on `create` together with
+`MSK_LLM_*` in the daemon environment for a real model.
+
+The TUI in daemon mode is a conversational workbench: a task list, a transcript,
+and a message editor. `Enter` or `i` starts writing; `Enter` sends, `Esc` leaves
+the editor, and `←`/`→`, `Home`/`End`, `Backspace`, and `Ctrl+U` edit the line.
+`s` interrupts the running turn, `n` creates an interactive scripted task,
+`x` cancels, `t` opens/focuses the daemon-managed PTY terminal (`Ctrl+Q`
+detaches), `j`/`k` select tasks, `r` reloads, and `?` shows help. Assistant text
+streams into the transcript as `agent.text` deltas; errors and interrupts appear
+as system lines. The right pane keeps the live event stream for debugging.
 
 Terminal scripting:
 

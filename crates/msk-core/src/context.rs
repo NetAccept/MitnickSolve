@@ -3,7 +3,11 @@
 //! Tool results larger than `inline_tool_bytes` are stored as artifacts and
 //! replaced by a head/tail summary plus the artifact ID. Compaction removes
 //! old observations while preserving pinned facts and the most recent ones.
+//! Native tool calls are removed only together with every matching tool
+//! result, because providers reject a result whose call is missing (and vice
+//! versa).
 
+use std::collections::HashSet;
 use std::fmt;
 
 use crate::ToolCall;
@@ -181,45 +185,47 @@ impl ContextManager {
     }
 
     pub fn approx_tokens(&self) -> usize {
-        self.messages
-            .iter()
-            .map(|message| approx_tokens(&message.content))
-            .sum()
+        self.messages.iter().map(message_tokens).sum()
     }
 
     pub fn compactions(&self) -> usize {
         self.compactions
     }
 
-    /// Removes the oldest unpinned observations until the context fits or only
-    /// the minimum recent observations remain. Returns the number removed.
+    /// Removes the oldest removable groups until the context fits or only the
+    /// minimum recent observations remain. An assistant message that issued
+    /// tool calls is removed together with all of its tool results, so the
+    /// provider always receives a valid call/result sequence. Returns the
+    /// number of messages removed.
     pub fn compact(&mut self) -> usize {
         if self.approx_tokens() <= self.limits.max_tokens {
             return 0;
         }
 
-        let candidates: Vec<usize> = self
+        let total_observations = self
             .messages
             .iter()
-            .enumerate()
-            .filter(|(_, message)| {
-                // Native tool results stay paired with their assistant tool
-                // call; removing one without the other produces invalid
-                // provider requests. Large outputs are already summarized.
-                message.observation && !message.pinned && message.tool_call_id.is_none()
-            })
-            .map(|(index, _)| index)
-            .collect();
-        if candidates.len() <= self.limits.min_recent_observations {
+            .filter(|message| message.observation && !message.pinned)
+            .count();
+        if total_observations <= self.limits.min_recent_observations {
             return 0;
         }
+        let removable_observations = total_observations - self.limits.min_recent_observations;
 
-        let removable = candidates.len() - self.limits.min_recent_observations;
         let mut keep = vec![true; self.messages.len()];
         let mut removed = 0;
-        for index in candidates.into_iter().take(removable) {
-            keep[index] = false;
-            removed += 1;
+        let mut removed_observations = 0;
+        for group in self.removal_groups() {
+            if removed_observations + group.observations > removable_observations {
+                continue;
+            }
+            for index in group.indices {
+                if keep[index] {
+                    keep[index] = false;
+                    removed += 1;
+                }
+            }
+            removed_observations += group.observations;
             if self.tokens_with(&keep) <= self.limits.max_tokens {
                 break;
             }
@@ -237,14 +243,89 @@ impl ContextManager {
         removed
     }
 
+    /// Groups that can be removed without breaking a native tool call/result
+    /// pair. A tool-call group is removable only when every call has a result
+    /// and none of those messages are pinned. Legacy observations are single
+    /// message groups.
+    fn removal_groups(&self) -> Vec<RemovalGroup> {
+        let mut groups = Vec::new();
+        let mut claimed = vec![false; self.messages.len()];
+
+        for (index, message) in self.messages.iter().enumerate() {
+            if message.pinned || message.tool_calls.is_empty() {
+                continue;
+            }
+            let call_ids: HashSet<&str> = message
+                .tool_calls
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect();
+            let mut indices = vec![index];
+            let mut observations = 0;
+            let mut blocked = false;
+            for (other_index, other) in self.messages.iter().enumerate().skip(index + 1) {
+                let Some(call_id) = other.tool_call_id.as_deref() else {
+                    continue;
+                };
+                if !call_ids.contains(call_id) {
+                    continue;
+                }
+                if other.pinned {
+                    blocked = true;
+                    break;
+                }
+                indices.push(other_index);
+                observations += 1;
+            }
+            if blocked || observations != message.tool_calls.len() {
+                continue;
+            }
+            for &index in &indices {
+                claimed[index] = true;
+            }
+            groups.push(RemovalGroup {
+                indices,
+                observations,
+            });
+        }
+
+        for (index, message) in self.messages.iter().enumerate() {
+            if claimed[index] || message.pinned {
+                continue;
+            }
+            if message.observation && message.tool_call_id.is_none() {
+                groups.push(RemovalGroup {
+                    indices: vec![index],
+                    observations: 1,
+                });
+            }
+        }
+        groups.sort_by_key(|group| group.indices[0]);
+        groups
+    }
+
     fn tokens_with(&self, keep: &[bool]) -> usize {
         self.messages
             .iter()
             .zip(keep)
             .filter(|(_, keep)| **keep)
-            .map(|(message, _)| approx_tokens(&message.content))
+            .map(|(message, _)| message_tokens(message))
             .sum()
     }
+}
+
+struct RemovalGroup {
+    indices: Vec<usize>,
+    observations: usize,
+}
+
+fn message_tokens(message: &ContextMessage) -> usize {
+    let mut tokens = approx_tokens(&message.content);
+    for call in &message.tool_calls {
+        tokens += approx_tokens(&call.id) + approx_tokens(&call.tool);
+        tokens += approx_tokens(&call.args.to_string());
+    }
+    tokens
 }
 
 pub fn approx_tokens(text: &str) -> usize {
@@ -334,6 +415,66 @@ mod tests {
                 .filter(|message| message.observation)
                 .count(),
             3
+        );
+    }
+
+    #[test]
+    fn compact_removes_tool_calls_with_their_results() {
+        let limits = ContextLimits {
+            max_tokens: 30,
+            inline_tool_bytes: 2048,
+            summary_head_chars: 10,
+            summary_tail_chars: 5,
+            min_recent_observations: 1,
+        };
+        let mut context = ContextManager::new(limits);
+        for index in 0..4 {
+            context.push_assistant_tool_calls(
+                "run a command",
+                vec![ToolCall {
+                    id: format!("call-{index}"),
+                    tool: "exec".into(),
+                    args: serde_json::json!({"command": "echo hi"}),
+                }],
+            );
+            context.push_tool_result(
+                format!("call-{index}"),
+                "exec",
+                format!("result-{index}-{}", "x".repeat(80)),
+            );
+        }
+
+        let removed = context.compact();
+        assert!(removed > 0);
+
+        let messages = context.messages();
+        for (index, message) in messages.iter().enumerate() {
+            if let Some(call_id) = &message.tool_call_id {
+                assert!(
+                    messages[..index]
+                        .iter()
+                        .any(|previous| previous.tool_calls.iter().any(|call| &call.id == call_id)),
+                    "tool result {call_id} lost its assistant call"
+                );
+            }
+        }
+        for message in messages {
+            for call in &message.tool_calls {
+                assert!(
+                    messages
+                        .iter()
+                        .any(|result| result.tool_call_id.as_deref() == Some(call.id.as_str())),
+                    "assistant call {} lost its tool result",
+                    call.id
+                );
+            }
+        }
+        assert!(
+            messages
+                .iter()
+                .filter(|message| message.observation)
+                .count()
+                >= 1
         );
     }
 }

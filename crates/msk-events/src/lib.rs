@@ -5,14 +5,34 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
+/// Current event envelope version. Additive fields keep this at 1; readers
+/// must ignore unknown fields so newer writers stay compatible.
+pub const SCHEMA_VERSION: u32 = 1;
+
+static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn default_schema_version() -> u32 {
+    SCHEMA_VERSION
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
+    /// Envelope version, written first so log consumers can branch on it.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// Process-local monotonic sequence number. The JSONL sink assigns it
+    /// while holding the append lock, so log order and seq order agree.
+    /// Consumers must not compare seq values across processes; it exists to
+    /// detect gaps within one log.
+    #[serde(default)]
+    pub seq: u64,
     pub id: String,
     pub ts: String,
     pub task: Option<String>,
@@ -25,6 +45,8 @@ pub struct Event {
 impl Event {
     pub fn new(kind: impl Into<String>, actor: impl Into<String>, data: serde_json::Value) -> Self {
         Self {
+            schema_version: SCHEMA_VERSION,
+            seq: 0,
             id: Uuid::new_v4().to_string(),
             ts: OffsetDateTime::now_utc()
                 .format(&Rfc3339)
@@ -80,7 +102,11 @@ impl JsonlSink {
 impl EventSink for JsonlSink {
     fn emit(&self, event: &Event) -> Result<(), EventError> {
         let mut writer = self.writer.lock().expect("event writer poisoned");
-        serde_json::to_writer(&mut *writer, event)?;
+        let mut event = event.clone();
+        if event.seq == 0 {
+            event.seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
+        }
+        serde_json::to_writer(&mut *writer, &event)?;
         writer.write_all(b"\n")?;
         writer.flush()?;
         Ok(())
@@ -129,7 +155,17 @@ mod tests {
         let events = read_events(&path).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].kind, "tool.call");
+        assert_eq!(events[0].schema_version, SCHEMA_VERSION);
+        assert!(events[1].seq > events[0].seq);
         assert!(events[0].ts.starts_with("20"));
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn old_events_without_envelope_fields_still_load() {
+        let line = r#"{"id":"e1","ts":"2025-01-01T00:00:00Z","task":null,"kind":"tool.call","actor":"kernel","parents":[],"data":{}}"#;
+        let event: Event = serde_json::from_str(line).unwrap();
+        assert_eq!(event.schema_version, SCHEMA_VERSION);
+        assert_eq!(event.seq, 0);
     }
 }

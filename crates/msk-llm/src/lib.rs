@@ -146,6 +146,40 @@ impl LlmProvider for ScriptedProvider {
     }
 }
 
+/// Offline provider for the interactive session loop. It echoes the most
+/// recent user message, which makes session, turn, and context behavior
+/// testable without a network or a model.
+pub struct EchoProvider {
+    id: String,
+}
+
+impl EchoProvider {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self { id: id.into() }
+    }
+}
+
+impl LlmProvider for EchoProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        let text = request
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user" && message.tool_call_id.is_none())
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
+        Ok(LlmResponse {
+            text: format!("echo: {text}"),
+            tool_calls: Vec::new(),
+            usage_tokens: 0,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenAiConfig {
     pub base_url: String,

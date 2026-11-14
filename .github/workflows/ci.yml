@@ -30,9 +30,50 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27"
+      - uses: dtolnay/rust-toolchain@stable
       - name: Vet
         working-directory: tools/envd
         run: go vet ./...
       - name: Test
         working-directory: tools/envd
         run: go test ./...
+      - name: Build envd
+        working-directory: tools/envd
+        run: go build -o ../../target/debug/envd ./cmd/envd
+      - name: Build kernel
+        run: cargo build -p msk-kernel --bins
+      - name: Daemon interactive session smoke
+        run: |
+          set -euo pipefail
+          rm -rf .msk/ci
+          mkdir -p .msk/ci
+          target/debug/mskd --root .msk/ci --envd target/debug/envd \
+            --tools-dir tools/wasm >.msk/ci/daemon.log 2>&1 &
+          daemon=$!
+          trap 'kill "$daemon" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 100); do
+            if [ -f .msk/ci/ipc.token ]; then break; fi
+            sleep 0.1
+          done
+          task=$(target/debug/mskctl --root .msk/ci create --interactive | jq -r .task_id)
+          for _ in $(seq 1 100); do
+            state=$(target/debug/mskctl --root .msk/ci state "$task" | jq -r .state)
+            if [ "$state" = waiting_input ]; then break; fi
+            sleep 0.1
+          done
+          [ "$(target/debug/mskctl --root .msk/ci state "$task" | jq -r .state)" = waiting_input ]
+          target/debug/mskctl --root .msk/ci send --task "$task" --text "first turn" >/dev/null
+          for _ in $(seq 1 100); do
+            turns=$(target/debug/mskctl --root .msk/ci state "$task" | jq -r .turns)
+            if [ "$turns" = 1 ]; then break; fi
+            sleep 0.1
+          done
+          [ "$(target/debug/mskctl --root .msk/ci state "$task" | jq -r .turns)" = 1 ]
+          target/debug/mskctl --root .msk/ci send --task "$task" --text "second turn" >/dev/null
+          for _ in $(seq 1 100); do
+            turns=$(target/debug/mskctl --root .msk/ci state "$task" | jq -r .turns)
+            if [ "$turns" = 2 ]; then break; fi
+            sleep 0.1
+          done
+          [ "$(target/debug/mskctl --root .msk/ci state "$task" | jq -r .turns)" = 2 ]
+          grep -q '"kind":"turn.end"' .msk/ci/tasks/"$task"/events.jsonl

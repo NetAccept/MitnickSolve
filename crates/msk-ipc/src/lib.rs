@@ -414,6 +414,8 @@ impl Client {
 pub mod methods {
     pub const HELLO: &str = "kernel.hello";
     pub const TASK_CREATE: &str = "task.create";
+    pub const TASK_MESSAGE: &str = "task.message";
+    pub const TASK_INTERRUPT: &str = "task.interrupt";
     pub const TASK_CANCEL: &str = "task.cancel";
     pub const TASK_STATE: &str = "task.state";
     pub const TASK_LIST: &str = "task.list";

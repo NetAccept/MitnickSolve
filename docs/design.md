@@ -950,6 +950,17 @@ profile = "host"
 - GUI 客户端、远程网关、多前端并发。
 - 退出标准：GUI 不修改内核代码即可接入。
 
+### 实施进度（P1 首个切片，已落地）
+
+- `runtime.rs` 汇集 host bridge、工具注册表、LLM 请求构造、观测工件化与占位符替换；一次性 demo 与常驻会话共用同一套 WASM/策略边界。
+- `agent.rs` 提供 Session/Turn 引擎；`msk --session` 常驻读取 stdin，`--stdio-json` 输出严格 JSON 协议；工具 trap、工具返回错误、占位符缺失都成为观测而非终止进程，provider 错误只结束当前 turn。
+- `mskd` 支持 `task.create {"interactive":true}`、`task.message`、`turn.end` 通知；任务在 `waiting_input` 与 `running` 之间切换，`mskctl create --interactive` / `send` / `watch` 可用。
+- 前置项：连接级认证（hello 前拒绝其他方法、常量时间 token 比较）、事件 `schema_version` + 进程内单调 `seq`、成对工具调用/结果压缩、基于时间戳的任务 ID。
+- 协作式取消：stdin 读取线程设置 `CancelToken`；引擎在模型/工具步骤之间检查，`turn.end` 返回 `interrupted`；被打断的 assistant tool_calls 仍补齐每个结果，保证下一轮请求合法。`mskctl interrupt` 与 `/interrupt` 已接入。
+- 对话式 TUI：任务列表、按任务过滤的转录、单行输入编辑器、流式 `agent.text` 累积、`turn.end` 系统行、`s` 中断、`n` 新建交互任务；右侧保留事件流用于调试。
+- 验收：同一会话连续两轮消息得到两次 `turn.end`，第二轮请求携带第一轮上下文；真实 mock provider 的 echo 工具调用跨轮保留；工具 trap 后该轮仍能收到下一次模型响应。
+- 尚未进入本切片：审批、envd 服务模式与断线重连。
+
 ---
 
 ## 20. 开放问题与决议

@@ -1,22 +1,29 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+mod agent;
+mod runtime;
 
+use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, mpsc};
+
+use agent::{Session, SessionOptions};
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use clap::{Parser, ValueEnum};
+use msk_core::ToolCall;
 use msk_core::context::{ContextLimits, ContextManager, Role, summarize_output};
-use msk_core::{Capability, DataLabel, ToolCall};
 use msk_data::{FileObjectStore, ObjectStore};
 use msk_events::{Event, EventSink, JsonlSink};
-use msk_kernel::policy;
 use msk_llm::{
-    LlmDelta, LlmError, LlmProvider, LlmRequest, LlmResponse, Message, OpenAiConfig,
-    OpenAiProvider, OpenAiResponsesProvider, ScriptedProvider, ToolSchema,
+    EchoProvider, LlmDelta, LlmError, LlmProvider, LlmResponse, OpenAiConfig, OpenAiProvider,
+    OpenAiResponsesProvider, ScriptedProvider,
 };
 use msk_mcp::EnvClient;
-use msk_wasm::{ToolContext, ToolHost, ToolManifest, WasmtimeRuntime};
+use msk_wasm::ToolHost;
+use runtime::{
+    EnvHost, build_observation, complete_or_stream, extract_data, llm_request, load_registry,
+    substitute,
+};
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 
@@ -50,6 +57,17 @@ struct Cli {
     /// Scripted agent demo to run.
     #[arg(long, value_enum, default_value_t = Demo::Session)]
     demo: Demo,
+    /// Keep one agent session alive and read user messages from stdin.
+    /// Without this flag the binary runs the one-shot scripted demo.
+    #[arg(long)]
+    session: bool,
+    /// Session protocol on stdout: JSON lines only, human output on stderr.
+    /// Implies --session.
+    #[arg(long)]
+    stdio_json: bool,
+    /// Task ID attached to events written by this process (set by mskd).
+    #[arg(long)]
+    task_id: Option<String>,
     /// Approximate token budget for the agent context.
     #[arg(long, default_value_t = 100_000)]
     max_context_tokens: usize,
@@ -65,7 +83,7 @@ struct Cli {
         default_value = "Create a persistent shell, run a command, and close it."
     )]
     goal: String,
-    /// Maximum agent turns before aborting.
+    /// Maximum model/tool steps within one user turn.
     #[arg(long, default_value_t = 12)]
     max_steps: usize,
     /// Stream text deltas from the provider when available.
@@ -82,83 +100,109 @@ struct Cli {
     llm_api_key: Option<String>,
 }
 
-/// M0 host bridge: the only native capability exposed to WASM tools.
-struct EnvHost {
-    client: Mutex<EnvClient>,
-    artifacts: Arc<dyn ObjectStore>,
+/// Wraps the JSONL sink so every event emitted by this process carries the
+/// daemon-assigned task ID. Events that already carry one are left alone.
+struct TaggedSink {
+    inner: Arc<dyn EventSink>,
+    task: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct ReadArtifactArgs {
-    id: String,
-    #[serde(default)]
-    offset: Option<usize>,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-impl EnvHost {
-    fn read_artifact(&self, input: &[u8]) -> Result<Vec<u8>, String> {
-        let args: ReadArtifactArgs = serde_json::from_slice(input)
-            .map_err(|err| format!("invalid artifact read input: {err}"))?;
-        let bytes = self
-            .artifacts
-            .get(&args.id)
-            .map_err(|err| err.to_string())?;
-        let offset = args.offset.unwrap_or(0).min(bytes.len());
-        let limit = args.limit.unwrap_or(64 * 1024).min(1024 * 1024);
-        let end = offset.saturating_add(limit).min(bytes.len());
-        let chunk = &bytes[offset..end];
-        let (data, encoding) = match std::str::from_utf8(chunk) {
-            Ok(text) => (text.to_string(), "utf8"),
-            Err(_) => (STANDARD.encode(chunk), "base64"),
-        };
-        let response = json!({
-            "id": args.id,
-            "offset": offset,
-            "next_offset": end,
-            "eof": end >= bytes.len(),
-            "encoding": encoding,
-            "data": data
-        });
-        serde_json::to_vec(&response).map_err(|err| err.to_string())
-    }
-}
-
-impl ToolHost for EnvHost {
-    fn call(&self, ctx: &ToolContext, input: &[u8]) -> Result<Vec<u8>, String> {
-        if ctx.tool == "artifact_read" {
-            if !ctx.allows(Capability::ArtifactRead) {
-                return Err("denied: artifact.read not granted".to_string());
+impl EventSink for TaggedSink {
+    fn emit(&self, event: &Event) -> Result<(), msk_events::EventError> {
+        if event.task.is_none() {
+            if let Some(task) = &self.task {
+                return self.inner.emit(&event.clone().with_task(task.clone()));
             }
-            return self.read_artifact(input);
         }
-
-        let envd_tool = match ctx.tool.as_str() {
-            "exec" | "session_create" | "session_exec" | "session_close" | "session_write"
-            | "session_read" | "session_resize" => ctx.tool.as_str(),
-            other => return Err(format!("denied: tool {other} is not allowed")),
-        };
-        if !ctx.allows(Capability::ExecSession) {
-            return Err("denied: exec.session not granted".to_string());
-        }
-        let args: Value =
-            serde_json::from_slice(input).map_err(|err| format!("invalid tool input: {err}"))?;
-        let mut client = self
-            .client
-            .lock()
-            .map_err(|_| "envd client lock poisoned".to_string())?;
-        let result = client
-            .call_tool(envd_tool, args)
-            .map_err(|err| err.to_string())?;
-        serde_json::to_vec(&result).map_err(|err| err.to_string())
+        self.inner.emit(event)
     }
 }
 
-struct RegisteredTool {
-    context: ToolContext,
-    runtime: WasmtimeRuntime,
-    manifest: ToolManifest,
+enum SessionInput {
+    User(String),
+    Interrupt,
+    Ping,
+    Shutdown,
+    Invalid(String),
+}
+
+/// Reads stdin on its own thread so `/interrupt` (or a JSON interrupt frame)
+/// can reach a turn that is currently blocked on a model or tool call. The
+/// reader sets the cancel token immediately, before the main loop dequeues
+/// the message.
+fn spawn_stdin_reader(
+    cancel: agent::CancelToken,
+    stdio_json: bool,
+) -> mpsc::Receiver<SessionInput> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(err) => {
+                    let _ = tx.send(SessionInput::Invalid(format!("stdin error: {err}")));
+                    break;
+                }
+            };
+            if stdio_json {
+                let value: Value = match serde_json::from_str(&line) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        let _ = tx.send(SessionInput::Invalid(format!("invalid input: {err}")));
+                        continue;
+                    }
+                };
+                match value.get("type").and_then(Value::as_str).unwrap_or("user") {
+                    "user" => {
+                        let text = value
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        if text.is_empty() {
+                            let _ = tx.send(SessionInput::Invalid("empty user message".into()));
+                        } else {
+                            let _ = tx.send(SessionInput::User(text));
+                        }
+                    }
+                    "interrupt" => {
+                        cancel.cancel();
+                        let _ = tx.send(SessionInput::Interrupt);
+                    }
+                    "ping" => {
+                        let _ = tx.send(SessionInput::Ping);
+                    }
+                    "shutdown" => {
+                        let _ = tx.send(SessionInput::Shutdown);
+                        break;
+                    }
+                    other => {
+                        let _ = tx.send(SessionInput::Invalid(format!(
+                            "unknown input type: {other}"
+                        )));
+                    }
+                }
+            } else {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed == "/quit" || trimmed == "/exit" {
+                    let _ = tx.send(SessionInput::Shutdown);
+                    break;
+                }
+                if trimmed == "/interrupt" {
+                    cancel.cancel();
+                    let _ = tx.send(SessionInput::Interrupt);
+                    continue;
+                }
+                let _ = tx.send(SessionInput::User(trimmed.to_string()));
+            }
+        }
+        let _ = tx.send(SessionInput::Shutdown);
+    });
+    rx
 }
 
 fn main() -> Result<()> {
@@ -170,12 +214,25 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     std::fs::create_dir_all(&cli.root)?;
     let events_path = cli.root.join("events.jsonl");
-    let sink = JsonlSink::open(&events_path)?;
+    let base: Arc<dyn EventSink> = Arc::new(JsonlSink::open(&events_path)?);
+    let sink: Arc<dyn EventSink> = Arc::new(TaggedSink {
+        inner: base,
+        task: cli.task_id.clone(),
+    });
     emit(
-        &sink,
+        sink.as_ref(),
         "kernel.start",
-        json!({"root": cli.root.display().to_string(), "demo": format!("{:?}", cli.demo)}),
+        json!({
+            "root": cli.root.display().to_string(),
+            "mode": if cli.session || cli.stdio_json { "session" } else { "demo" },
+            "task_id": cli.task_id,
+            "demo": format!("{:?}", cli.demo)
+        }),
     )?;
+
+    if cli.session || cli.stdio_json {
+        return run_session(&cli, sink, &events_path);
+    }
 
     let envd_bin = cli.envd.canonicalize().unwrap_or_else(|_| cli.envd.clone());
     if !envd_bin.exists() {
@@ -200,13 +257,13 @@ fn main() -> Result<()> {
         ack.server, ack.protocol, ack.max_frame
     );
     emit(
-        &sink,
+        sink.as_ref(),
         "envd.hello",
         json!({"server": ack.server, "protocol": ack.protocol, "max_frame": ack.max_frame}),
     )?;
 
     let init = client.initialize().context("MCP initialize")?;
-    emit(&sink, "mcp.initialize", init)?;
+    emit(sink.as_ref(), "mcp.initialize", init)?;
     let tools = client.request("tools/list", json!({}))?;
     let tool_count = tools
         .get("tools")
@@ -214,13 +271,13 @@ fn main() -> Result<()> {
         .map(Vec::len)
         .unwrap_or(0);
     println!("envd tools: {tool_count}");
-    emit(&sink, "mcp.tools", json!({"count": tool_count}))?;
+    emit(sink.as_ref(), "mcp.tools", json!({"count": tool_count}))?;
 
     let env = tool_data(
         &mut client,
         "env_create",
         json!({"name": "demo", "kind": "managed", "profile": "dev"}),
-        &sink,
+        sink.as_ref(),
     )?;
     let env_id = env
         .get("env_id")
@@ -232,7 +289,7 @@ fn main() -> Result<()> {
         env.get("workspace").and_then(Value::as_str).unwrap_or("?")
     );
     emit(
-        &sink,
+        sink.as_ref(),
         "env.create",
         json!({"env_id": env_id, "workspace": env.get("workspace")}),
     )?;
@@ -247,15 +304,15 @@ fn main() -> Result<()> {
             "data": STANDARD.encode(content),
             "atomic": true
         }),
-        &sink,
+        sink.as_ref(),
     )?;
-    emit(&sink, "file.write", write)?;
+    emit(sink.as_ref(), "file.write", write)?;
 
     let read = tool_data(
         &mut client,
         "read_file",
         json!({"env_id": env_id.clone(), "path": "hello.txt"}),
-        &sink,
+        sink.as_ref(),
     )?;
     let data = read
         .get("data")
@@ -277,14 +334,15 @@ fn main() -> Result<()> {
             "data": STANDARD.encode(large_content.as_bytes()),
             "atomic": true
         }),
-        &sink,
+        sink.as_ref(),
     )?;
-    emit(&sink, "file.write_large", large_write)?;
+    emit(sink.as_ref(), "file.write_large", large_write)?;
 
     let object_store: Arc<dyn ObjectStore> =
         Arc::new(FileObjectStore::open(cli.root.join("artifacts")).context("open artifact store")?);
+    let client = Arc::new(Mutex::new(client));
     let env_host = Arc::new(EnvHost {
-        client: Mutex::new(client),
+        client: client.clone(),
         artifacts: object_store.clone(),
     });
     let host: Arc<dyn ToolHost> = env_host.clone();
@@ -303,7 +361,7 @@ fn main() -> Result<()> {
     };
     let registry = load_registry(&cli.tools_dir, &cli.wasm, host, tool_names)?;
     emit(
-        &sink,
+        sink.as_ref(),
         "tool.registry",
         json!({"tools": tool_names, "dir": cli.tools_dir.display().to_string()}),
     )?;
@@ -331,8 +389,15 @@ fn main() -> Result<()> {
         provider.as_ref(),
         &llm_request(&context, &registry),
         cli.stream,
+        &mut |delta| {
+            let LlmDelta::Text(text) = delta;
+            print!("{text}");
+        },
     )
     .context("LLM call")?;
+    if cli.stream {
+        println!();
+    }
     let mut last_session: Option<String> = None;
     let mut last_artifact: Option<String> = None;
     let mut steps = 0usize;
@@ -343,7 +408,7 @@ fn main() -> Result<()> {
         }
         steps += 1;
         emit(
-            &sink,
+            sink.as_ref(),
             "llm.response",
             json!({
                 "text": response.text.clone(),
@@ -372,9 +437,13 @@ fn main() -> Result<()> {
             let tool = registry
                 .get(&call.tool)
                 .with_context(|| format!("tool not registered: {}", call.tool))?;
-            emit(&sink, "tool.call", json!({"tool": call.tool, "args": args}))?;
             emit(
-                &sink,
+                sink.as_ref(),
+                "tool.call",
+                json!({"tool": call.tool, "args": args}),
+            )?;
+            emit(
+                sink.as_ref(),
                 "policy.decision",
                 json!({
                     "tool": tool.context.tool.clone(),
@@ -399,7 +468,7 @@ fn main() -> Result<()> {
             if let Some(object) = &artifact {
                 last_artifact = Some(object.id.clone());
                 emit(
-                    &sink,
+                    sink.as_ref(),
                     "data.put",
                     json!({
                         "id": object.id,
@@ -410,7 +479,7 @@ fn main() -> Result<()> {
                 )?;
             }
             emit(
-                &sink,
+                sink.as_ref(),
                 "wasm.result",
                 json!({
                     "tool": call.tool,
@@ -445,7 +514,7 @@ fn main() -> Result<()> {
         let removed = context.compact();
         if removed > 0 {
             emit(
-                &sink,
+                sink.as_ref(),
                 "context.compact",
                 json!({
                     "removed": removed,
@@ -455,7 +524,7 @@ fn main() -> Result<()> {
             )?;
         }
         emit(
-            &sink,
+            sink.as_ref(),
             "context.state",
             json!({
                 "messages": context.messages().len(),
@@ -467,8 +536,17 @@ fn main() -> Result<()> {
             provider.as_ref(),
             &llm_request(&context, &registry),
             cli.stream,
+            &mut |delta| {
+                let LlmDelta::Text(text) = delta;
+                print!("{text}");
+            },
         ) {
-            Ok(next) => response = next,
+            Ok(next) => {
+                if cli.stream {
+                    println!();
+                }
+                response = next;
+            }
             Err(LlmError::Exhausted) => break,
             Err(err) => return Err(err.into()),
         }
@@ -481,58 +559,229 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn load_registry(
-    tools_dir: &Path,
-    fallback_wasm: &Path,
-    host: Arc<dyn ToolHost>,
-    names: &[&str],
-) -> Result<HashMap<String, RegisteredTool>> {
-    let mut tools = HashMap::new();
-    for name in names {
-        let manifest_path = tools_dir.join(format!("{name}.json"));
-        let manifest = policy::load_manifest(&manifest_path)
-            .with_context(|| format!("load manifest {}", manifest_path.display()))?;
-        let context =
-            policy::context_for(&manifest).with_context(|| format!("authorize tool {name}"))?;
-
-        let candidate = tools_dir.join(format!("{name}.wat"));
-        let wasm = if candidate.exists() {
-            candidate
-        } else {
-            fallback_wasm.to_path_buf()
-        };
-        let runtime = WasmtimeRuntime::from_file(host.clone(), &wasm)
-            .with_context(|| format!("load WASM {}", wasm.display()))?;
-        tools.insert(
-            (*name).to_string(),
-            RegisteredTool {
-                context,
-                runtime,
-                manifest,
-            },
+fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Path) -> Result<()> {
+    let envd_bin = cli.envd.canonicalize().unwrap_or_else(|_| cli.envd.clone());
+    if !envd_bin.exists() {
+        bail!(
+            "envd binary not found: {} — build it with `cd tools/envd && go build -o ../../target/debug/envd ./cmd/envd`",
+            envd_bin.display()
         );
     }
-    Ok(tools)
+    if !cli.tools_dir.exists() {
+        bail!("tool directory not found: {}", cli.tools_dir.display());
+    }
+    if !cli.wasm.exists() {
+        bail!("fallback WASM module not found: {}", cli.wasm.display());
+    }
+
+    let envd_root = cli.root.join("envd");
+    std::fs::create_dir_all(&envd_root)?;
+    let mut client = EnvClient::spawn(&envd_bin, &envd_root).context("spawn embedded envd")?;
+    let ack = client.handshake("agent-local").context("envd handshake")?;
+    human_line(
+        cli,
+        &format!(
+            "envd: {} (protocol {}, max_frame {})",
+            ack.server, ack.protocol, ack.max_frame
+        ),
+    );
+    emit(
+        sink.as_ref(),
+        "envd.hello",
+        json!({"server": ack.server, "protocol": ack.protocol, "max_frame": ack.max_frame}),
+    )?;
+
+    let init = client.initialize().context("MCP initialize")?;
+    emit(sink.as_ref(), "mcp.initialize", init)?;
+    let tools = client.request("tools/list", json!({}))?;
+    let tool_count = tools
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    human_line(cli, &format!("envd tools: {tool_count}"));
+    emit(sink.as_ref(), "mcp.tools", json!({"count": tool_count}))?;
+
+    let env = tool_data(
+        &mut client,
+        "env_create",
+        json!({"name": "session", "kind": "managed", "profile": "dev"}),
+        sink.as_ref(),
+    )?;
+    let env_id = env
+        .get("env_id")
+        .and_then(Value::as_str)
+        .context("env_create did not return env_id")?
+        .to_string();
+    human_line(cli, &format!("env: {env_id}"));
+    emit(
+        sink.as_ref(),
+        "env.create",
+        json!({"env_id": env_id, "workspace": env.get("workspace")}),
+    )?;
+
+    let object_store: Arc<dyn ObjectStore> =
+        Arc::new(FileObjectStore::open(cli.root.join("artifacts")).context("open artifact store")?);
+    let client = Arc::new(Mutex::new(client));
+    let env_host = Arc::new(EnvHost {
+        client,
+        artifacts: object_store.clone(),
+    });
+    let host: Arc<dyn ToolHost> = env_host.clone();
+    let tool_names = [
+        "exec",
+        "session_create",
+        "session_exec",
+        "session_write",
+        "session_read",
+        "session_resize",
+        "session_close",
+        "artifact_read",
+        "echo",
+    ];
+    let registry = load_registry(&cli.tools_dir, &cli.wasm, host, &tool_names)?;
+    emit(
+        sink.as_ref(),
+        "tool.registry",
+        json!({"tools": tool_names, "dir": cli.tools_dir.display().to_string()}),
+    )?;
+
+    let limits = ContextLimits::default()
+        .with_max_tokens(cli.max_context_tokens)
+        .with_min_recent_observations(cli.min_recent_observations);
+    let mut context = ContextManager::new(limits.clone());
+    context.push_pinned(
+        Role::System,
+        "You are MitnickSolve, a CTF agent. Use the provided tools for all machine access. \
+         Prefer persistent sessions for multi-command work. Tool output over 2 KiB is stored \
+         as an artifact; use artifact_read to inspect it. Keep responses concise.",
+    );
+    context.push_pinned(Role::System, format!("env_id={env_id}"));
+
+    let provider = session_provider(cli)?;
+    let mut session = Session::new(SessionOptions {
+        env_id,
+        registry,
+        provider,
+        context,
+        limits,
+        objects: object_store,
+        sink: sink.clone(),
+        max_steps: cli.max_steps,
+        stream: cli.stream,
+        task: cli.task_id.clone(),
+        cancel: agent::CancelToken::new(),
+    });
+
+    let inputs = spawn_stdin_reader(session.cancel_token(), cli.stdio_json);
+    loop {
+        if !cli.stdio_json {
+            eprint!("> ");
+            let _ = io::stderr().flush();
+        }
+        let input = match inputs.recv() {
+            Ok(input) => input,
+            Err(_) => break,
+        };
+        let text = match input {
+            SessionInput::Shutdown => break,
+            SessionInput::Interrupt => {
+                // The reader already set the token. If no turn was running,
+                // clear it so the next user message starts cleanly.
+                session.clear_cancel();
+                continue;
+            }
+            SessionInput::Ping => {
+                if cli.stdio_json {
+                    emit_protocol(json!({"type": "pong"}));
+                }
+                continue;
+            }
+            SessionInput::Invalid(message) => {
+                if cli.stdio_json {
+                    emit_protocol(json!({"type": "error", "message": message}));
+                } else {
+                    eprintln!("{message}");
+                }
+                continue;
+            }
+            SessionInput::User(text) => text,
+        };
+
+        let mut printed = false;
+        let outcome = {
+            let stdio = cli.stdio_json;
+            let stream = cli.stream;
+            let mut on_text = |chunk: &str| {
+                printed = true;
+                if stdio {
+                    emit_protocol(json!({"type": "agent.text", "text": chunk, "delta": stream}));
+                } else {
+                    print!("{chunk}");
+                    let _ = io::stdout().flush();
+                }
+            };
+            session.run_turn(&text, &mut on_text)
+        };
+
+        if !cli.stdio_json && printed {
+            println!();
+        }
+        let mut end = json!({
+            "type": "turn.end",
+            "status": outcome.status(),
+            "turns": session.turns()
+        });
+        if let Some(message) = outcome.message() {
+            end["message"] = json!(message);
+        }
+        if cli.stdio_json {
+            emit_protocol(end);
+        } else if let Some(message) = outcome.message() {
+            eprintln!("{}: {message}", outcome.status());
+        }
+    }
+
+    env_host.shutdown();
+    emit(
+        sink.as_ref(),
+        "session.end",
+        json!({
+            "turns": session.turns(),
+            "messages": session.context().messages().len()
+        }),
+    )?;
+    human_line(cli, &format!("events: {}", events_path.display()));
+    Ok(())
 }
 
-fn complete_or_stream(
-    provider: &dyn LlmProvider,
-    request: &LlmRequest,
-    stream: bool,
-) -> Result<LlmResponse, LlmError> {
-    if !stream {
-        return provider.complete(request);
+fn session_provider(cli: &Cli) -> Result<Box<dyn LlmProvider>> {
+    Ok(match cli.provider {
+        ProviderKind::Scripted => Box::new(EchoProvider::new("echo")),
+        ProviderKind::Openai => {
+            Box::new(OpenAiProvider::new(openai_config(cli)?).context("configure OpenAI provider")?)
+        }
+        ProviderKind::OpenaiResponses => Box::new(
+            OpenAiResponsesProvider::new(openai_config(cli)?)
+                .context("configure OpenAI Responses provider")?,
+        ),
+    })
+}
+
+fn human_line(cli: &Cli, text: &str) {
+    if cli.stdio_json {
+        eprintln!("{text}");
+    } else {
+        println!("{text}");
     }
-    let mut printed = false;
-    let response = provider.stream(request, &mut |delta| {
-        let LlmDelta::Text(text) = delta;
-        print!("{text}");
-        printed = true;
-    })?;
-    if printed {
-        println!();
-    }
-    Ok(response)
+}
+
+fn emit_protocol(value: Value) {
+    println!(
+        "{}",
+        serde_json::to_string(&value).unwrap_or_else(|_| "{\"type\":\"error\"}".to_string())
+    );
+    let _ = io::stdout().flush();
 }
 
 fn openai_config(cli: &Cli) -> Result<OpenAiConfig> {
@@ -556,64 +805,6 @@ fn openai_config(cli: &Cli) -> Result<OpenAiConfig> {
         model,
         api_key,
     })
-}
-
-fn llm_request(context: &ContextManager, registry: &HashMap<String, RegisteredTool>) -> LlmRequest {
-    let tools = registry
-        .values()
-        .map(|tool| ToolSchema {
-            name: tool.manifest.name.clone(),
-            description: tool.manifest.description.clone(),
-            parameters: tool.manifest.input_schema.clone(),
-        })
-        .collect();
-    LlmRequest {
-        messages: context
-            .messages()
-            .iter()
-            .map(|message| {
-                if let Some(call_id) = &message.tool_call_id {
-                    Message::tool_result(
-                        call_id.clone(),
-                        message.tool_name.clone().unwrap_or_default(),
-                        message.content.clone(),
-                    )
-                } else if !message.tool_calls.is_empty() {
-                    Message::assistant_tool_calls(
-                        message.content.clone(),
-                        message.tool_calls.clone(),
-                    )
-                } else {
-                    Message::text(message.role.as_llm_role(), message.content.clone())
-                }
-            })
-            .collect(),
-        tools,
-        max_tokens: Some(512),
-    }
-}
-
-fn build_observation(
-    _tool: &str,
-    data: &Value,
-    limits: &ContextLimits,
-    store: &dyn ObjectStore,
-) -> Result<(String, Option<msk_core::ObjectRef>)> {
-    let text = serde_json::to_string(data)?;
-    if text.len() <= limits.inline_tool_bytes {
-        return Ok((text, None));
-    }
-    let object = store.put(text.as_bytes(), DataLabel::Derived)?;
-    let summary = summarize_output(&text, limits.summary_head_chars, limits.summary_tail_chars);
-    Ok((
-        format!(
-            "[artifact {} ({} bytes)] {}",
-            object.id,
-            text.len(),
-            summary
-        ),
-        Some(object),
-    ))
 }
 
 fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
@@ -708,58 +899,6 @@ fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
             ]
         }
     }
-}
-
-fn substitute(
-    value: &mut Value,
-    env_id: &str,
-    session: Option<&str>,
-    artifact: Option<&str>,
-) -> Result<()> {
-    match value {
-        Value::String(text) => {
-            if text == "$ENV" {
-                *text = env_id.to_string();
-            } else if text == "$SESSION" {
-                let session = session
-                    .ok_or_else(|| anyhow::anyhow!("$SESSION used before session_create"))?;
-                *text = session.to_string();
-            } else if text == "$ARTIFACT" {
-                let artifact = artifact
-                    .ok_or_else(|| anyhow::anyhow!("$ARTIFACT used before an artifact existed"))?;
-                *text = artifact.to_string();
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                substitute(item, env_id, session, artifact)?;
-            }
-        }
-        Value::Object(map) => {
-            for item in map.values_mut() {
-                substitute(item, env_id, session, artifact)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn extract_data(value: &Value) -> Result<Value> {
-    if value
-        .get("isError")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        bail!("tool failed: {value}");
-    }
-    if let Some(structured) = value.get("structuredContent") {
-        if structured.get("ok").and_then(Value::as_bool) != Some(true) {
-            bail!("tool returned not ok: {structured}");
-        }
-        return Ok(structured.get("data").cloned().unwrap_or(Value::Null));
-    }
-    Ok(value.clone())
 }
 
 fn tool_data(
