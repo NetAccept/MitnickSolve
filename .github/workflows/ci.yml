@@ -40,6 +40,26 @@ jobs:
       - name: Build envd
         working-directory: tools/envd
         run: go build -o ../../target/debug/envd ./cmd/envd
+      - name: envd service smoke
+        run: |
+          set -euo pipefail
+          rm -rf .msk/envd-ci
+          mkdir -p .msk
+          target/debug/envd --service --root .msk/envd-ci \
+            --listen 127.0.0.1:17800 --data-listen 127.0.0.1:17801 \
+            --token ci-token >.msk/envd-ci.log 2>&1 &
+          envd_pid=$!
+          trap 'kill "$envd_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 100); do
+            if curl -fsS http://127.0.0.1:17800/healthz >/dev/null; then break; fi
+            sleep 0.1
+          done
+          curl -fsS http://127.0.0.1:17800/healthz | jq -e '.ok == true'
+          curl -fsS -X POST http://127.0.0.1:17800/mcp \
+            -H 'Authorization: Bearer ci-token' -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}' \
+            | jq -e '.result.serverInfo.name == "envd"'
+          [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:17800/mcp -d '{}')" = 401 ]
       - name: Build kernel
         run: cargo build -p msk-kernel --bins
       - name: Daemon interactive session smoke

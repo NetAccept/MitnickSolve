@@ -5,7 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"github.com/cynosure279/mitnick/tools/envd/internal/protocol"
 	"github.com/cynosure279/mitnick/tools/envd/internal/server"
@@ -13,17 +15,33 @@ import (
 
 func main() {
 	var (
-		embedded bool
-		root     string
-		maxFrame int
+		embedded   bool
+		service    bool
+		root       string
+		maxFrame   int
+		listen     string
+		dataListen string
+		token      string
+		tlsCert    string
+		tlsKey     string
 	)
-	flag.BoolVar(&embedded, "embedded", false, "serve the frame protocol over stdin/stdout (M0)")
+	flag.BoolVar(&embedded, "embedded", false, "serve the frame protocol over stdin/stdout")
+	flag.BoolVar(&service, "service", false, "serve MCP over HTTP and MSDP over TCP")
 	flag.StringVar(&root, "root", ".msk-envd", "envd data root")
 	flag.IntVar(&maxFrame, "max-frame", protocol.EmbeddedMaxFrame, "maximum frame size in bytes")
+	flag.StringVar(&listen, "listen", "127.0.0.1:7800", "service control listen address")
+	flag.StringVar(&dataListen, "data-listen", "127.0.0.1:7801", "service data listen address (empty disables)")
+	flag.StringVar(&token, "token", "", "service bearer token (defaults to ENVD_TOKEN)")
+	flag.StringVar(&tlsCert, "tls-cert", "", "TLS certificate for service mode")
+	flag.StringVar(&tlsKey, "tls-key", "", "TLS private key for service mode")
 	flag.Parse()
 
-	if !embedded {
-		fmt.Fprintln(os.Stderr, "envd M0 only supports --embedded")
+	if embedded && service {
+		fmt.Fprintln(os.Stderr, "envd: --embedded and --service are mutually exclusive")
+		os.Exit(2)
+	}
+	if !embedded && !service {
+		fmt.Fprintln(os.Stderr, "envd: choose --embedded or --service")
 		os.Exit(2)
 	}
 
@@ -36,9 +54,42 @@ func main() {
 		fmt.Fprintln(os.Stderr, "envd:", err)
 		os.Exit(1)
 	}
-	if err := server.RunEmbedded(context.Background(), server.Options{
-		Root:     absRoot,
-		MaxFrame: maxFrame,
+
+	if embedded {
+		if err := server.RunEmbedded(context.Background(), server.Options{
+			Root:     absRoot,
+			MaxFrame: maxFrame,
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, "envd:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if token == "" {
+		token = os.Getenv("ENVD_TOKEN")
+	}
+	if token == "" {
+		fmt.Fprintln(os.Stderr, "envd: service mode requires --token or ENVD_TOKEN")
+		os.Exit(2)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	fmt.Fprintf(os.Stderr, "envd: service control listening on %s\n", listen)
+	if dataListen != "" {
+		fmt.Fprintf(os.Stderr, "envd: service data listening on %s\n", dataListen)
+	}
+	if err := server.RunService(ctx, server.ServiceOptions{
+		Options: server.Options{
+			Root:     absRoot,
+			MaxFrame: maxFrame,
+		},
+		Addr:     listen,
+		DataAddr: dataListen,
+		Token:    token,
+		TLSCert:  tlsCert,
+		TLSKey:   tlsKey,
 	}); err != nil {
 		fmt.Fprintln(os.Stderr, "envd:", err)
 		os.Exit(1)

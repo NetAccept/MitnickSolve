@@ -81,6 +81,8 @@
   - `wss`：`/data`，WebSocket 二进制消息，每条消息一个完整帧；经 HTTP 反向代理时使用。
 - 文件：小数据（默认 ≤ 1 MiB）内联 MCP；大数据走数据面；`file_link` 为外部客户端提供能力 URL。
 
+> **实现状态（0.2）**：控制面 `POST /mcp` 与独立 TCP/TLS 数据监听已实现；尚未提供 `/data` 的 HTTP Upgrade/WSS，也尚未把控制与数据合并为单连接多路复用。数据面接受 `CREDIT` 帧但未据此限流。连接断开后 session 继续运行，但当前数据视图不保留重连游标；详见 [`tools/envd/README.md`](../tools/envd/README.md)。
+
 ---
 
 ## 4. 版本与能力协商

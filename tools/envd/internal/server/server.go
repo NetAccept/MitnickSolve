@@ -13,7 +13,7 @@ import (
 	"github.com/cynosure279/mitnick/tools/envd/internal/protocol"
 )
 
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 type Options struct {
 	Root     string
@@ -28,10 +28,12 @@ type Env struct {
 }
 
 type Server struct {
-	opts     Options
-	mu       sync.Mutex
-	envs     map[string]*Env
-	sessions map[string]*Session
+	opts      Options
+	mu        sync.Mutex
+	envs      map[string]*Env
+	sessions  map[string]*Session
+	transport string
+	dataPlane bool
 }
 
 func New(opts Options) *Server {
@@ -39,9 +41,10 @@ func New(opts Options) *Server {
 		opts.MaxFrame = protocol.EmbeddedMaxFrame
 	}
 	return &Server{
-		opts:     opts,
-		envs:     make(map[string]*Env),
-		sessions: make(map[string]*Session),
+		opts:      opts,
+		envs:      make(map[string]*Env),
+		sessions:  make(map[string]*Session),
+		transport: "embedded-stdio",
 	}
 }
 

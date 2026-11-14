@@ -42,7 +42,7 @@ func (s *Server) dispatch(req rpcRequest) (rpcResponse, bool) {
 					"tools": map[string]any{},
 					"envd": map[string]any{
 						"protocol":      map[string]any{"min": 2, "max": 2},
-						"tools_version": "0.1",
+						"tools_version": "0.2",
 						"capabilities":  s.capabilities(),
 						"profiles":      []string{"dev", "host", "isolated"},
 					},
@@ -84,7 +84,10 @@ func (s *Server) dispatch(req rpcRequest) (rpcResponse, bool) {
 }
 
 func (s *Server) capabilities() []string {
-	caps := []string{"transport.embedded-stdio", "env.managed", "exec", "files"}
+	caps := []string{"transport." + s.transport, "env.managed", "exec", "files"}
+	if s.dataPlane {
+		caps = append(caps, "transport.tcp")
+	}
 	if runtime.GOOS == "windows" {
 		caps = append(caps, "signals.console", "fs.acl")
 	} else {

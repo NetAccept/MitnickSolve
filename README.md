@@ -9,7 +9,9 @@ results are in [`docs/performance.md`](docs/performance.md).
 M0 scaffold plus the P1 session/turn slice:
 
 - Rust workspace with the kernel/TUI skeleton and core types.
-- Embedded `envd` over stdio frames (Go; `go-pty` for cross-platform PTY).
+- Embedded `envd` over stdio frames (Go; `go-pty` for cross-platform PTY) and
+  service mode: MCP JSON-RPC over HTTP(S) plus an MSDP TCP/TLS data plane, both
+  behind a bearer token.
 - One end-to-end demo: kernel -> embedded envd -> `env_create` -> `write_file` ->
   `read_file` -> `exec` -> JSONL events.
 - wasmtime-backed WASM tool runtime: fresh store per call, fuel limit, 64 MiB
@@ -86,9 +88,6 @@ M0 scaffold plus the P1 session/turn slice:
   `exec.session` is granted by the kernel and checked in `EnvHost`.
 - Service-mode envd, persistence/replay, and multi-agent are next.
 
-The Go side is not compiled in this repository yet; see
-[`tools/envd/README.md`](tools/envd/README.md).
-
 ## Build
 
 ```sh
@@ -102,6 +101,23 @@ Build the embedded execution environment (requires Go 1.26+; CI uses 1.27):
 cd tools/envd
 go build -o ../../target/debug/envd ./cmd/envd
 ```
+
+Run it as a standalone service (remote/host deployment):
+
+```sh
+export ENVD_TOKEN=change-me
+target/debug/envd --service --root .msk/envd-service \
+  --listen 127.0.0.1:7800 --data-listen 127.0.0.1:7801
+curl -H "Authorization: Bearer $ENVD_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}' \
+  http://127.0.0.1:7800/mcp
+```
+
+Add `--tls-cert` and `--tls-key` for TLS 1.3. The data plane accepts MSDP
+`HELLO`/`OPEN`/`DATA`/`RESIZE`/`CLOSE` frames for an existing `session_id`; see
+[`tools/envd/README.md`](tools/envd/README.md). The kernel still uses embedded
+stdio by default.
 
 ## Run the M0 demo
 
