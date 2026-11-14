@@ -135,7 +135,8 @@ impl ToolHost for EnvHost {
         }
 
         let envd_tool = match ctx.tool.as_str() {
-            "exec" | "session_create" | "session_exec" | "session_close" => ctx.tool.as_str(),
+            "exec" | "session_create" | "session_exec" | "session_close" | "session_write"
+            | "session_read" | "session_resize" => ctx.tool.as_str(),
             other => return Err(format!("denied: tool {other} is not allowed")),
         };
         if !ctx.allows(Capability::ExecSession) {
@@ -292,6 +293,9 @@ fn main() -> Result<()> {
         Demo::Session => &[
             "session_create",
             "session_exec",
+            "session_write",
+            "session_read",
+            "session_resize",
             "session_close",
             "artifact_read",
         ],

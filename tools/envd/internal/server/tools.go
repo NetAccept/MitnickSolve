@@ -88,6 +88,12 @@ func (s *Server) callTool(name string, raw json.RawMessage) toolResult {
 		return s.toolSessionCreate(raw)
 	case "session_exec":
 		return s.toolSessionExec(raw)
+	case "session_write":
+		return s.toolSessionWrite(raw)
+	case "session_read":
+		return s.toolSessionRead(raw)
+	case "session_resize":
+		return s.toolSessionResize(raw)
 	case "session_list":
 		return s.toolSessionList(raw)
 	case "session_close":

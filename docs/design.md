@@ -744,6 +744,8 @@ pub trait LlmProvider: Send + Sync {
 - `session_list/kill`：后台作业与清理。
 - `exec`：一次性命令，保留为便捷接口；超时终止进程树。
 
+M0 实现：envd 支持 `pty=true` 的 PTY 会话（Windows ConPTY、Unix PTY），提供 `session_write/session_read/session_resize`；`session_exec` 仅用于管道会话，避免终端回显把标记行误判。
+
 **文件**
 
 - `read_file/write_file/list_dir/search/stat`；基于 `os.Root` 的 confine，拒绝绝对路径、`..`、逃逸符号链接。

@@ -166,17 +166,46 @@ func toolDefinitions() []map[string]any {
 			"inputSchema": objectSchema(map[string]any{
 				"env_id": stringProp(),
 				"shell":  stringProp(),
+				"pty":    map[string]any{"type": "boolean"},
+				"cols":   intProp(),
+				"rows":   intProp(),
 			}, "env_id"),
 		},
 		{
 			"name":        "session_exec",
-			"description": "Run a command in a persistent shell session and return its output.",
+			"description": "Run a command in a pipe-backed persistent shell session and return its output.",
 			"inputSchema": objectSchema(map[string]any{
 				"session_id":       stringProp(),
 				"command":          stringProp(),
 				"timeout_ms":       intProp(),
 				"max_output_bytes": intProp(),
 			}, "session_id", "command"),
+		},
+		{
+			"name":        "session_write",
+			"description": "Write base64-encoded bytes to a session, typically a PTY.",
+			"inputSchema": objectSchema(map[string]any{
+				"session_id":  stringProp(),
+				"data_base64": stringProp(),
+			}, "session_id", "data_base64"),
+		},
+		{
+			"name":        "session_read",
+			"description": "Read available session output as base64 bytes.",
+			"inputSchema": objectSchema(map[string]any{
+				"session_id": stringProp(),
+				"max_bytes":  intProp(),
+				"timeout_ms": intProp(),
+			}, "session_id"),
+		},
+		{
+			"name":        "session_resize",
+			"description": "Resize a PTY session.",
+			"inputSchema": objectSchema(map[string]any{
+				"session_id": stringProp(),
+				"cols":       intProp(),
+				"rows":       intProp(),
+			}, "session_id", "cols", "rows"),
 		},
 		{
 			"name":        "session_list",

@@ -1,9 +1,9 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -15,22 +15,27 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	gopty "github.com/aymanbagabas/go-pty"
 )
 
 const sessionPromptMarker = "__MSK_PROMPT__"
 
-// Session is a persistent shell inside an environment. Commands are wrapped
-// with a unique marker so the server can return exactly one command's output
-// without prompt detection.
+// Session is a persistent shell inside an environment. Pipe-backed sessions
+// support marker-based session_exec; PTY-backed sessions support raw
+// session_write/session_read/resize for interactive programs.
 type Session struct {
 	ID    string
 	EnvID string
 
 	mu        sync.Mutex
 	cmd       *exec.Cmd
+	ptyCmd    *gopty.Cmd
+	pty       gopty.Pty
 	stdin     io.WriteCloser
 	output    *os.File
-	lines     chan string
+	chunks    chan []byte
+	pending   []byte
 	markerSeq uint64
 	closed    bool
 }
@@ -39,6 +44,9 @@ func (s *Server) toolSessionCreate(raw json.RawMessage) toolResult {
 	var args struct {
 		EnvID string `json:"env_id"`
 		Shell string `json:"shell"`
+		Pty   bool   `json:"pty"`
+		Cols  uint16 `json:"cols"`
+		Rows  uint16 `json:"rows"`
 	}
 	if err := json.Unmarshal(raw, &args); err != nil {
 		return errResult(codeInvalidArgument, "INVALID_ARGUMENT", err.Error())
@@ -53,40 +61,76 @@ func (s *Server) toolSessionCreate(raw json.RawMessage) toolResult {
 		return errResult(codeUnsupported, "UNSUPPORTED", err.Error())
 	}
 
-	cmd := exec.Command(shell, shellArgs...)
-	cmd.Dir = env.Workspace
-	if runtime.GOOS == "windows" {
-		cmd.Env = append(os.Environ(), "PROMPT="+sessionPromptMarker)
+	cols := args.Cols
+	if cols == 0 {
+		cols = 120
 	}
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return errResult(codeInternal, "INTERNAL", err.Error())
+	rows := args.Rows
+	if rows == 0 {
+		rows = 40
 	}
-	output, writer, err := os.Pipe()
-	if err != nil {
-		return errResult(codeInternal, "INTERNAL", err.Error())
-	}
-	cmd.Stdout = writer
-	cmd.Stderr = writer
-
-	if err := cmd.Start(); err != nil {
-		_ = writer.Close()
-		_ = output.Close()
-		_ = stdin.Close()
-		return errResult(codeInternal, "INTERNAL", err.Error())
-	}
-	_ = writer.Close()
 
 	sess := &Session{
 		ID:     newID("ses"),
 		EnvID:  env.ID,
-		cmd:    cmd,
-		stdin:  stdin,
-		output: output,
-		lines:  make(chan string, 256),
+		chunks: make(chan []byte, 256),
 	}
-	go sess.readLoop()
-	go func() { _ = cmd.Wait() }()
+
+	if args.Pty {
+		p, err := gopty.New()
+		if err != nil {
+			return errResult(codeUnsupported, "UNSUPPORTED", "pty unavailable: "+err.Error())
+		}
+		shellPath := shell
+		if resolved, err := exec.LookPath(shell); err == nil {
+			shellPath = resolved
+		}
+		cmd := p.Command(shellPath, shellArgs...)
+		cmd.Dir = env.Workspace
+		cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+		if runtime.GOOS == "windows" {
+			cmd.Env = append(cmd.Env, "PROMPT="+sessionPromptMarker)
+		} else {
+			cmd.Env = append(cmd.Env, "PS1="+sessionPromptMarker)
+		}
+		if err := cmd.Start(); err != nil {
+			_ = p.Close()
+			return errResult(codeInternal, "INTERNAL", err.Error())
+		}
+		_ = p.Resize(int(cols), int(rows))
+		sess.pty = p
+		sess.ptyCmd = cmd
+		go sess.readLoop(p)
+		go func() { _ = cmd.Wait() }()
+	} else {
+		cmd := exec.Command(shell, shellArgs...)
+		cmd.Dir = env.Workspace
+		if runtime.GOOS == "windows" {
+			cmd.Env = append(os.Environ(), "PROMPT="+sessionPromptMarker)
+		}
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			return errResult(codeInternal, "INTERNAL", err.Error())
+		}
+		output, writer, err := os.Pipe()
+		if err != nil {
+			return errResult(codeInternal, "INTERNAL", err.Error())
+		}
+		cmd.Stdout = writer
+		cmd.Stderr = writer
+		if err := cmd.Start(); err != nil {
+			_ = writer.Close()
+			_ = output.Close()
+			_ = stdin.Close()
+			return errResult(codeInternal, "INTERNAL", err.Error())
+		}
+		_ = writer.Close()
+		sess.cmd = cmd
+		sess.stdin = stdin
+		sess.output = output
+		go sess.readLoop(output)
+		go func() { _ = cmd.Wait() }()
+	}
 
 	readyMarker := "__MSK_READY_" + randomToken() + "__"
 	if err := sess.sendReady(readyMarker); err != nil {
@@ -106,6 +150,9 @@ func (s *Server) toolSessionCreate(raw json.RawMessage) toolResult {
 		"session_id": sess.ID,
 		"state":      "running",
 		"shell":      shell,
+		"pty":        args.Pty,
+		"cols":       cols,
+		"rows":       rows,
 	})
 }
 
@@ -139,12 +186,17 @@ func (s *Server) toolSessionExec(raw json.RawMessage) toolResult {
 	if sess.closed {
 		return errResult(codeFailedPrecondition, "FAILED_PRECONDITION", "session is closed")
 	}
+	if sess.pty != nil {
+		return errResult(codeUnsupported, "UNSUPPORTED",
+			"PTY sessions use session_write/session_read/resize, not session_exec")
+	}
 
 	marker := fmt.Sprintf("__MSK_DONE_%d_%s__", sess.markerSeq, randomToken())
 	sess.markerSeq++
 	script := sessionScript(args.Command, marker)
-	if _, err := io.WriteString(sess.stdin, script); err != nil {
-		sess.closed = true
+	sess.pending = sess.pending[:0]
+	if err := sess.writeRaw([]byte(script)); err != nil {
+		sess.closeLocked()
 		return errResult(codeInternal, "INTERNAL", err.Error())
 	}
 
@@ -154,20 +206,18 @@ func (s *Server) toolSessionExec(raw json.RawMessage) toolResult {
 
 	var out bytes.Buffer
 	truncated := false
+	pending := sess.pending
 	for {
-		select {
-		case line, ok := <-sess.lines:
-			if !ok {
-				sess.closed = true
-				return errResult(codeInternal, "INTERNAL",
-					"session exited before marker; partial output: "+out.String())
+		for {
+			index := bytes.IndexByte(pending, '\n')
+			if index < 0 {
+				break
 			}
-			if index := strings.Index(line, marker); index >= 0 {
-				prefix := cleanSessionLine(line[:index])
-				if prefix != "" {
-					appendLimited(&out, prefix+"\n", args.MaxOutputBytes, &truncated)
-				}
-				code := parseExitCode(line[index+len(marker):])
+			line := string(pending[:index+1])
+			pending = pending[index+1:]
+			done, code := handleSessionLine(line, marker, &out, args.MaxOutputBytes, &truncated)
+			if done {
+				sess.pending = pending
 				return okResult(fmt.Sprintf("exit code %d", code), map[string]any{
 					"stdout":      out.String(),
 					"exit_code":   code,
@@ -175,18 +225,164 @@ func (s *Server) toolSessionExec(raw json.RawMessage) toolResult {
 					"duration_ms": time.Since(started).Milliseconds(),
 				})
 			}
-			cleaned := cleanSessionLine(line)
-			if cleaned != "" {
-				appendLimited(&out, cleaned+"\n", args.MaxOutputBytes, &truncated)
+		}
+		sess.pending = pending
+
+		select {
+		case chunk, ok := <-sess.chunks:
+			if !ok {
+				sess.closed = true
+				return errResult(codeInternal, "INTERNAL",
+					"session exited before marker; partial output: "+out.String())
 			}
+			pending = append(pending, chunk...)
 		case <-deadline.C:
-			sess.closed = true
-			_ = sess.cmd.Process.Kill()
-			_ = sess.output.Close()
+			sess.closeLocked()
 			return errResult(codeDeadlineExceeded, "DEADLINE_EXCEEDED",
 				fmt.Sprintf("command exceeded %d ms", args.TimeoutMS))
 		}
 	}
+}
+
+func (s *Server) toolSessionWrite(raw json.RawMessage) toolResult {
+	var args struct {
+		SessionID  string `json:"session_id"`
+		DataBase64 string `json:"data_base64"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return errResult(codeInvalidArgument, "INVALID_ARGUMENT", err.Error())
+	}
+	data, err := base64.StdEncoding.DecodeString(args.DataBase64)
+	if err != nil {
+		return errResult(codeInvalidArgument, "INVALID_ARGUMENT", "data_base64: "+err.Error())
+	}
+	if len(data) > 1<<20 {
+		return errResult(codeInvalidArgument, "INVALID_ARGUMENT", "write exceeds 1 MiB")
+	}
+
+	sess, err := s.getSession(args.SessionID)
+	if err != nil {
+		return errResult(codeNotFound, "NOT_FOUND", err.Error())
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.closed {
+		return errResult(codeFailedPrecondition, "FAILED_PRECONDITION", "session is closed")
+	}
+	if err := sess.writeRaw(data); err != nil {
+		sess.closeLocked()
+		return errResult(codeInternal, "INTERNAL", err.Error())
+	}
+	return okResult(fmt.Sprintf("wrote %d bytes", len(data)), map[string]any{
+		"bytes": len(data),
+	})
+}
+
+func (s *Server) toolSessionRead(raw json.RawMessage) toolResult {
+	var args struct {
+		SessionID string `json:"session_id"`
+		MaxBytes  int64  `json:"max_bytes"`
+		TimeoutMS int64  `json:"timeout_ms"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return errResult(codeInvalidArgument, "INVALID_ARGUMENT", err.Error())
+	}
+	maxBytes := args.MaxBytes
+	if maxBytes <= 0 || maxBytes > 1<<20 {
+		maxBytes = 64 << 10
+	}
+
+	sess, err := s.getSession(args.SessionID)
+	if err != nil {
+		return errResult(codeNotFound, "NOT_FOUND", err.Error())
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.closed {
+		return errResult(codeFailedPrecondition, "FAILED_PRECONDITION", "session is closed")
+	}
+
+	eof := false
+	if args.TimeoutMS <= 0 {
+	drain:
+		for {
+			select {
+			case chunk, ok := <-sess.chunks:
+				if !ok {
+					eof = true
+					break drain
+				}
+				sess.pending = append(sess.pending, chunk...)
+			default:
+				break drain
+			}
+		}
+	} else {
+		timer := time.NewTimer(time.Duration(args.TimeoutMS) * time.Millisecond)
+		defer timer.Stop()
+	wait:
+		for int64(len(sess.pending)) < maxBytes {
+			select {
+			case chunk, ok := <-sess.chunks:
+				if !ok {
+					eof = true
+					break wait
+				}
+				sess.pending = append(sess.pending, chunk...)
+			case <-timer.C:
+				break wait
+			}
+		}
+	}
+
+	n := int64(len(sess.pending))
+	if n > maxBytes {
+		n = maxBytes
+	}
+	data := sess.pending[:n]
+	sess.pending = sess.pending[n:]
+	if eof {
+		sess.closed = true
+	}
+	return okResult(fmt.Sprintf("read %d bytes", len(data)), map[string]any{
+		"data_base64": base64.StdEncoding.EncodeToString(data),
+		"bytes":       len(data),
+		"remaining":   len(sess.pending),
+		"eof":         eof,
+	})
+}
+
+func (s *Server) toolSessionResize(raw json.RawMessage) toolResult {
+	var args struct {
+		SessionID string `json:"session_id"`
+		Cols      uint16 `json:"cols"`
+		Rows      uint16 `json:"rows"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return errResult(codeInvalidArgument, "INVALID_ARGUMENT", err.Error())
+	}
+	if args.Cols == 0 || args.Rows == 0 {
+		return errResult(codeInvalidArgument, "INVALID_ARGUMENT", "cols and rows are required")
+	}
+	sess, err := s.getSession(args.SessionID)
+	if err != nil {
+		return errResult(codeNotFound, "NOT_FOUND", err.Error())
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.closed {
+		return errResult(codeFailedPrecondition, "FAILED_PRECONDITION", "session is closed")
+	}
+	if sess.pty == nil {
+		return errResult(codeUnsupported, "UNSUPPORTED", "session is not a PTY")
+	}
+	if err := sess.pty.Resize(int(args.Cols), int(args.Rows)); err != nil {
+		return errResult(codeInternal, "INTERNAL", err.Error())
+	}
+	return okResult("resized", map[string]any{
+		"cols": args.Cols,
+		"rows": args.Rows,
+	})
 }
 
 func (s *Server) toolSessionList(raw json.RawMessage) toolResult {
@@ -205,6 +401,7 @@ func (s *Server) toolSessionList(raw json.RawMessage) toolResult {
 		sessions = append(sessions, map[string]any{
 			"session_id": sess.ID,
 			"env_id":     sess.EnvID,
+			"pty":        sess.pty != nil,
 		})
 	}
 	return okResult(fmt.Sprintf("%d sessions", len(sessions)), map[string]any{
@@ -246,13 +443,15 @@ func (s *Server) getSession(id string) (*Session, error) {
 	return sess, nil
 }
 
-func (sess *Session) readLoop() {
-	reader := bufio.NewReader(sess.output)
-	defer close(sess.lines)
+func (sess *Session) readLoop(reader io.Reader) {
+	defer close(sess.chunks)
+	buffer := make([]byte, 4096)
 	for {
-		line, err := reader.ReadString('\n')
-		if line != "" {
-			sess.lines <- line
+		n, err := reader.Read(buffer)
+		if n > 0 {
+			chunk := make([]byte, n)
+			copy(chunk, buffer[:n])
+			sess.chunks <- chunk
 		}
 		if err != nil {
 			return
@@ -267,26 +466,59 @@ func (sess *Session) sendReady(marker string) error {
 	} else {
 		script = "printf '" + marker + "\\n'\n"
 	}
-	_, err := io.WriteString(sess.stdin, script)
+	return sess.writeRaw([]byte(script))
+}
+
+func (sess *Session) writeRaw(data []byte) error {
+	if sess.pty != nil {
+		_, err := sess.pty.Write(data)
+		return err
+	}
+	_, err := sess.stdin.Write(data)
 	return err
 }
 
 func (sess *Session) waitReady(marker string, timeout time.Duration) error {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
+	var pending []byte
 	for {
 		select {
-		case line, ok := <-sess.lines:
+		case chunk, ok := <-sess.chunks:
 			if !ok {
 				return fmt.Errorf("shell exited before ready")
 			}
-			if strings.Contains(line, marker) {
+			pending = append(pending, chunk...)
+			if bytes.Contains(pending, []byte(marker)) {
 				return nil
+			}
+			if len(pending) > 1<<20 {
+				pending = pending[len(pending)-(1<<20):]
 			}
 		case <-deadline.C:
 			return fmt.Errorf("shell did not become ready within %s", timeout)
 		}
 	}
+}
+
+func handleSessionLine(
+	line, marker string,
+	out *bytes.Buffer,
+	limit int64,
+	truncated *bool,
+) (bool, int) {
+	if index := strings.Index(line, marker); index >= 0 {
+		prefix := cleanSessionLine(line[:index])
+		if prefix != "" {
+			appendLimited(out, prefix+"\n", limit, truncated)
+		}
+		return true, parseExitCode(line[index+len(marker):])
+	}
+	cleaned := cleanSessionLine(line)
+	if cleaned != "" {
+		appendLimited(out, cleaned+"\n", limit, truncated)
+	}
+	return false, 0
 }
 
 func cleanSessionLine(line string) string {
@@ -299,15 +531,29 @@ func cleanSessionLine(line string) string {
 func (sess *Session) close() {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
+	sess.closeLocked()
+}
+
+func (sess *Session) closeLocked() {
 	if sess.closed {
 		return
 	}
 	sess.closed = true
-	if sess.cmd.Process != nil {
+	if sess.pty != nil {
+		_ = sess.pty.Close()
+	}
+	if sess.ptyCmd != nil && sess.ptyCmd.Process != nil {
+		_ = sess.ptyCmd.Process.Kill()
+	}
+	if sess.cmd != nil && sess.cmd.Process != nil {
 		_ = sess.cmd.Process.Kill()
 	}
-	_ = sess.stdin.Close()
-	_ = sess.output.Close()
+	if sess.stdin != nil {
+		_ = sess.stdin.Close()
+	}
+	if sess.output != nil {
+		_ = sess.output.Close()
+	}
 }
 
 func resolveShell(requested string) (string, []string, error) {

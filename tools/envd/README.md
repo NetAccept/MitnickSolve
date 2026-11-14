@@ -39,7 +39,9 @@ without a client will wait for a HELLO frame.
 
 ## Notes
 
-- Standard library only.
+- Go standard library plus `github.com/aymanbagabas/go-pty` for PTY sessions.
 - `secureJoin` currently handles traversal and existing symlinks. `os.Root`,
   Windows reserved names, and ADS rejection are TODO before service mode.
+- Pipe sessions support `session_exec`; PTY sessions use raw
+  `session_write` / `session_read` / `session_resize`.
 - `exec` is one-shot; sessions and process groups/Job Objects come next.

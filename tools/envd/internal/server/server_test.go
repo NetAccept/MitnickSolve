@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cynosure279/mitnick/tools/envd/internal/protocol"
 )
@@ -164,9 +165,83 @@ func TestSessionExec(t *testing.T) {
 	mustTool(t, s, "session_close", `{"session_id":"`+sid+`"}`)
 }
 
-func mustTool(t *testing.T, s *Server, name, args string) map[string]any {
+func TestPtySession(t *testing.T) {
+	s := New(Options{Root: t.TempDir(), MaxFrame: protocol.EmbeddedMaxFrame})
+	env := mustTool(t, s, "env_create", `{"name":"t"}`)
+	id := env["env_id"].(string)
+
+	createArgs, err := json.Marshal(map[string]any{
+		"env_id": id,
+		"pty":    true,
+		"cols":   80,
+		"rows":   24,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := s.callTool("session_create", createArgs)
+	session, ok := decodeTool(t, result)
+	if !ok {
+		t.Skipf("PTY unavailable: %v", result.StructuredContent)
+	}
+	sid, _ := session["session_id"].(string)
+	if sid == "" {
+		t.Fatal("missing session_id")
+	}
+
+	command := "echo $((6*7))\n"
+	if runtime.GOOS == "windows" {
+		command = "set /a 6*7\r\n"
+	}
+	writeArgs, err := json.Marshal(map[string]any{
+		"session_id":  sid,
+		"data_base64": base64.StdEncoding.EncodeToString([]byte(command)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustTool(t, s, "session_write", string(writeArgs))
+
+	deadline := time.Now().Add(5 * time.Second)
+	var output string
+	for time.Now().Before(deadline) {
+		readArgs, err := json.Marshal(map[string]any{
+			"session_id": sid,
+			"max_bytes":  4096,
+			"timeout_ms": 200,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		data := mustTool(t, s, "session_read", string(readArgs))
+		encoded, _ := data["data_base64"].(string)
+		raw, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		output += string(raw)
+		if strings.Contains(output, "42") {
+			break
+		}
+	}
+	if !strings.Contains(output, "42") {
+		t.Fatalf("PTY output: %q", output)
+	}
+
+	resizeArgs, err := json.Marshal(map[string]any{
+		"session_id": sid,
+		"cols":       100,
+		"rows":       30,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustTool(t, s, "session_resize", string(resizeArgs))
+	mustTool(t, s, "session_close", `{"session_id":"`+sid+`"}`)
+}
+
+func decodeTool(t *testing.T, result toolResult) (map[string]any, bool) {
 	t.Helper()
-	result := s.callTool(name, json.RawMessage(args))
 	raw, err := json.Marshal(result)
 	if err != nil {
 		t.Fatal(err)
@@ -179,14 +254,20 @@ func mustTool(t *testing.T, s *Server, name, args string) map[string]any {
 		t.Fatal(err)
 	}
 	if envelope.IsError {
-		t.Fatalf("tool %s failed: %v", name, envelope.StructuredContent)
-	}
-	if envelope.StructuredContent["ok"] != true {
-		t.Fatalf("tool %s not ok: %v", name, envelope.StructuredContent)
+		return nil, false
 	}
 	data, ok := envelope.StructuredContent["data"].(map[string]any)
 	if !ok {
-		t.Fatalf("tool %s data type: %T", name, envelope.StructuredContent["data"])
+		t.Fatalf("tool data type: %T", envelope.StructuredContent["data"])
+	}
+	return data, true
+}
+
+func mustTool(t *testing.T, s *Server, name, args string) map[string]any {
+	t.Helper()
+	data, ok := decodeTool(t, s.callTool(name, json.RawMessage(args)))
+	if !ok {
+		t.Fatalf("tool %s failed", name)
 	}
 	return data
 }

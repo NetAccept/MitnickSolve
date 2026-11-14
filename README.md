@@ -9,7 +9,7 @@ results are in [`docs/performance.md`](docs/performance.md).
 M0 scaffold:
 
 - Rust workspace with the kernel/TUI skeleton and core types.
-- Embedded `envd` over stdio frames (Go, standard library only).
+- Embedded `envd` over stdio frames (Go; `go-pty` for cross-platform PTY).
 - One end-to-end demo: kernel -> embedded envd -> `env_create` -> `write_file` ->
   `read_file` -> `exec` -> JSONL events.
 - wasmtime-backed WASM tool runtime: fresh store per call, fuel limit, 64 MiB
@@ -18,6 +18,9 @@ M0 scaffold:
   declared capabilities with kernel grants; a manifest can never self-grant.
 - Persistent shell sessions in envd (`session_create` / `session_exec` /
   `session_close`): repeated commands reuse one shell instead of spawning a process.
+- PTY sessions: `session_create` with `pty=true` uses ConPTY on Windows or a
+  Unix PTY; raw interaction goes through `session_write`, `session_read`, and
+  `session_resize`. `session_exec` remains pipe-only to keep marker parsing safe.
 - Multi-turn scripted agent loop: each LLM turn can issue tool calls, observations
   feed the next turn. The default demo creates a session, runs commands, verifies
   shell state, and closes it through WASM + manifest policy.

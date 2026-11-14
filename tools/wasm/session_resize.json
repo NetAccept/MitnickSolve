@@ -1,0 +1,9 @@
+{
+  "name": "session_resize",
+  "description": "Resize a PTY session.",
+  "input_schema": {
+    "type": "object",
+    "required": ["session_id", "cols", "rows"]
+  },
+  "capabilities": ["exec.session"]
+}

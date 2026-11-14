@@ -1,0 +1,9 @@
+{
+  "name": "session_read",
+  "description": "Read available session output as base64 bytes.",
+  "input_schema": {
+    "type": "object",
+    "required": ["session_id"]
+  },
+  "capabilities": ["exec.session"]
+}

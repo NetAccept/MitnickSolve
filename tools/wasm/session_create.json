@@ -3,7 +3,14 @@
   "description": "Start a persistent shell session inside an environment.",
   "input_schema": {
     "type": "object",
-    "required": ["env_id"]
+    "required": ["env_id"],
+    "properties": {
+      "env_id": {"type": "string"},
+      "shell": {"type": "string"},
+      "pty": {"type": "boolean"},
+      "cols": {"type": "integer"},
+      "rows": {"type": "integer"}
+    }
   },
   "capabilities": ["exec.session"]
 }

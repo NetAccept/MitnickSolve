@@ -1,0 +1,9 @@
+{
+  "name": "session_write",
+  "description": "Write base64-encoded bytes to a session, typically a PTY.",
+  "input_schema": {
+    "type": "object",
+    "required": ["session_id", "data_base64"]
+  },
+  "capabilities": ["exec.session"]
+}
