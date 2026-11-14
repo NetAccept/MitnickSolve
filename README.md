@@ -103,8 +103,9 @@ M0 scaffold plus the P1 session/turn slice:
   signed cdylib as the model provider; the kernel keeps an allocation ledger,
   copies and frees responses, serializes calls, and never unloads the library.
   `--component-host <binary>` runs the same component in
-  `msk-component-host`, so a component abort kills only that process. See
-  [`docs/components.md`](docs/components.md).
+  `msk-component-host`, so a component abort kills only that process. A C header
+  and a build-time `sizeof`/`offsetof` parity probe keep the Rust and C ABI in
+  sync. See [`docs/components.md`](docs/components.md).
 - Subagents: `spawn_agent` creates a headless child task and `agent_result`
   waits for its state/transcript. Both require `agent.spawn`; spawning is
   approval-gated by default, the child runs with delegated `approvals=allow`,

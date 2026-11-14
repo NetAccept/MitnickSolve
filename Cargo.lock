@@ -1216,6 +1216,9 @@ dependencies = [
 [[package]]
 name = "msk-abi"
 version = "0.1.0"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "msk-core"

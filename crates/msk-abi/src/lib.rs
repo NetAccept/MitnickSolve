@@ -214,4 +214,85 @@ mod tests {
         assert_eq!(size_of::<ms_bytes>(), 8);
         assert_eq!(size_of::<ms_llm_vtable>(), 48);
     }
+
+    unsafe extern "C" {
+        fn msk_c_sizeof_header() -> usize;
+        fn msk_c_offsetof_header_id() -> usize;
+        fn msk_c_offsetof_header_version() -> usize;
+        fn msk_c_sizeof_host() -> usize;
+        fn msk_c_offsetof_host_ctx() -> usize;
+        fn msk_c_offsetof_host_alloc() -> usize;
+        fn msk_c_offsetof_host_free() -> usize;
+        fn msk_c_offsetof_host_log() -> usize;
+        fn msk_c_offsetof_host_config_get() -> usize;
+        fn msk_c_offsetof_host_now_unix_ms() -> usize;
+        fn msk_c_sizeof_component() -> usize;
+        fn msk_c_offsetof_component_port_kind() -> usize;
+        fn msk_c_offsetof_component_vtable() -> usize;
+        fn msk_c_offsetof_component_init() -> usize;
+        fn msk_c_offsetof_component_shutdown() -> usize;
+        fn msk_c_sizeof_vtable_header() -> usize;
+        fn msk_c_sizeof_bytes() -> usize;
+        fn msk_c_sizeof_llm_vtable() -> usize;
+        fn msk_c_offsetof_llm_vtable_complete() -> usize;
+        fn msk_c_offsetof_llm_vtable_stream() -> usize;
+        fn msk_c_offsetof_llm_vtable_reserved() -> usize;
+    }
+
+    #[test]
+    fn c_header_matches_rust_layout() {
+        unsafe {
+            assert_eq!(msk_c_sizeof_header(), size_of::<ms_abi_header>());
+            assert_eq!(msk_c_offsetof_header_id(), offset_of!(ms_abi_header, id));
+            assert_eq!(
+                msk_c_offsetof_header_version(),
+                offset_of!(ms_abi_header, version)
+            );
+            assert_eq!(msk_c_sizeof_host(), size_of::<ms_host>());
+            assert_eq!(msk_c_offsetof_host_ctx(), offset_of!(ms_host, ctx));
+            assert_eq!(msk_c_offsetof_host_alloc(), offset_of!(ms_host, alloc));
+            assert_eq!(msk_c_offsetof_host_free(), offset_of!(ms_host, free));
+            assert_eq!(msk_c_offsetof_host_log(), offset_of!(ms_host, log));
+            assert_eq!(
+                msk_c_offsetof_host_config_get(),
+                offset_of!(ms_host, config_get)
+            );
+            assert_eq!(
+                msk_c_offsetof_host_now_unix_ms(),
+                offset_of!(ms_host, now_unix_ms)
+            );
+            assert_eq!(msk_c_sizeof_component(), size_of::<ms_component>());
+            assert_eq!(
+                msk_c_offsetof_component_port_kind(),
+                offset_of!(ms_component, port_kind)
+            );
+            assert_eq!(
+                msk_c_offsetof_component_vtable(),
+                offset_of!(ms_component, vtable)
+            );
+            assert_eq!(
+                msk_c_offsetof_component_init(),
+                offset_of!(ms_component, init)
+            );
+            assert_eq!(
+                msk_c_offsetof_component_shutdown(),
+                offset_of!(ms_component, shutdown)
+            );
+            assert_eq!(msk_c_sizeof_vtable_header(), size_of::<ms_vtable_header>());
+            assert_eq!(msk_c_sizeof_bytes(), size_of::<ms_bytes>());
+            assert_eq!(msk_c_sizeof_llm_vtable(), size_of::<ms_llm_vtable>());
+            assert_eq!(
+                msk_c_offsetof_llm_vtable_complete(),
+                offset_of!(ms_llm_vtable, complete)
+            );
+            assert_eq!(
+                msk_c_offsetof_llm_vtable_stream(),
+                offset_of!(ms_llm_vtable, stream)
+            );
+            assert_eq!(
+                msk_c_offsetof_llm_vtable_reserved(),
+                offset_of!(ms_llm_vtable, reserved)
+            );
+        }
+    }
 }

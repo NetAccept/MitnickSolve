@@ -43,8 +43,10 @@ a plain file name in the manifest directory. `trust.json`:
 ## ABI v1 (64-bit only)
 
 All structs use natural alignment and `struct_size` means the total size of the
-containing struct. The Rust definitions live in `crates/msk-abi/src/lib.rs`;
-layout is asserted by tests. Sizes on 64-bit:
+containing struct. The Rust definitions live in `crates/msk-abi/src/lib.rs`; the
+C header is `crates/msk-abi/include/msk_abi.h`. A build-script layout probe
+compares every `sizeof`/`offsetof` with the Rust values in CI, so the two cannot
+drift silently. Sizes on 64-bit:
 
 | Struct | Size | Key offsets |
 | --- | ---: | --- |
@@ -140,7 +142,7 @@ is for tests only.
 ## Remaining M2 work
 
 - Restart policy, resource limits, and syscall sandbox for the component host.
-- C header (`crates/msk-abi/include/msk_abi.h`) and cross-language conformance.
+- Cross-language component conformance harness beyond layout parity.
 - TOCTOU-hardened loading (memfd/`/proc/self/fd` on Linux, handle-based loading
   on Windows) and DLL search hardening.
 - Streaming vtable slot (reserved in v1).
