@@ -60,7 +60,7 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-Build the embedded execution environment (requires Go 1.25+):
+Build the embedded execution environment (requires Go 1.26+; CI uses 1.27):
 
 ```sh
 cd tools/envd
