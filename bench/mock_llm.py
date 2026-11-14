@@ -14,8 +14,12 @@ class Handler(BaseHTTPRequestHandler):
     calls = 0
 
     def do_GET(self):
-        body = json.dumps({"ok": True, "path": self.path}).encode()
-        self.send_response(200)
+        if self.path == "/secret" and self.headers.get("X-Api-Key") != "s3cret":
+            body = b'{"ok":false}'
+            self.send_response(401)
+        else:
+            body = json.dumps({"ok": True, "path": self.path}).encode()
+            self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -156,9 +160,46 @@ class Handler(BaseHTTPRequestHandler):
                 has_result = True
         return task_id, has_result
 
+    def wants_secret(self, request):
+        for message in request.get("messages", []):
+            if message.get("role") == "user" and "secret" in (
+                message.get("content") or ""
+            ):
+                return True
+        return False
+
     def chat_payload(self, request):
         wants_file = self.wants_file(request)
         wants_spawn = self.wants_spawn(request)
+        if Handler.calls == 1 and self.wants_secret(request):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_secret",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "http_request",
+                                        "arguments": json.dumps(
+                                            {
+                                                "url": "http://127.0.0.1:8765/secret",
+                                                "method": "GET",
+                                                "headers": {
+                                                    "X-Api-Key": "$secret:api"
+                                                },
+                                            }
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ],
+                "usage": {"total_tokens": 7},
+            }
         if wants_spawn and Handler.calls > 1:
             task_id, has_result = self.spawn_context(request)
             if task_id and not has_result:

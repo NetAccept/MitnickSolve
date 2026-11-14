@@ -35,7 +35,10 @@ pub fn default_policy() -> PolicyTable {
         ("write_file", vec![Capability::FsWorkspace]),
         ("list_dir", vec![Capability::FsWorkspace]),
         ("stat_file", vec![Capability::FsWorkspace]),
-        ("http_request", vec![Capability::NetEgress]),
+        (
+            "http_request",
+            vec![Capability::NetEgress, Capability::SecretsRead],
+        ),
         ("spawn_agent", vec![Capability::AgentSpawn]),
         ("agent_result", vec![Capability::AgentSpawn]),
         ("echo", vec![]),

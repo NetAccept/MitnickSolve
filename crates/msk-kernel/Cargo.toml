@@ -35,6 +35,7 @@ msk-events.workspace = true
 msk-ipc.workspace = true
 msk-llm.workspace = true
 msk-mcp.workspace = true
+msk-secret.workspace = true
 msk-wasm.workspace = true
 serde.workspace = true
 serde_json.workspace = true

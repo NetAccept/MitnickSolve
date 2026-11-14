@@ -5,5 +5,5 @@
     "type": "object",
     "required": ["url"]
   },
-  "capabilities": ["net.egress"]
+  "capabilities": ["net.egress", "secrets.read"]
 }

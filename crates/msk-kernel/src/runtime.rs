@@ -19,6 +19,7 @@ use msk_ipc::{Client, methods};
 use msk_kernel::policy;
 use msk_llm::{LlmDelta, LlmError, LlmProvider, LlmRequest, LlmResponse, Message, ToolSchema};
 use msk_mcp::EnvTransport;
+use msk_secret::SecretStore;
 use msk_wasm::{ToolContext, ToolHost, ToolManifest, WasmtimeRuntime};
 use serde_json::{Value, json};
 
@@ -27,6 +28,7 @@ pub struct EnvHost {
     pub client: Arc<Mutex<Box<dyn EnvTransport>>>,
     pub artifacts: Arc<dyn ObjectStore>,
     pub control: Option<Arc<ControlPlane>>,
+    pub secrets: Arc<dyn SecretStore>,
     pub agent_depth: u32,
     pub default_provider: String,
 }
@@ -130,7 +132,11 @@ fn default_http_method() -> String {
 /// Host-side HTTP egress for the `http_request` WASM tool. The WASM guest
 /// cannot bypass the capability check in `EnvHost::call`; this function only
 /// performs the I/O after that check. Redirects and http/https only.
-fn http_request(input: &[u8]) -> Result<Vec<u8>, String> {
+fn http_request(
+    input: &[u8],
+    secrets: &dyn SecretStore,
+    allow_secrets: bool,
+) -> Result<Vec<u8>, String> {
     let args: HttpRequestArgs = serde_json::from_slice(input)
         .map_err(|err| format!("invalid http request input: {err}"))?;
     let method = args.method.to_ascii_uppercase();
@@ -161,7 +167,19 @@ fn http_request(input: &[u8]) -> Result<Vec<u8>, String> {
         .method(method.as_str())
         .uri(&args.url);
     for (name, value) in &args.headers {
-        builder = builder.header(name, value);
+        let resolved = if let Some(secret_name) = value.strip_prefix("$secret:") {
+            if !allow_secrets {
+                return Err("denied: secrets.read not granted".into());
+            }
+            let secret_name = secret_name.trim();
+            let secret = secrets
+                .get(secret_name)
+                .ok_or_else(|| format!("secret not found: {secret_name}"))?;
+            secret.expose().to_string()
+        } else {
+            value.clone()
+        };
+        builder = builder.header(name, &resolved);
     }
     let request = builder
         .body(body)
@@ -273,7 +291,11 @@ impl ToolHost for EnvHost {
             if !ctx.allows(Capability::NetEgress) {
                 return Err("denied: net.egress not granted".to_string());
             }
-            return http_request(input);
+            return http_request(
+                input,
+                self.secrets.as_ref(),
+                ctx.allows(Capability::SecretsRead),
+            );
         }
         if ctx.tool == "artifact_read" {
             if !ctx.allows(Capability::ArtifactRead) {
@@ -520,7 +542,7 @@ mod tests {
             "headers": {"X-Test": "1"}
         }))
         .unwrap();
-        let output = http_request(&input).unwrap();
+        let output = http_request(&input, &msk_secret::MemorySecretStore::new(), false).unwrap();
         let value: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(value["status"], 200);
         let body = STANDARD
@@ -538,8 +560,47 @@ mod tests {
     }
 
     #[test]
+    fn http_request_resolves_secret_headers_without_leaking_them() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            assert!(request.contains("x-api-key: s3cret"), "{request}");
+            let body = "ok";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let secrets = msk_secret::MemorySecretStore::new();
+        secrets.insert("api", "s3cret");
+        let input = serde_json::to_vec(&json!({
+            "url": format!("http://{address}/"),
+            "headers": {"X-Api-Key": "$secret:api"}
+        }))
+        .unwrap();
+        let output = http_request(&input, &secrets, true).unwrap();
+        assert!(!String::from_utf8_lossy(&output).contains("s3cret"));
+        server.join().unwrap();
+
+        assert!(http_request(&input, &secrets, false).is_err());
+        let missing = serde_json::to_vec(&json!({
+            "url": format!("http://{address}/"),
+            "headers": {"X-Api-Key": "$secret:missing"}
+        }))
+        .unwrap();
+        assert!(http_request(&missing, &secrets, true).is_err());
+    }
+
+    #[test]
     fn http_request_rejects_non_http_urls() {
         let input = serde_json::to_vec(&json!({"url": "file:///etc/passwd"})).unwrap();
-        assert!(http_request(&input).is_err());
+        assert!(http_request(&input, &msk_secret::MemorySecretStore::new(), false).is_err());
     }
 }

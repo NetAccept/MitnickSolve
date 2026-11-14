@@ -97,6 +97,10 @@ M0 scaffold plus the P1 session/turn slice:
   approval-gated by default, the child runs with delegated `approvals=allow`,
   and depth is capped at 2. `mskctl create --headless --goal ...` and
   `mskctl result task-...` expose the same path.
+- Secrets: `EnvSecretStore` maps `$secret:name` to `MSK_SECRET_NAME` (names are
+  uppercased, non-alphanumerics become `_`). `http_request` resolves secret
+  header values on the host after the `secrets.read` capability check; the
+  plaintext never enters the model-visible observation or event log.
 - File and HTTP tools: `read_file`/`write_file`/`list_dir`/`stat_file` run
   through envd with `fs.workspace` (writes require approval); `http_request`
   performs host-side HTTP(S) under `net.egress` with a 30 s default timeout and
@@ -332,6 +336,7 @@ close); the control-plane `terminal-*` commands are convenient for scripting.
 | `crates/msk-data` | Content-addressed artifact store |
 | `crates/msk-llm` | LLM provider port and scripted provider |
 | `crates/msk-mcp` | MCP client and embedded stdio frame transport |
+| `crates/msk-secret` | Secret store port, env and memory backends |
 | `crates/msk-wasm` | WASM tool runtime boundary (stub) |
 | `crates/msk-loader` | Signed core component manifest/loader boundary |
 | `crates/msk-kernel` | Kernel binary and M0 demo |

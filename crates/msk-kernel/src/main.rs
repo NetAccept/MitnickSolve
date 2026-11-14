@@ -21,6 +21,7 @@ use msk_llm::{
     OpenAiResponsesProvider, ScriptedProvider,
 };
 use msk_mcp::{EnvClient, EnvTransport, ServiceClient};
+use msk_secret::EnvSecretStore;
 use msk_wasm::ToolHost;
 use runtime::{
     ControlPlane, EnvHost, build_observation, complete_or_stream, extract_data, llm_request,
@@ -583,6 +584,7 @@ fn main() -> Result<()> {
         client: client.clone(),
         artifacts: object_store.clone(),
         control: None,
+        secrets: Arc::new(EnvSecretStore::default()),
         agent_depth: 0,
         default_provider: "scripted".into(),
     });
@@ -820,6 +822,7 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         client,
         artifacts: object_store.clone(),
         control: control.map(Arc::new),
+        secrets: Arc::new(EnvSecretStore::default()),
         agent_depth: cli.agent_depth,
         default_provider: provider_kind_str(cli.provider).into(),
     });
