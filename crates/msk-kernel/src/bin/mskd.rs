@@ -16,7 +16,7 @@ use msk_events::Event;
 use msk_ipc::data::{DATA_MAX_FRAME, DataFrame, DataKind, write_frame};
 use msk_ipc::local::{self, Stream};
 use msk_ipc::{RpcNotification, RpcRequest, RpcResponse, TryClone, methods};
-use msk_mcp::EnvClient;
+use msk_mcp::{EnvClient, EnvTransport, ServiceClient};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -25,9 +25,15 @@ struct Cli {
     /// Kernel state directory containing the socket and token.
     #[arg(long, default_value = ".msk")]
     root: PathBuf,
-    /// Path to the envd binary.
+    /// Path to the envd binary (embedded mode).
     #[arg(long)]
-    envd: PathBuf,
+    envd: Option<PathBuf>,
+    /// Remote envd service URL; tasks and the terminal use it instead.
+    #[arg(long)]
+    envd_url: Option<String>,
+    /// Bearer token for --envd-url (defaults to ENVD_TOKEN).
+    #[arg(long)]
+    envd_token: Option<String>,
     /// Directory containing tool manifests and WAT modules.
     #[arg(long, default_value = "tools/wasm")]
     tools_dir: PathBuf,
@@ -108,7 +114,7 @@ struct Subscriber {
 }
 
 struct TerminalSession {
-    client: EnvClient,
+    client: Box<dyn EnvTransport>,
     session_id: String,
     cols: u16,
     rows: u16,
@@ -143,7 +149,9 @@ struct Inner {
 
 struct Daemon {
     root: PathBuf,
-    envd: PathBuf,
+    envd: Option<PathBuf>,
+    envd_url: Option<String>,
+    envd_token: Option<String>,
     tools_dir: PathBuf,
     agent_bin: PathBuf,
     token: String,
@@ -161,9 +169,25 @@ fn main() -> Result<()> {
     fs::create_dir_all(&cli.root)?;
     let root = msk_ipc::normalize_root(&cli.root);
 
-    let envd = msk_ipc::normalize_root(&cli.envd);
-    if !envd.exists() {
-        bail!("envd binary not found: {}", envd.display());
+    let envd = cli.envd.as_ref().map(|path| msk_ipc::normalize_root(path));
+    if envd.is_none() && cli.envd_url.is_none() {
+        bail!("either --envd or --envd-url is required");
+    }
+    if envd.is_some() && cli.envd_url.is_some() {
+        bail!("use either --envd or --envd-url, not both");
+    }
+    if let Some(envd) = &envd {
+        if !envd.exists() {
+            bail!("envd binary not found: {}", envd.display());
+        }
+    }
+    let envd_url = cli.envd_url.clone();
+    let envd_token = cli
+        .envd_token
+        .clone()
+        .or_else(|| std::env::var("ENVD_TOKEN").ok());
+    if envd_url.is_some() && envd_token.is_none() {
+        bail!("--envd-token or ENVD_TOKEN is required with --envd-url");
     }
     let tools_dir = msk_ipc::normalize_root(&cli.tools_dir);
     if !tools_dir.exists() {
@@ -185,10 +209,17 @@ fn main() -> Result<()> {
     println!("mskd data at {}", local::data_display_name(&root));
     println!("token file: {}", msk_ipc::token_path(&root).display());
     println!("agent: {}", agent_bin.display());
+    if let Some(url) = &envd_url {
+        println!("envd service: {url}");
+    } else if let Some(envd) = &envd {
+        println!("envd: {}", envd.display());
+    }
 
     let daemon = Arc::new(Daemon {
         root,
         envd,
+        envd_url,
+        envd_token,
         tools_dir,
         agent_bin,
         token,
@@ -620,9 +651,16 @@ impl Daemon {
         };
 
         let mut command = Command::new(&self.agent_bin);
+        if let Some(url) = &self.envd_url {
+            command
+                .arg("--envd-url")
+                .arg(url)
+                .arg("--envd-token")
+                .arg(self.envd_token.as_deref().unwrap_or_default());
+        } else if let Some(envd) = &self.envd {
+            command.arg("--envd").arg(envd);
+        }
         command
-            .arg("--envd")
-            .arg(&self.envd)
             .arg("--root")
             .arg(&dir)
             .arg("--tools-dir")
@@ -1308,11 +1346,20 @@ impl Daemon {
 
         let cols = params.get("cols").and_then(Value::as_u64).unwrap_or(100) as u16;
         let rows = params.get("rows").and_then(Value::as_u64).unwrap_or(30) as u16;
-        let envd_root = self.root.join("terminal-envd");
-        fs::create_dir_all(&envd_root)?;
-        let mut client = EnvClient::spawn(&self.envd, &envd_root).context("spawn terminal envd")?;
-        client.handshake("mskd-terminal")?;
-        client.initialize()?;
+        let mut client: Box<dyn EnvTransport> = if let Some(url) = &self.envd_url {
+            let mut service =
+                ServiceClient::new(url, self.envd_token.as_deref().unwrap_or_default());
+            service.initialize()?;
+            Box::new(service)
+        } else {
+            let envd = self.envd.as_ref().context("envd is not configured")?;
+            let envd_root = self.root.join("terminal-envd");
+            fs::create_dir_all(&envd_root)?;
+            let mut embedded = EnvClient::spawn(envd, &envd_root).context("spawn terminal envd")?;
+            embedded.handshake("mskd-terminal")?;
+            embedded.initialize()?;
+            Box::new(embedded)
+        };
 
         let env = client.call_tool(
             "env_create",
