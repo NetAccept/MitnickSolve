@@ -89,6 +89,12 @@ pub enum LlmError {
     Config(String),
     #[error("http: {0}")]
     Http(String),
+    #[error("protocol: {0}")]
+    Protocol(String),
+    #[error("auth: {0}")]
+    Auth(String),
+    #[error("timeout: {0}")]
+    Timeout(String),
     #[error("scripted provider exhausted")]
     Exhausted,
 }

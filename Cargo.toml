@@ -30,6 +30,7 @@ msk-data = { path = "crates/msk-data" }
 msk-events = { path = "crates/msk-events" }
 msk-ipc = { path = "crates/msk-ipc" }
 msk-llm = { path = "crates/msk-llm" }
+msk-loader = { path = "crates/msk-loader" }
 msk-mcp = { path = "crates/msk-mcp" }
 msk-secret = { path = "crates/msk-secret" }
 msk-wasm = { path = "crates/msk-wasm" }

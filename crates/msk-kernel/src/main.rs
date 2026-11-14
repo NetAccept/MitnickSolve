@@ -36,11 +36,12 @@ enum Demo {
     Echo,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum ProviderKind {
     Scripted,
     Openai,
     OpenaiResponses,
+    Component,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -104,6 +105,12 @@ struct Cli {
     /// LLM provider backend.
     #[arg(long, value_enum, default_value_t = ProviderKind::Scripted)]
     provider: ProviderKind,
+    /// Signed llm.provider component manifest (with --provider component).
+    #[arg(long)]
+    component_manifest: Option<PathBuf>,
+    /// Component trust store; defaults to trust.json next to the manifest.
+    #[arg(long)]
+    component_trust: Option<PathBuf>,
     /// Ask before executing commands in a session; allow runs them directly.
     #[arg(long, value_enum, default_value_t = Approvals::Ask)]
     approvals: Approvals,
@@ -616,18 +623,7 @@ fn main() -> Result<()> {
     context.push_pinned(Role::User, cli.goal.clone());
     context.push_pinned(Role::System, format!("env_id={env_id}"));
 
-    let provider: Box<dyn LlmProvider> = match cli.provider {
-        ProviderKind::Scripted => {
-            Box::new(ScriptedProvider::new("scripted", demo_responses(cli.demo)))
-        }
-        ProviderKind::Openai => Box::new(
-            OpenAiProvider::new(openai_config(&cli)?).context("configure OpenAI provider")?,
-        ),
-        ProviderKind::OpenaiResponses => Box::new(
-            OpenAiResponsesProvider::new(openai_config(&cli)?)
-                .context("configure OpenAI Responses provider")?,
-        ),
-    };
+    let provider = build_provider(&cli, true)?;
     let mut response = complete_or_stream(
         provider.as_ref(),
         &llm_request(&context, &registry),
@@ -894,7 +890,7 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         }
     }
 
-    let provider = session_provider(cli)?;
+    let provider = build_provider(cli, false)?;
     let gate = ApprovalGate::new(cli.stdio_json, Duration::from_secs(300));
     let approvals: Option<Box<dyn ApprovalHandler>> = if cli.approvals == Approvals::Ask {
         Some(Box::new(gate.clone()))
@@ -1047,12 +1043,24 @@ fn provider_kind_str(kind: ProviderKind) -> &'static str {
         ProviderKind::Scripted => "scripted",
         ProviderKind::Openai => "openai",
         ProviderKind::OpenaiResponses => "openai-responses",
+        ProviderKind::Component => "component",
     }
 }
 
-fn session_provider(cli: &Cli) -> Result<Box<dyn LlmProvider>> {
+fn build_provider(cli: &Cli, demo: bool) -> Result<Box<dyn LlmProvider>> {
+    if cli.provider != ProviderKind::Component
+        && (cli.component_manifest.is_some() || cli.component_trust.is_some())
+    {
+        bail!("--component-manifest/--component-trust require --provider component");
+    }
     Ok(match cli.provider {
-        ProviderKind::Scripted => Box::new(EchoProvider::new("echo")),
+        ProviderKind::Scripted => {
+            if demo {
+                Box::new(ScriptedProvider::new("scripted", demo_responses(cli.demo)))
+            } else {
+                Box::new(EchoProvider::new("echo"))
+            }
+        }
         ProviderKind::Openai => {
             Box::new(OpenAiProvider::new(openai_config(cli)?).context("configure OpenAI provider")?)
         }
@@ -1060,6 +1068,23 @@ fn session_provider(cli: &Cli) -> Result<Box<dyn LlmProvider>> {
             OpenAiResponsesProvider::new(openai_config(cli)?)
                 .context("configure OpenAI Responses provider")?,
         ),
+        ProviderKind::Component => {
+            let manifest = cli
+                .component_manifest
+                .clone()
+                .context("--component-manifest is required with --provider component")?;
+            let trust = cli.component_trust.clone().unwrap_or_else(|| {
+                manifest
+                    .parent()
+                    .map(|parent| parent.join("trust.json"))
+                    .unwrap_or_else(|| PathBuf::from("trust.json"))
+            });
+            let provider = msk_kernel::component::ComponentLlmProvider::load(
+                &msk_kernel::component::ComponentOptions { manifest, trust },
+            )
+            .context("load component provider")?;
+            Box::new(provider)
+        }
     })
 }
 

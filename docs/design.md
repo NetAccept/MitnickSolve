@@ -260,47 +260,67 @@ sealed 判定写死在加载器里，与签名无关：组件 manifest 声明 se
 
 ```c
 typedef struct ms_abi_header {
-    uint32_t abi_version;   /* MS_ABI_VERSION */
-    uint32_t struct_size;   /* sizeof(本结构) */
-    const char *id;         /* 组件 ID */
-    const char *version;    /* 语义化版本 */
+    uint32_t abi_version;   /* MS_ABI_VERSION = 1 */
+    uint32_t struct_size;   /* 整个包含结构的大小，不只是本头 */
+    const uint8_t *id;      /* 静态 NUL 结尾 UTF-8 */
+    const uint8_t *version; /* 静态 NUL 结尾 UTF-8 */
 } ms_abi_header;
 
+typedef int32_t (*ms_init_fn)(const ms_host *host, void **out_ctx);
+
 typedef struct ms_host {
-    ms_abi_header header;
+    ms_abi_header header;   /* struct_size = sizeof(ms_host) = 72 (64-bit) */
     void *ctx;
     void *(*alloc)(void *ctx, size_t len);
     void  (*free)(void *ctx, void *ptr, size_t len);
-    void  (*log)(void *ctx, int level, const uint8_t *msg, size_t len);
-    int32_t (*config_get)(void *ctx, const char *key, uint8_t *buf, size_t *len);
+    void  (*log)(void *ctx, int32_t level, const uint8_t *msg, size_t len);
+    int32_t (*config_get)(void *ctx, const uint8_t *key, size_t key_len,
+                          uint8_t *buf, size_t *len);  /* len 输入容量/输出所需 */
     int32_t (*now_unix_ms)(void *ctx, int64_t *out);
 } ms_host;
 
 typedef struct ms_component {
-    ms_abi_header header;
-    uint32_t port_kind;     /* 例如 MS_PORT_LLM */
-    const void *vtable;     /* 端口专用函数表 */
-    int32_t (*init)(const ms_host *host, void **out_ctx);
-    void    (*shutdown)(void *ctx);
+    ms_abi_header header;   /* struct_size = sizeof(ms_component) = 56 */
+    uint32_t port_kind;
+    const void *vtable;
+    ms_init_fn init;        /* 返回 i32，绝不返回 Rust enum */
+    void (*shutdown)(void *ctx);
 } ms_component;
 
-const ms_component *ms_component_entry(void);
+const ms_component *ms_component_entry(void);  /* 进程生命周期静态指针 */
 ```
 
-端口 vtable 示例（LLM）：
+端口 vtable（LLM，v1 只启用 `complete`，`stream` 槽保留）：
 
 ```c
+typedef struct ms_vtable_header {
+    uint32_t abi_version;   /* 1 */
+    uint32_t struct_size;   /* 整个 vtable 大小 */
+    uint32_t port_kind;
+    uint32_t reserved;      /* 必须为 0 */
+} ms_vtable_header;
+
+typedef struct ms_bytes { uint8_t *ptr; size_t len; } ms_bytes;
+
+typedef int32_t (*ms_llm_complete_fn)(
+    void *ctx, const uint8_t *request, size_t request_len,
+    ms_bytes *response, uint8_t *err, size_t err_cap, size_t *err_len);
+
+typedef void (*ms_llm_delta_fn)(void *sink_ctx, const uint8_t *ptr, size_t len);
+typedef int32_t (*ms_llm_stream_fn)(
+    void *ctx, const uint8_t *request, size_t request_len,
+    ms_llm_delta_fn sink, void *sink_ctx, ms_bytes *response,
+    uint8_t *err, size_t err_cap, size_t *err_len);
+
 typedef struct ms_llm_vtable {
-    uint32_t struct_size;
-    int32_t (*start)(void *ctx, const uint8_t *req, size_t req_len,
-                     ms_llm_sink *sink, ms_cancel_token *cancel, uint64_t *out_call);
-    int32_t (*poll)(void *ctx, uint64_t call, uint8_t *buf, size_t *len);
-    void    (*cancel)(void *ctx, uint64_t call);
-    void    (*release)(void *ctx, uint64_t call);
+    ms_vtable_header header;  /* struct_size = 80 (64-bit) */
+    ms_llm_complete_fn complete;
+    ms_llm_stream_fn stream;  /* 可为 NULL；v1 保留 */
+    const void *reserved[6];  /* 必须全为 NULL */
 } ms_llm_vtable;
 ```
 
-错误码统一为 `int32_t`：0 成功，负数为内核定义的分类（参数、权限、超时、取消、内部、协议）。错误详情通过可选的消息缓冲区返回，格式为 UTF-8。
+请求/响应是带 `schema_version=1` 的 UTF-8 JSON（`messages`、`tools`、`max_tokens` → `text`、`tool_calls`、`usage_tokens`）。响应缓冲区必须通过 `host.alloc(host.ctx, len)` 分配，成功后所有权转移给宿主；宿主用分配台账复制后释放，未登记指针拒绝释放。错误路径不信任组件返回的长度。错误码统一为 `int32_t`：0 成功，负数为参数、权限、未找到、超时、取消、不支持、内部；详情通过 1024 字节错误缓冲区返回。完整布局、所有权矩阵、限制与安全边界见 [`components.md`](components.md)。
 
 ### 8.3 Manifest 与签名
 
@@ -961,7 +981,7 @@ profile = "host"
 - 三态策略与审批：`allow`/`ask`/`deny`；`exec`、`session_exec`、`session_write` 在交互任务中默认 `ask`。agent 通过 stdout `approval.request` 阻塞等待，mskd 转为通知并由 TUI 模态框或 `mskctl approve/deny` 回写 `approval.respond`；拒绝会变成成对的错误观测，模型可继续。`--approvals allow` 用于无人值守。
 - 事件完整性与恢复：`msk-replay` 校验 schema/seq/重复 ID/父链接并输出转录；`msk --session --resume <events.jsonl>` 将截断后的历史转录固定为新会话上下文，并显式标记旧 env/session 已失效。`turn.start` 现在记录用户原文，使日志成为完整对话来源。
 - 组件签名（M2 前半）：`ComponentManifest` 带 Ed25519 签名，签名覆盖去掉签名字段的规范化 JSON；`TrustStore` 按发布者显式信任公钥；工件校验 SHA-256 并拒绝越界路径。
-- 组件加载（M2）：`libloading` 解析 `ms_component_entry`，在调用 init 之前校验 ABI 版本、header 大小、port kind、id/version 与签名清单一致，并保持库加载；工作区内的 cdylib 测试组件端到端覆盖该路径。host `init`/vtable、conformance 套件与进程外宿主仍属后续。
+- 组件宿主（M2）：`libloading` 解析 `ms_component_entry`，先验签/信任、再校验工件哈希与路径，校验总 `struct_size`、ABI、port、vtable 头/保留槽后才复制指针；`init` 恰好一次，调用串行化，`shutdown` 仅在成功 init 后调用一次，库永不卸载。宿主带分配台账，响应先复制再释放，越权/未登记指针拒释放。`msk --provider component --component-manifest ...` 与 mskd 转发已可用；测试 cdylib 覆盖正常响应、空/越界/未登记/错误/panic 模式。C header、进程外宿主、TOCTOU 加固与流式槽仍属后续（见 `docs/components.md`）。
 - envd 服务模式（P5 前半）：`--service` 提供 MCP JSON-RPC over HTTP(S)，Bearer token 与 TLS 1.3；数据面为 TCP/TLS 上的 MSDP `HELLO/OPEN/DATA/RESIZE/CLOSE/EXIT`，直接引用控制面创建的 `session_id`。CREDIT 帧被接受但尚未用于限流；数据视图独占该会话输出。
 - 远程 envd 客户端：`msk --envd-url/--envd-token` 通过 HTTP(S) 调 MCP，`EnvTransport` 抽象让 embedded 与 service 共用同一 WASM 宿主桥；已用服务模式完成 headless 会话、远程 `exec`、mskd 任务与 daemon 终端；断线重连与数据面重连游标待接。
 - 文件与网络工具：`read_file/write_file/list_dir/stat_file` 经 envd 的 `fs.workspace` 能力执行，写入默认审批；`http_request` 在宿主侧执行 HTTP(S)，受 `net.egress` 能力约束，仅允许 http/https、默认 30s 超时、4 MiB 响应上限并跟随重定向。SSRF/私网访问目前不做内建阻断，应由部署网络策略或沙箱负责。

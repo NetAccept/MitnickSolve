@@ -34,6 +34,12 @@ struct Cli {
     /// Bearer token for --envd-url (defaults to ENVD_TOKEN).
     #[arg(long)]
     envd_token: Option<String>,
+    /// Signed llm.provider manifest forwarded to component-provider tasks.
+    #[arg(long)]
+    component_manifest: Option<PathBuf>,
+    /// Trust store for the component manifest.
+    #[arg(long)]
+    component_trust: Option<PathBuf>,
     /// Directory containing tool manifests and WAT modules.
     #[arg(long, default_value = "tools/wasm")]
     tools_dir: PathBuf,
@@ -152,6 +158,8 @@ struct Daemon {
     envd: Option<PathBuf>,
     envd_url: Option<String>,
     envd_token: Option<String>,
+    component_manifest: Option<PathBuf>,
+    component_trust: Option<PathBuf>,
     tools_dir: PathBuf,
     agent_bin: PathBuf,
     token: String,
@@ -189,6 +197,14 @@ fn main() -> Result<()> {
     if envd_url.is_some() && envd_token.is_none() {
         bail!("--envd-token or ENVD_TOKEN is required with --envd-url");
     }
+    let component_manifest = cli
+        .component_manifest
+        .as_ref()
+        .map(|path| msk_ipc::normalize_root(path));
+    let component_trust = cli
+        .component_trust
+        .as_ref()
+        .map(|path| msk_ipc::normalize_root(path));
     let tools_dir = msk_ipc::normalize_root(&cli.tools_dir);
     if !tools_dir.exists() {
         bail!("tools directory not found: {}", tools_dir.display());
@@ -220,6 +236,8 @@ fn main() -> Result<()> {
         envd,
         envd_url,
         envd_token,
+        component_manifest,
+        component_trust,
         tools_dir,
         agent_bin,
         token,
@@ -559,6 +577,9 @@ impl Daemon {
         if !matches!(approvals.as_str(), "allow" | "ask") {
             bail!("approvals must be allow or ask");
         }
+        if provider == "component" && self.component_manifest.is_none() {
+            bail!("component provider is not configured on this daemon");
+        }
         let id = format!(
             "task-{}-{}",
             now_ms(),
@@ -679,6 +700,14 @@ impl Daemon {
             .arg(agent_depth.to_string())
             .arg("--max-steps")
             .arg(max_steps.to_string());
+        if provider == "component" {
+            if let Some(manifest) = &self.component_manifest {
+                command.arg("--component-manifest").arg(manifest);
+            }
+            if let Some(trust) = &self.component_trust {
+                command.arg("--component-trust").arg(trust);
+            }
+        }
         if interactive {
             command
                 .arg("--session")

@@ -34,6 +34,7 @@ msk-data.workspace = true
 msk-events.workspace = true
 msk-ipc.workspace = true
 msk-llm.workspace = true
+msk-loader.workspace = true
 msk-mcp.workspace = true
 msk-secret.workspace = true
 msk-wasm.workspace = true
@@ -43,3 +44,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 ureq.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true
+msk-abi.workspace = true
+msk-test-component = { path = "../msk-test-component" }
+sha2.workspace = true

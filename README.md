@@ -88,10 +88,13 @@ M0 scaffold plus the P1 session/turn slice:
 - Signed component manifests: Ed25519 signatures over canonical manifest
   bytes, an explicit publisher trust store, and SHA-256/path checks for
   component artifacts.
-- Component dynamic loading: `libloading` resolves `ms_component_entry`,
-  validates the ABI header, port kind, id, and version against the signed
-  manifest, and keeps the library loaded. A cdylib test component exercises the
-  path end to end. Host `init`/vtable dispatch is the next M2 step.
+- Component host: `libloading` resolves `ms_component_entry`, validates the
+  signed manifest, ABI envelope, LLM vtable, and artifact, then calls `init`
+  exactly once. `msk --provider component --component-manifest ...` uses a
+  signed cdylib as the model provider; the kernel keeps an allocation ledger,
+  copies and frees responses, serializes calls, and never unloads the library.
+  See [`docs/components.md`](docs/components.md). The out-of-process host is the
+  remaining M2 hardening step.
 - Subagents: `spawn_agent` creates a headless child task and `agent_result`
   waits for its state/transcript. Both require `agent.spawn`; spawning is
   approval-gated by default, the child runs with delegated `approvals=allow`,
@@ -171,6 +174,27 @@ cargo run -p msk-kernel --bin msk -- --envd target/debug/envd --root .msk --demo
 The context budget defaults to 100k tokens; pass `--max-context-tokens 32000`
 to exercise compaction. Large session output is stored as a `data.put` artifact
 and summarized in the transcript.
+
+## Signed LLM component
+
+Build the test cdylib, generate a signed fixture, and use it as the provider:
+
+```sh
+cargo build -p msk-test-component
+cargo run -p msk-loader --example sign_test_fixture -- \
+  target/debug/build/msk-test-component/*/out/msk_test_component.dll \
+  .msk/component-test
+target/debug/msk --envd target/debug/envd --root .msk/component-cli \
+  --headless --provider component \
+  --component-manifest .msk/component-test/manifest.json \
+  --goal "hello component"
+```
+
+On Linux/macOS the artifact is `libmsk_test_component.so` / `.dylib`. The
+daemon accepts `--component-manifest` and `--component-trust` and forwards them
+to tasks created with `--provider component`. See
+[`docs/components.md`](docs/components.md) for the ABI, ownership rules, limits,
+and security boundary.
 
 ## Interactive session
 

@@ -62,13 +62,25 @@ jobs:
           [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:17800/mcp -d '{}')" = 401 ]
       - name: Build kernel
         run: cargo build -p msk-kernel --bins
+      - name: Build component fixture
+        run: |
+          set -euo pipefail
+          cargo build -p msk-test-component
+          artifact=$(find target/debug -type f \
+            \( -name 'libmsk_test_component*.so' -o -name 'libmsk_test_component*.dylib' -o -name 'msk_test_component*.dll' \) \
+            | head -1)
+          test -n "$artifact"
+          cargo run -q -p msk-loader --example sign_test_fixture -- "$artifact" .msk/component-fixture
       - name: Daemon interactive session smoke
         run: |
           set -euo pipefail
           rm -rf .msk/ci
           mkdir -p .msk/ci
           target/debug/mskd --root .msk/ci --envd target/debug/envd \
-            --tools-dir tools/wasm >.msk/ci/daemon.log 2>&1 &
+            --tools-dir tools/wasm \
+            --component-manifest .msk/component-fixture/manifest.json \
+            --component-trust .msk/component-fixture/trust.json \
+            >.msk/ci/daemon.log 2>&1 &
           daemon=$!
           trap 'kill "$daemon" 2>/dev/null || true' EXIT
           for _ in $(seq 1 100); do
@@ -97,3 +109,13 @@ jobs:
           done
           [ "$(target/debug/mskctl --root .msk/ci state "$task" | jq -r .turns)" = 2 ]
           grep -q '"kind":"turn.end"' .msk/ci/tasks/"$task"/events.jsonl
+          component_task=$(target/debug/mskctl --root .msk/ci create --headless \
+            --provider component --goal "component smoke" | jq -r .task_id)
+          for _ in $(seq 1 150); do
+            state=$(target/debug/mskctl --root .msk/ci state "$component_task" | jq -r .state)
+            if [ "$state" = done ] || [ "$state" = failed ]; then break; fi
+            sleep 0.1
+          done
+          [ "$(target/debug/mskctl --root .msk/ci state "$component_task" | jq -r .state)" = done ]
+          target/debug/mskctl --root .msk/ci result "$component_task" \
+            | jq -r .transcript | grep -q "component hello"
