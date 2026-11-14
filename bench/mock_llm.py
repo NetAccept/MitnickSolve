@@ -160,6 +160,14 @@ class Handler(BaseHTTPRequestHandler):
                 has_result = True
         return task_id, has_result
 
+    def wants_board(self, request):
+        for message in request.get("messages", []):
+            if message.get("role") == "user" and "board" in (
+                message.get("content") or ""
+            ):
+                return True
+        return False
+
     def wants_secret(self, request):
         for message in request.get("messages", []):
             if message.get("role") == "user" and "secret" in (
@@ -171,6 +179,54 @@ class Handler(BaseHTTPRequestHandler):
     def chat_payload(self, request):
         wants_file = self.wants_file(request)
         wants_spawn = self.wants_spawn(request)
+        wants_board = self.wants_board(request)
+        if Handler.calls == 1 and wants_board:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_board_set",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "blackboard_set",
+                                        "arguments": json.dumps(
+                                            {
+                                                "key": "note",
+                                                "value": "from-agent",
+                                            }
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ],
+                "usage": {"total_tokens": 7},
+            }
+        if Handler.calls == 2 and wants_board:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_board_get",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "blackboard_get",
+                                        "arguments": json.dumps({"key": "note"}),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ],
+                "usage": {"total_tokens": 7},
+            }
         if Handler.calls == 1 and self.wants_secret(request):
             return {
                 "choices": [

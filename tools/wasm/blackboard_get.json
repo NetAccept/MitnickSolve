@@ -1,0 +1,6 @@
+{
+  "name": "blackboard_get",
+  "description": "Read a shared blackboard value by key.",
+  "input_schema": {"type": "object", "required": ["key"]},
+  "capabilities": ["state.shared"]
+}

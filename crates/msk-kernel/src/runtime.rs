@@ -53,6 +53,7 @@ impl ControlPlane {
         goal: &str,
         provider: &str,
         max_steps: usize,
+        max_context_tokens: usize,
         depth: u32,
     ) -> std::result::Result<Value, String> {
         if depth >= 2 {
@@ -72,7 +73,8 @@ impl ControlPlane {
                     "headless": true,
                     "approvals": "allow",
                     "agent_depth": depth + 1,
-                    "max_steps": max_steps
+                    "max_steps": max_steps,
+                    "max_context_tokens": max_context_tokens
                 }),
             )
             .map_err(|err| err.to_string())
@@ -98,6 +100,36 @@ impl ControlPlane {
             }
             thread::sleep(Duration::from_millis(200));
         }
+    }
+
+    pub fn blackboard_get(&self, key: &str) -> std::result::Result<Value, String> {
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|_| "control client lock poisoned".to_string())?;
+        client
+            .request(methods::BLACKBOARD_GET, json!({"key": key}))
+            .map_err(|err| err.to_string())
+    }
+
+    pub fn blackboard_set(&self, key: &str, value: Value) -> std::result::Result<Value, String> {
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|_| "control client lock poisoned".to_string())?;
+        client
+            .request(methods::BLACKBOARD_SET, json!({"key": key, "value": value}))
+            .map_err(|err| err.to_string())
+    }
+
+    pub fn blackboard_list(&self) -> std::result::Result<Value, String> {
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|_| "control client lock poisoned".to_string())?;
+        client
+            .request(methods::BLACKBOARD_LIST, json!({}))
+            .map_err(|err| err.to_string())
     }
 }
 
@@ -249,6 +281,39 @@ impl EnvHost {
 
 impl ToolHost for EnvHost {
     fn call(&self, ctx: &ToolContext, input: &[u8]) -> Result<Vec<u8>, String> {
+        if matches!(
+            ctx.tool.as_str(),
+            "blackboard_get" | "blackboard_set" | "blackboard_list"
+        ) {
+            if !ctx.allows(Capability::SharedState) {
+                return Err("denied: state.shared not granted".to_string());
+            }
+            let control = self
+                .control
+                .as_ref()
+                .ok_or_else(|| "control plane is not configured".to_string())?;
+            let args: Value = serde_json::from_slice(input)
+                .map_err(|err| format!("invalid blackboard input: {err}"))?;
+            let value = match ctx.tool.as_str() {
+                "blackboard_get" => {
+                    let key = args
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "key is required".to_string())?;
+                    control.blackboard_get(key)?
+                }
+                "blackboard_set" => {
+                    let key = args
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "key is required".to_string())?;
+                    let value = args.get("value").cloned().unwrap_or(Value::Null);
+                    control.blackboard_set(key, value)?
+                }
+                _ => control.blackboard_list()?,
+            };
+            return serde_json::to_vec(&value).map_err(|err| err.to_string());
+        }
         if matches!(ctx.tool.as_str(), "spawn_agent" | "agent_result") {
             if !ctx.allows(Capability::AgentSpawn) {
                 return Err("denied: agent.spawn not granted".to_string());
@@ -273,7 +338,18 @@ impl ToolHost for EnvHost {
                     .and_then(Value::as_u64)
                     .unwrap_or(8)
                     .clamp(1, 50) as usize;
-                control.spawn_agent(goal, provider, max_steps, self.agent_depth)?
+                let max_context_tokens = args
+                    .get("max_context_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(50_000)
+                    .clamp(4_096, 1_000_000) as usize;
+                control.spawn_agent(
+                    goal,
+                    provider,
+                    max_steps,
+                    max_context_tokens,
+                    self.agent_depth,
+                )?
             } else {
                 let task_id = args
                     .get("task_id")

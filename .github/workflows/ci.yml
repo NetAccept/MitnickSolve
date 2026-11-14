@@ -89,7 +89,10 @@ jobs:
             if [ -f .msk/ci/ipc.token ]; then break; fi
             sleep 0.1
           done
-          task=$(target/debug/mskctl --root .msk/ci create --interactive | jq -r .task_id)
+          target/debug/mskctl --root .msk/ci bb-set ci '{"ok":true}' >/dev/null
+          target/debug/mskctl --root .msk/ci bb-get ci | jq -e '.value.ok == true'
+          task=$(target/debug/mskctl --root .msk/ci create --interactive --max-context-tokens 5000 | jq -r .task_id)
+          [ "$(target/debug/mskctl --root .msk/ci state "$task" | jq -r .max_context_tokens)" = 5000 ]
           for _ in $(seq 1 100); do
             state=$(target/debug/mskctl --root .msk/ci state "$task" | jq -r .state)
             if [ "$state" = waiting_input ]; then break; fi

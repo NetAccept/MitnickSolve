@@ -1,0 +1,6 @@
+{
+  "name": "blackboard_set",
+  "description": "Write a shared blackboard value (JSON) by key.",
+  "input_schema": {"type": "object", "required": ["key", "value"]},
+  "capabilities": ["state.shared"]
+}

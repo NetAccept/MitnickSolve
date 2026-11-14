@@ -41,6 +41,9 @@ pub fn default_policy() -> PolicyTable {
         ),
         ("spawn_agent", vec![Capability::AgentSpawn]),
         ("agent_result", vec![Capability::AgentSpawn]),
+        ("blackboard_get", vec![Capability::SharedState]),
+        ("blackboard_set", vec![Capability::SharedState]),
+        ("blackboard_list", vec![Capability::SharedState]),
         ("echo", vec![]),
     ])
 }

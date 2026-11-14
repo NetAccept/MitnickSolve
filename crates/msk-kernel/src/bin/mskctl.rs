@@ -47,6 +47,9 @@ enum Command {
         /// Defaults to ask for interactive tasks and allow otherwise.
         #[arg(long, value_parser = ["allow", "ask"])]
         approvals: Option<String>,
+        /// Context token budget for the task (default 100000).
+        #[arg(long)]
+        max_context_tokens: Option<u64>,
     },
     /// Send a user message to an interactive task.
     Send {
@@ -77,6 +80,12 @@ enum Command {
     State { task: String },
     /// Print a task's state, event count, and transcript.
     Result { task: String },
+    /// List shared blackboard entries.
+    BbList,
+    /// Read one shared blackboard entry.
+    BbGet { key: String },
+    /// Write one shared blackboard entry (JSON value or plain string).
+    BbSet { key: String, value: String },
     /// Cancel a running task.
     Cancel { task: String },
     /// Subscribe to events and print notifications.
@@ -156,6 +165,7 @@ fn main() -> Result<()> {
             stream,
             headless,
             approvals,
+            max_context_tokens,
         } => {
             let mut params = json!({
                 "goal": goal,
@@ -167,6 +177,9 @@ fn main() -> Result<()> {
             });
             if let Some(approvals) = approvals {
                 params["approvals"] = json!(approvals);
+            }
+            if let Some(max_context_tokens) = max_context_tokens {
+                params["max_context_tokens"] = json!(max_context_tokens);
             }
             let result = client.request(methods::TASK_CREATE, params)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -206,6 +219,21 @@ fn main() -> Result<()> {
         }
         Command::Result { task } => {
             let result = client.request(methods::TASK_RESULT, json!({"task_id": task}))?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::BbList => {
+            let result = client.request(methods::BLACKBOARD_LIST, json!({}))?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::BbGet { key } => {
+            let result = client.request(methods::BLACKBOARD_GET, json!({"key": key}))?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::BbSet { key, value } => {
+            let value =
+                serde_json::from_str(&value).unwrap_or_else(|_| serde_json::Value::String(value));
+            let result =
+                client.request(methods::BLACKBOARD_SET, json!({"key": key, "value": value}))?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Cancel { task } => {

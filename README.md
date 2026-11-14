@@ -109,8 +109,13 @@ M0 scaffold plus the P1 session/turn slice:
 - Subagents: `spawn_agent` creates a headless child task and `agent_result`
   waits for its state/transcript. Both require `agent.spawn`; spawning is
   approval-gated by default, the child runs with delegated `approvals=allow`,
-  and depth is capped at 2. `mskctl create --headless --goal ...` and
-  `mskctl result task-...` expose the same path.
+  and depth is capped at 2. `max_steps` and `max_context_tokens` bound each
+  child; `mskctl create --headless --goal ...` and `mskctl result task-...`
+  expose the same path.
+- Shared blackboard: `blackboard_get/set/list` (`state.shared`) persist a
+  per-root JSON map (`<root>/blackboard.json`, 64 KiB/value, 1 MiB total) so
+  parent and child agents can coordinate findings. `mskctl bb-get/bb-set/bb-list`
+  expose it directly.
 - Secrets: `EnvSecretStore` maps `$secret:name` to `MSK_SECRET_NAME` (names are
   uppercased, non-alphanumerics become `_`). `http_request` resolves secret
   header values on the host after the `secrets.read` capability check; the
@@ -329,12 +334,16 @@ Interactive tasks stay alive between messages:
 ```sh
 target/debug/mskctl --root .msk create --interactive
 target/debug/mskctl --root .msk create --headless --goal "run one task and exit"
+target/debug/mskctl --root .msk create --headless --max-context-tokens 5000
 target/debug/mskctl --root .msk result task-...
 target/debug/mskctl --root .msk send --task task-... --text "list the workspace"
 target/debug/mskctl --root .msk interrupt task-...
 target/debug/mskctl --root .msk approvals
 target/debug/mskctl --root .msk approve --task task-... --id 1
 target/debug/mskctl --root .msk deny --task task-... --id 2
+target/debug/mskctl --root .msk bb-set finding '{"port":8080}'
+target/debug/mskctl --root .msk bb-get finding
+target/debug/mskctl --root .msk bb-list
 target/debug/mskctl --root .msk watch --task task-...
 target/debug/mskctl --root .msk state task-...
 ```

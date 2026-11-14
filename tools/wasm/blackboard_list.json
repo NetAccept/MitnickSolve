@@ -1,0 +1,6 @@
+{
+  "name": "blackboard_list",
+  "description": "List all shared blackboard entries.",
+  "input_schema": {"type": "object"},
+  "capabilities": ["state.shared"]
+}

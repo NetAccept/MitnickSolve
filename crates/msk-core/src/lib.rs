@@ -107,6 +107,8 @@ pub enum Capability {
     McpConnect,
     #[serde(rename = "agent.spawn")]
     AgentSpawn,
+    #[serde(rename = "state.shared")]
+    SharedState,
 }
 
 impl Capability {
@@ -121,6 +123,7 @@ impl Capability {
             Self::ArtifactRead => "artifact.read",
             Self::McpConnect => "mcp.connect",
             Self::AgentSpawn => "agent.spawn",
+            Self::SharedState => "state.shared",
         }
     }
 
@@ -135,6 +138,7 @@ impl Capability {
             "artifact.read" => Some(Self::ArtifactRead),
             "mcp.connect" => Some(Self::McpConnect),
             "agent.spawn" => Some(Self::AgentSpawn),
+            "state.shared" => Some(Self::SharedState),
             _ => None,
         }
     }

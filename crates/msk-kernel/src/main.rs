@@ -848,6 +848,9 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         "http_request",
         "spawn_agent",
         "agent_result",
+        "blackboard_get",
+        "blackboard_set",
+        "blackboard_list",
         "echo",
     ];
     let registry_policy = policy::policy_with_approvals(cli.approvals == Approvals::Ask);

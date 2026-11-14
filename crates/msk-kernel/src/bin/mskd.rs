@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -86,6 +86,7 @@ struct Task {
     headless: bool,
     agent_depth: u32,
     max_steps: usize,
+    max_context_tokens: usize,
     state: TaskState,
     dir: PathBuf,
     child: Arc<Mutex<Option<Child>>>,
@@ -109,6 +110,7 @@ impl Task {
             "headless": self.headless,
             "agent_depth": self.agent_depth,
             "max_steps": self.max_steps,
+            "max_context_tokens": self.max_context_tokens,
             "state": self.state.as_str(),
             "dir": self.dir.display().to_string(),
             "events": self.events,
@@ -155,6 +157,81 @@ impl PendingApproval {
     }
 }
 
+struct Blackboard {
+    path: PathBuf,
+    values: BTreeMap<String, Value>,
+}
+
+impl Blackboard {
+    fn load(path: PathBuf) -> Self {
+        let values = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<BTreeMap<String, Value>>(&text).ok())
+            .unwrap_or_default();
+        Self { path, values }
+    }
+
+    fn get(&self, key: &str) -> Value {
+        json!({"key": key, "value": self.values.get(key).cloned().unwrap_or(Value::Null)})
+    }
+
+    fn list(&self) -> Value {
+        let entries: Vec<Value> = self
+            .values
+            .iter()
+            .map(|(key, value)| json!({"key": key, "value": value}))
+            .collect();
+        json!({"entries": entries})
+    }
+
+    fn set(&mut self, key: &str, value: Value) -> Result<Value> {
+        if key.is_empty() || key.len() > 128 || key.chars().any(char::is_control) {
+            bail!("blackboard key must be 1..128 printable characters");
+        }
+        let encoded = serde_json::to_vec(&value)?;
+        if encoded.len() > 64 * 1024 {
+            bail!("blackboard value exceeds 64 KiB");
+        }
+        let existing: usize = self
+            .values
+            .iter()
+            .filter(|(existing_key, _)| existing_key.as_str() != key)
+            .map(|(_, value)| {
+                serde_json::to_vec(value)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0)
+            })
+            .sum();
+        if existing.saturating_add(encoded.len()) > 1 << 20 {
+            bail!("blackboard exceeds 1 MiB");
+        }
+        self.values.insert(key.to_string(), value.clone());
+        self.save()?;
+        Ok(json!({"key": key, "value": value}))
+    }
+
+    fn save(&self) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let temporary = self
+            .path
+            .with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::write(&temporary, serde_json::to_vec_pretty(&self.values)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600));
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+        std::fs::rename(&temporary, &self.path)?;
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     tasks: HashMap<String, Task>,
@@ -176,6 +253,7 @@ struct Daemon {
     subscribers: Mutex<Vec<Subscriber>>,
     terminal: Mutex<Option<TerminalSession>>,
     approvals: Mutex<HashMap<String, PendingApproval>>,
+    blackboard: Mutex<Blackboard>,
     data_active: AtomicBool,
     next_task: AtomicU64,
     next_sub: AtomicU64,
@@ -245,6 +323,7 @@ fn main() -> Result<()> {
         println!("envd: {}", envd.display());
     }
 
+    let blackboard_path = root.join("blackboard.json");
     let daemon = Arc::new(Daemon {
         root,
         envd,
@@ -261,6 +340,7 @@ fn main() -> Result<()> {
         subscribers: Mutex::new(Vec::new()),
         terminal: Mutex::new(None),
         approvals: Mutex::new(HashMap::new()),
+        blackboard: Mutex::new(Blackboard::load(blackboard_path)),
         data_active: AtomicBool::new(false),
         next_task: AtomicU64::new(1),
         next_sub: AtomicU64::new(1),
@@ -437,6 +517,11 @@ impl Daemon {
                     .and_then(Value::as_u64)
                     .unwrap_or(12)
                     .clamp(1, 50) as usize;
+                let max_context_tokens = params
+                    .get("max_context_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(100_000)
+                    .clamp(4_096, 1_000_000) as usize;
                 match self.create_task(
                     goal,
                     demo,
@@ -447,6 +532,7 @@ impl Daemon {
                     headless,
                     agent_depth,
                     max_steps,
+                    max_context_tokens,
                 ) {
                     Ok(snapshot) => (RpcResponse::ok(id, snapshot), None),
                     Err(err) => (RpcResponse::err(id, -32000, err.to_string()), None),
@@ -504,6 +590,42 @@ impl Daemon {
                     Ok(value) => (RpcResponse::ok(id, value), None),
                     Err(err) => (RpcResponse::err(id, -32002, err.to_string()), None),
                 }
+            }
+            methods::BLACKBOARD_GET => {
+                let key = params
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let value = self
+                    .blackboard
+                    .lock()
+                    .map(|blackboard| blackboard.get(key))
+                    .unwrap_or(Value::Null);
+                (RpcResponse::ok(id, value), None)
+            }
+            methods::BLACKBOARD_SET => {
+                let key = params
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let value = params.get("value").cloned().unwrap_or(Value::Null);
+                let result = self
+                    .blackboard
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("blackboard poisoned"))
+                    .and_then(|mut blackboard| blackboard.set(key, value));
+                match result {
+                    Ok(value) => (RpcResponse::ok(id, value), None),
+                    Err(err) => (RpcResponse::err(id, -32000, err.to_string()), None),
+                }
+            }
+            methods::BLACKBOARD_LIST => {
+                let value = self
+                    .blackboard
+                    .lock()
+                    .map(|blackboard| blackboard.list())
+                    .unwrap_or_else(|_| json!({"entries": []}));
+                (RpcResponse::ok(id, value), None)
             }
             methods::TASK_CANCEL => {
                 let task_id = params
@@ -589,6 +711,7 @@ impl Daemon {
         headless: bool,
         agent_depth: u32,
         max_steps: usize,
+        max_context_tokens: usize,
     ) -> Result<Value> {
         if !matches!(approvals.as_str(), "allow" | "ask") {
             bail!("approvals must be allow or ask");
@@ -616,6 +739,7 @@ impl Daemon {
             headless,
             agent_depth,
             max_steps,
+            max_context_tokens,
             state: TaskState::Running,
             dir,
             child: child.clone(),
@@ -649,6 +773,7 @@ impl Daemon {
             headless,
             agent_depth,
             max_steps,
+            max_context_tokens,
             child_handle,
             input_handle,
         ) = {
@@ -668,6 +793,7 @@ impl Daemon {
                     task.headless,
                     task.agent_depth,
                     task.max_steps,
+                    task.max_context_tokens,
                     task.child.clone(),
                     task.input.clone(),
                 ),
@@ -715,7 +841,9 @@ impl Daemon {
             .arg("--agent-depth")
             .arg(agent_depth.to_string())
             .arg("--max-steps")
-            .arg(max_steps.to_string());
+            .arg(max_steps.to_string())
+            .arg("--max-context-tokens")
+            .arg(max_context_tokens.to_string());
         if provider == "component" {
             if let Some(manifest) = &self.component_manifest {
                 command.arg("--component-manifest").arg(manifest);
@@ -1853,5 +1981,24 @@ mod tests {
         assert!(!token_eq("abc", "ab"));
         assert!(!token_eq("", "x"));
         assert!(token_eq("", ""));
+    }
+
+    #[test]
+    fn blackboard_persists_and_enforces_limits() {
+        let dir = std::env::temp_dir().join(format!("msk-blackboard-{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blackboard.json");
+        let mut blackboard = Blackboard::load(path.clone());
+        blackboard.set("finding", json!({"port": 8080})).unwrap();
+        assert_eq!(blackboard.get("finding")["value"]["port"], 8080);
+        let reloaded = Blackboard::load(path.clone());
+        assert_eq!(reloaded.get("finding")["value"]["port"], 8080);
+        assert!(blackboard.set("", Value::Null).is_err());
+        assert!(
+            blackboard
+                .set("huge", Value::String("x".repeat(70 * 1024)))
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
