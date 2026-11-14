@@ -499,6 +499,7 @@ struct DaemonApp {
     selected_task: usize,
     events: Vec<(String, Event)>,
     chat: Vec<ChatLine>,
+    approvals: Vec<Value>,
     composing: bool,
     input: String,
     input_cursor: usize,
@@ -526,6 +527,7 @@ impl DaemonApp {
             selected_task: 0,
             events: Vec::new(),
             chat: Vec::new(),
+            approvals: Vec::new(),
             composing: false,
             input: String::new(),
             input_cursor: 0,
@@ -596,7 +598,30 @@ impl DaemonApp {
                         }
                         if finished {
                             finish_streaming(&mut self.chat, task_id);
+                            self.approvals.retain(|approval| {
+                                approval.get("task_id").and_then(Value::as_str) != Some(task_id)
+                            });
                         }
+                    }
+                }
+                Some("approval.request") => {
+                    if let Some(pending) = value.get("params") {
+                        let duplicate = self.approvals.iter().any(|approval| {
+                            approval.get("task_id") == pending.get("task_id")
+                                && approval.get("id") == pending.get("id")
+                        });
+                        if !duplicate {
+                            self.approvals.push(pending.clone());
+                            self.status = "approval requested".into();
+                        }
+                    }
+                }
+                Some("approval.resolved") => {
+                    if let Some(resolved) = value.get("params") {
+                        self.approvals.retain(|approval| {
+                            approval.get("task_id") != resolved.get("task_id")
+                                || approval.get("id") != resolved.get("id")
+                        });
                     }
                 }
                 Some("task.message") => {
@@ -644,6 +669,9 @@ impl DaemonApp {
                         .and_then(Value::as_str)
                         .unwrap_or("awaiting_input");
                     finish_streaming(&mut self.chat, &task_id);
+                    self.approvals.retain(|approval| {
+                        approval.get("task_id").and_then(Value::as_str) != Some(task_id.as_str())
+                    });
                     if status != "awaiting_input" {
                         let message = params
                             .get("message")
@@ -815,6 +843,35 @@ impl DaemonApp {
         }
     }
 
+    fn respond_approval(&mut self, approved: bool) {
+        let Some(pending) = self.approvals.first().cloned() else {
+            return;
+        };
+        let task_id = pending
+            .get("task_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let id = pending.get("id").and_then(Value::as_u64).unwrap_or(0);
+        match self.client.request(
+            methods::APPROVAL_RESPOND,
+            json!({"task_id": task_id, "id": id, "approved": approved}),
+        ) {
+            Ok(_) => {
+                self.approvals.retain(|approval| {
+                    approval.get("task_id").and_then(Value::as_str) != Some(task_id.as_str())
+                        || approval.get("id").and_then(Value::as_u64) != Some(id)
+                });
+                self.status = if approved {
+                    format!("approved {id} for {task_id}")
+                } else {
+                    format!("denied {id} for {task_id}")
+                };
+            }
+            Err(err) => self.status = format!("approval response failed: {err}"),
+        }
+    }
+
     fn compose_key(&mut self, key: KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -889,6 +946,15 @@ impl DaemonApp {
             return false;
         }
 
+        if !self.approvals.is_empty() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => self.respond_approval(true),
+                KeyCode::Char('n') | KeyCode::Esc => self.respond_approval(false),
+                _ => {}
+            }
+            return false;
+        }
+
         if self.composing {
             return self.compose_key(key);
         }
@@ -922,7 +988,11 @@ impl DaemonApp {
             KeyCode::Char('x') => self.cancel_task(),
             KeyCode::Char('s') => self.interrupt_task(),
             KeyCode::Char('a') => {
-                self.status = "approvals: none pending (M0 agent has no approval calls yet)".into();
+                self.status = if self.approvals.is_empty() {
+                    "no pending approvals".into()
+                } else {
+                    format!("{} pending approval(s)", self.approvals.len())
+                };
             }
             KeyCode::Char('t') => {
                 self.composing = false;
@@ -1221,10 +1291,12 @@ impl DaemonApp {
             );
         }
 
-        let footer = if self.composing {
+        let footer = if !self.approvals.is_empty() {
+            "APPROVAL PENDING: y approve  n deny"
+        } else if self.composing {
             "Enter send  Esc close editor  ←/→ move  Ctrl+U clear  Ctrl+C cancel"
         } else {
-            "Enter/i message  s interrupt  n new  x cancel  t terminal  j/k task  r reload  q quit  ? help"
+            "Enter/i message  s interrupt  n new  x cancel  a approvals  t terminal  j/k task  r reload  q quit  ? help"
         };
         frame.render_widget(Paragraph::new(footer), areas[4]);
 
@@ -1239,6 +1311,8 @@ impl DaemonApp {
                  ← / →      move the input cursor\n\
                  Ctrl+U     clear the input\n\
                  s          interrupt the running turn\n\
+                 a          show pending approvals\n\
+                 y / n      approve / deny the modal request\n\
                  j / k      previous / next task\n\
                  g / G      first / last task\n\
                  n          create an interactive scripted task\n\
@@ -1255,6 +1329,34 @@ impl DaemonApp {
             .block(Block::default().borders(Borders::ALL).title("help"))
             .wrap(Wrap { trim: false });
             frame.render_widget(help, area);
+        }
+
+        if let Some(pending) = self.approvals.first() {
+            let task_id = pending
+                .get("task_id")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let id = pending.get("id").and_then(Value::as_u64).unwrap_or(0);
+            let tool = pending.get("tool").and_then(Value::as_str).unwrap_or("?");
+            let reason = pending
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let args = serde_json::to_string_pretty(pending.get("args").unwrap_or(&Value::Null))
+                .unwrap_or_default();
+            let area = centered_rect(78, 58, frame.area());
+            frame.render_widget(Clear, area);
+            let text = format!(
+                "tool: {tool}\nreason: {reason}\n\nargs:\n{args}\n\n[y] approve   [n] deny"
+            );
+            let paragraph = Paragraph::new(text)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!("approval required — {task_id} #{id}")),
+                )
+                .wrap(Wrap { trim: false });
+            frame.render_widget(paragraph, area);
         }
     }
 }
@@ -1620,6 +1722,80 @@ mod tests {
         assert_eq!(chat.len(), 2);
         assert_eq!(chat[0].task_id, "task-1");
         assert_eq!(chat[1].task_id, "task-2");
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd with a mock OpenAI-compatible LLM"]
+    fn daemon_approval_modal_draws_and_responds() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app = DaemonApp::connect(PathBuf::from(root), 100).unwrap();
+        let created = app
+            .client
+            .request(
+                methods::TASK_CREATE,
+                json!({
+                    "goal": "approval draw test",
+                    "provider": "openai",
+                    "interactive": true,
+                    "stream": true,
+                    "approvals": "ask"
+                }),
+            )
+            .unwrap();
+        let task_id = created["task_id"].as_str().unwrap().to_string();
+        for _ in 0..100 {
+            let _ = app.reload_tasks();
+            if let Some(index) = app.tasks.iter().position(|task| {
+                task.get("task_id").and_then(Value::as_str) == Some(task_id.as_str())
+            }) {
+                app.selected_task = index;
+            }
+            if app.selected_state() == "waiting_input" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(app.selected_state(), "waiting_input");
+
+        app.enter_compose();
+        app.input = "please exec echo approved".into();
+        app.input_cursor = app.input.len();
+        app.send_message();
+        for _ in 0..100 {
+            let _ = app.refresh();
+            if !app.approvals.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!app.approvals.is_empty());
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(content.contains("approval required"));
+        assert!(content.contains("exec"));
+
+        app.respond_approval(true);
+        for _ in 0..100 {
+            let _ = app.refresh();
+            let _ = app.reload_tasks();
+            if app.selected_state() == "waiting_input" && app.approvals.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(app.approvals.is_empty());
+        app.cancel_task();
     }
 
     #[test]

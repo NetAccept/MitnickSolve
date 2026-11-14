@@ -24,12 +24,12 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(3)
         Handler.calls += 1
         if request.get("stream") and not self.path.endswith("/responses"):
-            self.send_chat_stream()
+            self.send_chat_stream(request)
             return
         if self.path.endswith("/responses"):
             payload = self.responses_payload()
         else:
-            payload = self.chat_payload()
+            payload = self.chat_payload(request)
 
         data = json.dumps(payload).encode()
         self.send_response(200)
@@ -38,12 +38,42 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def send_chat_stream(self):
+    def send_chat_stream(self, request):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
-        if Handler.calls == 1:
+        if Handler.calls == 1 and self.wants_exec(request):
+            args = {
+                "env_id": "$ENV",
+                "argv": (
+                    ["cmd", "/C", "echo approved"]
+                    if sys.platform == "win32"
+                    else ["sh", "-c", "echo approved"]
+                ),
+            }
+            events = [
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_exec",
+                                        "function": {
+                                            "name": "exec",
+                                            "arguments": json.dumps(args),
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {"choices": [], "usage": {"total_tokens": 7}},
+            ]
+        elif Handler.calls == 1:
             events = [
                 {"choices": [{"delta": {"content": "mock "}}]},
                 {"choices": [{"delta": {"content": "stream"}}]},
@@ -78,8 +108,44 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
         self.wfile.write(b"data: [DONE]\n\n")
 
-    def chat_payload(self):
+    def wants_exec(self, request):
+        for message in request.get("messages", []):
+            if message.get("role") == "user" and "exec" in (message.get("content") or ""):
+                return True
+        return False
+
+    def chat_payload(self, request):
         if Handler.calls == 1:
+            if self.wants_exec(request):
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_exec",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "exec",
+                                            "arguments": json.dumps(
+                                                {
+                                                    "env_id": "$ENV",
+                                                    "argv": (
+                                                        ["cmd", "/C", "echo approved"]
+                                                        if sys.platform == "win32"
+                                                        else ["sh", "-c", "echo approved"]
+                                                    ),
+                                                }
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                    "usage": {"total_tokens": 7},
+                }
             return {
                 "choices": [
                     {

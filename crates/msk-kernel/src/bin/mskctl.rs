@@ -40,6 +40,10 @@ enum Command {
         /// Ask the agent to stream text deltas.
         #[arg(long)]
         stream: bool,
+        /// Command policy: ask before executing, or allow directly.
+        /// Defaults to ask for interactive tasks and allow otherwise.
+        #[arg(long, value_parser = ["allow", "ask"])]
+        approvals: Option<String>,
     },
     /// Send a user message to an interactive task.
     Send {
@@ -50,6 +54,22 @@ enum Command {
     },
     /// Cooperatively interrupt the running turn of an interactive task.
     Interrupt { task: String },
+    /// List pending approval requests.
+    Approvals,
+    /// Approve a pending request.
+    Approve {
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        id: u64,
+    },
+    /// Deny a pending request.
+    Deny {
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        id: u64,
+    },
     /// Print one task snapshot.
     State { task: String },
     /// Cancel a running task.
@@ -129,17 +149,19 @@ fn main() -> Result<()> {
             provider,
             interactive,
             stream,
+            approvals,
         } => {
-            let result = client.request(
-                methods::TASK_CREATE,
-                json!({
-                    "goal": goal,
-                    "demo": demo,
-                    "provider": provider,
-                    "interactive": interactive,
-                    "stream": stream
-                }),
-            )?;
+            let mut params = json!({
+                "goal": goal,
+                "demo": demo,
+                "provider": provider,
+                "interactive": interactive,
+                "stream": stream
+            });
+            if let Some(approvals) = approvals {
+                params["approvals"] = json!(approvals);
+            }
+            let result = client.request(methods::TASK_CREATE, params)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Send { task, text } => {
@@ -151,6 +173,24 @@ fn main() -> Result<()> {
         }
         Command::Interrupt { task } => {
             let result = client.request(methods::TASK_INTERRUPT, json!({"task_id": task}))?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::Approvals => {
+            let result = client.request(methods::APPROVAL_LIST, json!({}))?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::Approve { task, id } => {
+            let result = client.request(
+                methods::APPROVAL_RESPOND,
+                json!({"task_id": task, "id": id, "approved": true}),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::Deny { task, id } => {
+            let result = client.request(
+                methods::APPROVAL_RESPOND,
+                json!({"task_id": task, "id": id, "approved": false}),
+            )?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::State { task } => {

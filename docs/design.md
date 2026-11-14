@@ -958,8 +958,9 @@ profile = "host"
 - 前置项：连接级认证（hello 前拒绝其他方法、常量时间 token 比较）、事件 `schema_version` + 进程内单调 `seq`、成对工具调用/结果压缩、基于时间戳的任务 ID。
 - 协作式取消：stdin 读取线程设置 `CancelToken`；引擎在模型/工具步骤之间检查，`turn.end` 返回 `interrupted`；被打断的 assistant tool_calls 仍补齐每个结果，保证下一轮请求合法。`mskctl interrupt` 与 `/interrupt` 已接入。
 - 对话式 TUI：任务列表、按任务过滤的转录、单行输入编辑器、流式 `agent.text` 累积、`turn.end` 系统行、`s` 中断、`n` 新建交互任务；右侧保留事件流用于调试。
-- 验收：同一会话连续两轮消息得到两次 `turn.end`，第二轮请求携带第一轮上下文；真实 mock provider 的 echo 工具调用跨轮保留；工具 trap 后该轮仍能收到下一次模型响应。
-- 尚未进入本切片：审批、envd 服务模式与断线重连。
+- 三态策略与审批：`allow`/`ask`/`deny`；`exec`、`session_exec`、`session_write` 在交互任务中默认 `ask`。agent 通过 stdout `approval.request` 阻塞等待，mskd 转为通知并由 TUI 模态框或 `mskctl approve/deny` 回写 `approval.respond`；拒绝会变成成对的错误观测，模型可继续。`--approvals allow` 用于无人值守。
+- 验收：同一会话连续两轮消息得到两次 `turn.end`，第二轮请求携带第一轮上下文；真实 mock provider 的 echo 工具调用跨轮保留；工具 trap 后该轮仍能收到下一次模型响应；审批通过后命令实际执行，拒绝后下一轮仍可用。
+- 尚未进入本切片：envd 服务模式与断线重连、持久化/重放、多 agent。
 
 ---
 

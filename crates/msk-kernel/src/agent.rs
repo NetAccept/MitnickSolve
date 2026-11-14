@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use msk_core::ToolCall;
 use msk_core::context::{ContextLimits, ContextManager, Role};
+use msk_core::{PolicyDecision, ToolCall};
 use msk_data::ObjectStore;
 use msk_events::{Event, EventSink};
 use msk_llm::{LlmDelta, LlmProvider};
@@ -71,6 +71,21 @@ impl CancelToken {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ApprovalRequest {
+    pub id: u64,
+    pub tool: String,
+    pub args: Value,
+    pub reason: String,
+}
+
+/// Blocking approval channel. The session calls this from the turn thread; the
+/// implementation may wait for IPC, a terminal prompt, or a timeout. Returning
+/// false denies the call and the model receives an error observation.
+pub trait ApprovalHandler {
+    fn request(&mut self, request: &ApprovalRequest, cancel: &CancelToken) -> bool;
+}
+
 pub struct SessionOptions {
     pub env_id: String,
     pub registry: HashMap<String, RegisteredTool>,
@@ -83,6 +98,7 @@ pub struct SessionOptions {
     pub stream: bool,
     pub task: Option<String>,
     pub cancel: CancelToken,
+    pub approvals: Option<Box<dyn ApprovalHandler>>,
 }
 
 pub struct Session {
@@ -97,6 +113,8 @@ pub struct Session {
     stream: bool,
     task: Option<String>,
     cancel: CancelToken,
+    approvals: Option<Box<dyn ApprovalHandler>>,
+    next_approval: u64,
     last_session: Option<String>,
     last_artifact: Option<String>,
     turns: u64,
@@ -116,6 +134,8 @@ impl Session {
             stream: options.stream,
             task: options.task,
             cancel: options.cancel,
+            approvals: options.approvals,
+            next_approval: 0,
             last_session: None,
             last_artifact: None,
             turns: 0,
@@ -250,15 +270,17 @@ impl Session {
             return;
         }
 
-        let Some(tool) = self.registry.get(&call.tool) else {
-            self.emit(
-                "policy.decision",
-                json!({"tool": call.tool, "decision": "deny", "reason": "tool not registered"}),
-            );
-            self.push_tool_error(&call, format!("tool not registered: {}", call.tool));
-            return;
+        let (decision, context) = match self.registry.get(&call.tool) {
+            Some(tool) => (tool.decision, tool.context.clone()),
+            None => {
+                self.emit(
+                    "policy.decision",
+                    json!({"tool": call.tool, "decision": "deny", "reason": "tool not registered"}),
+                );
+                self.push_tool_error(&call, format!("tool not registered: {}", call.tool));
+                return;
+            }
         };
-        let context = tool.context.clone();
         let input = match serde_json::to_vec(&args) {
             Ok(input) => input,
             Err(err) => {
@@ -273,10 +295,55 @@ impl Session {
             json!({
                 "tool": context.tool,
                 "granted": context.capabilities,
-                "decision": "allow"
+                "decision": decision.as_str()
             }),
         );
 
+        match decision {
+            PolicyDecision::Allow => {}
+            PolicyDecision::Deny => {
+                self.push_tool_error(&call, format!("policy denied tool {}", call.tool));
+                return;
+            }
+            PolicyDecision::Ask => {
+                let id = self.next_approval + 1;
+                self.next_approval = id;
+                let request = ApprovalRequest {
+                    id,
+                    tool: call.tool.clone(),
+                    args: args.clone(),
+                    reason: approval_reason(&call.tool),
+                };
+                self.emit(
+                    "approval.request",
+                    json!({
+                        "id": request.id,
+                        "tool": request.tool,
+                        "args": request.args,
+                        "reason": request.reason
+                    }),
+                );
+                let approved = match self.approvals.as_mut() {
+                    Some(handler) => handler.request(&request, &self.cancel),
+                    None => false,
+                };
+                self.emit("approval.result", json!({"id": id, "approved": approved}));
+                if !approved {
+                    let reason = if self.cancel.is_cancelled() {
+                        "approval interrupted"
+                    } else {
+                        "approval denied"
+                    };
+                    self.push_tool_error(&call, reason.into());
+                    return;
+                }
+            }
+        }
+
+        let Some(tool) = self.registry.get(&call.tool) else {
+            self.push_tool_error(&call, format!("tool disappeared: {}", call.tool));
+            return;
+        };
         let started = Instant::now();
         let output = match tool.runtime.run_with_context(&tool.context, &input) {
             Ok(output) => output,
@@ -398,6 +465,14 @@ impl Session {
     }
 }
 
+fn approval_reason(tool: &str) -> String {
+    match tool {
+        "exec" | "session_exec" => "execute a command".to_string(),
+        "session_write" => "write input to a terminal session".to_string(),
+        _ => "tool requires approval".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +499,14 @@ mod tests {
     }
 
     fn session_with(responses: Vec<LlmResponse>) -> Session {
+        session_with_approval(responses, PolicyDecision::Allow, None)
+    }
+
+    fn session_with_approval(
+        responses: Vec<LlmResponse>,
+        decision: PolicyDecision,
+        approvals: Option<Box<dyn ApprovalHandler>>,
+    ) -> Session {
         let runtime = WasmtimeRuntime::from_wat(
             Arc::new(UnusedHost),
             r#"(module
@@ -447,6 +530,7 @@ mod tests {
                 context: ToolContext::new("boom", Vec::new()),
                 runtime,
                 manifest,
+                decision,
             },
         );
 
@@ -465,6 +549,7 @@ mod tests {
             stream: false,
             task: None,
             cancel: CancelToken::new(),
+            approvals,
         })
     }
 
@@ -503,6 +588,76 @@ mod tests {
         );
     }
 
+    struct RecordingApproval {
+        approve: bool,
+        seen: Arc<std::sync::Mutex<Vec<ApprovalRequest>>>,
+    }
+
+    impl ApprovalHandler for RecordingApproval {
+        fn request(&mut self, request: &ApprovalRequest, _cancel: &CancelToken) -> bool {
+            self.seen.lock().unwrap().push(request.clone());
+            self.approve
+        }
+    }
+
+    fn ask_session(approve: bool) -> (Session, Arc<std::sync::Mutex<Vec<ApprovalRequest>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handler = Box::new(RecordingApproval {
+            approve,
+            seen: seen.clone(),
+        });
+        let session = session_with_approval(
+            vec![
+                LlmResponse {
+                    text: "ask first".into(),
+                    tool_calls: vec![ToolCall {
+                        id: "a1".into(),
+                        tool: "boom".into(),
+                        args: json!({"command": "rm -rf /"}),
+                    }],
+                    usage_tokens: 1,
+                },
+                LlmResponse {
+                    text: "done".into(),
+                    tool_calls: Vec::new(),
+                    usage_tokens: 1,
+                },
+            ],
+            PolicyDecision::Ask,
+            Some(handler),
+        );
+        (session, seen)
+    }
+
+    #[test]
+    fn denied_approval_becomes_a_paired_error_observation() {
+        let (mut session, seen) = ask_session(false);
+        assert_eq!(session.run_turn("go", |_| {}), TurnOutcome::AwaitingInput);
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].tool, "boom");
+        assert_eq!(requests[0].args["command"], "rm -rf /");
+        drop(requests);
+        let messages = session.context().messages();
+        assert!(messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("a1")
+                && message.content.contains("approval denied")
+        }));
+        assert!(messages.iter().any(|message| message.content == "done"));
+    }
+
+    #[test]
+    fn approved_approval_reaches_the_tool() {
+        let (mut session, seen) = ask_session(true);
+        assert_eq!(session.run_turn("go", |_| {}), TurnOutcome::AwaitingInput);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let messages = session.context().messages();
+        assert!(messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("a1")
+                && message.content.contains("WASM tool failed")
+        }));
+    }
+
     #[test]
     fn provider_failure_ends_only_the_turn() {
         let mut session = session_with(Vec::new());
@@ -536,6 +691,7 @@ mod tests {
             stream: false,
             task: None,
             cancel: CancelToken::new(),
+            approvals: None,
         });
         let mut first = String::new();
         assert_eq!(
@@ -618,6 +774,7 @@ mod tests {
                         max_memory_bytes: None,
                         timeout_ms: None,
                     },
+                    decision: PolicyDecision::Allow,
                 },
             );
         }
@@ -652,6 +809,7 @@ mod tests {
             stream: false,
             task: None,
             cancel: cancel.clone(),
+            approvals: None,
         })
     }
 

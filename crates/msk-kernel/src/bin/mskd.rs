@@ -64,6 +64,7 @@ struct Task {
     provider: String,
     interactive: bool,
     stream: bool,
+    approvals: String,
     state: TaskState,
     dir: PathBuf,
     child: Arc<Mutex<Option<Child>>>,
@@ -83,6 +84,7 @@ impl Task {
             "provider": self.provider,
             "interactive": self.interactive,
             "stream": self.stream,
+            "approvals": self.approvals,
             "state": self.state.as_str(),
             "dir": self.dir.display().to_string(),
             "events": self.events,
@@ -106,6 +108,28 @@ struct TerminalSession {
     rows: u16,
 }
 
+#[derive(Debug, Clone)]
+struct PendingApproval {
+    id: u64,
+    tool: String,
+    args: Value,
+    reason: String,
+    requested_ms: u128,
+}
+
+impl PendingApproval {
+    fn snapshot(&self, task_id: &str) -> Value {
+        json!({
+            "task_id": task_id,
+            "id": self.id,
+            "tool": self.tool,
+            "args": self.args,
+            "reason": self.reason,
+            "requested_ms": self.requested_ms
+        })
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     tasks: HashMap<String, Task>,
@@ -120,6 +144,7 @@ struct Daemon {
     inner: Mutex<Inner>,
     subscribers: Mutex<Vec<Subscriber>>,
     terminal: Mutex<Option<TerminalSession>>,
+    approvals: Mutex<HashMap<String, PendingApproval>>,
     data_active: AtomicBool,
     next_task: AtomicU64,
     next_sub: AtomicU64,
@@ -164,6 +189,7 @@ fn main() -> Result<()> {
         inner: Mutex::new(Inner::default()),
         subscribers: Mutex::new(Vec::new()),
         terminal: Mutex::new(None),
+        approvals: Mutex::new(HashMap::new()),
         data_active: AtomicBool::new(false),
         next_task: AtomicU64::new(1),
         next_sub: AtomicU64::new(1),
@@ -315,7 +341,18 @@ impl Daemon {
                     .get("stream")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                match self.create_task(goal, demo, provider, interactive, stream) {
+                let approvals = params
+                    .get("approvals")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        if interactive {
+                            "ask".to_string()
+                        } else {
+                            "allow".to_string()
+                        }
+                    });
+                match self.create_task(goal, demo, provider, interactive, stream, approvals) {
                     Ok(snapshot) => (RpcResponse::ok(id, snapshot), None),
                     Err(err) => (RpcResponse::err(id, -32000, err.to_string()), None),
                 }
@@ -401,14 +438,14 @@ impl Daemon {
                     Some(subscriber_id),
                 )
             }
-            methods::APPROVAL_LIST => (RpcResponse::ok(id, json!({"approvals": []})), None),
-            methods::APPROVAL_RESPOND => (
-                RpcResponse::ok(
-                    id,
-                    json!({"accepted": false, "reason": "no pending approvals in M0"}),
-                ),
+            methods::APPROVAL_LIST => (
+                RpcResponse::ok(id, json!({"approvals": self.approval_snapshots()})),
                 None,
             ),
+            methods::APPROVAL_RESPOND => match self.respond_approval(&params) {
+                Ok(value) => (RpcResponse::ok(id, value), None),
+                Err(err) => (RpcResponse::err(id, -32002, err.to_string()), None),
+            },
             methods::TERMINAL_OPEN => match self.terminal_open(&params) {
                 Ok(value) => (RpcResponse::ok(id, value), None),
                 Err(err) => (RpcResponse::err(id, -32000, err.to_string()), None),
@@ -443,7 +480,11 @@ impl Daemon {
         provider: String,
         interactive: bool,
         stream: bool,
+        approvals: String,
     ) -> Result<Value> {
+        if !matches!(approvals.as_str(), "allow" | "ask") {
+            bail!("approvals must be allow or ask");
+        }
         let id = format!(
             "task-{}-{}",
             now_ms(),
@@ -460,6 +501,7 @@ impl Daemon {
             provider,
             interactive,
             stream,
+            approvals,
             state: TaskState::Running,
             dir,
             child: child.clone(),
@@ -482,7 +524,7 @@ impl Daemon {
     }
 
     fn run_task(self: Arc<Self>, task_id: String) {
-        let (dir, goal, demo, provider, interactive, stream, child_handle, input_handle) = {
+        let (dir, goal, demo, provider, interactive, stream, approvals, child_handle, input_handle) = {
             let inner = match self.inner.lock() {
                 Ok(inner) => inner,
                 Err(_) => return,
@@ -495,6 +537,7 @@ impl Daemon {
                     task.provider.clone(),
                     task.interactive,
                     task.stream,
+                    task.approvals.clone(),
                     task.child.clone(),
                     task.input.clone(),
                 ),
@@ -525,7 +568,9 @@ impl Daemon {
             .arg("--wasm")
             .arg(self.tools_dir.join("exec.wat"))
             .arg("--provider")
-            .arg(&provider);
+            .arg(&provider)
+            .arg("--approvals")
+            .arg(&approvals);
         if interactive {
             command
                 .arg("--session")
@@ -711,6 +756,9 @@ impl Daemon {
                 "error" => {
                     eprintln!("mskd task {task_id}: agent protocol error: {value}");
                 }
+                "approval.request" => {
+                    self.record_approval_request(task_id, &value);
+                }
                 "pong" => {}
                 other => {
                     eprintln!("mskd task {task_id}: unknown protocol frame: {other}");
@@ -763,6 +811,7 @@ impl Daemon {
             self.set_state(task_id, TaskState::Failed, Some(err.to_string()));
             return Err(err);
         }
+        self.clear_approval(task_id);
         let mut snapshot = snapshot;
         snapshot["interrupted"] = json!(true);
         Ok(snapshot)
@@ -857,8 +906,148 @@ impl Daemon {
             }
             task.snapshot()
         };
+        self.clear_approval(task_id);
         self.broadcast_state(task_id, &snapshot);
         Some(snapshot)
+    }
+
+    fn record_approval_request(&self, task_id: &str, value: &Value) {
+        let pending = PendingApproval {
+            id: value.get("id").and_then(Value::as_u64).unwrap_or(0),
+            tool: value
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string(),
+            args: value.get("args").cloned().unwrap_or(Value::Null),
+            reason: value
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            requested_ms: now_ms(),
+        };
+        if let Ok(mut approvals) = self.approvals.lock() {
+            approvals.insert(task_id.to_string(), pending.clone());
+        }
+        let notification = serde_json::to_value(RpcNotification::new(
+            "approval.request",
+            pending.snapshot(task_id),
+        ))
+        .unwrap_or(Value::Null);
+        self.broadcast(notification, task_id);
+    }
+
+    fn approval_snapshots(&self) -> Vec<Value> {
+        let now = now_ms();
+        let mut approvals = match self.approvals.lock() {
+            Ok(approvals) => approvals,
+            Err(_) => return Vec::new(),
+        };
+        approvals.retain(|_, pending| now.saturating_sub(pending.requested_ms) < 10 * 60 * 1000);
+        let mut snapshots: Vec<Value> = approvals
+            .iter()
+            .map(|(task_id, pending)| pending.snapshot(task_id))
+            .collect();
+        snapshots.sort_by_key(|snapshot| {
+            snapshot
+                .get("requested_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        });
+        snapshots
+    }
+
+    fn clear_approval(&self, task_id: &str) {
+        let pending = self
+            .approvals
+            .lock()
+            .ok()
+            .and_then(|mut approvals| approvals.remove(task_id));
+        if let Some(pending) = pending {
+            let notification = serde_json::to_value(RpcNotification::new(
+                "approval.resolved",
+                json!({
+                    "task_id": task_id,
+                    "id": pending.id,
+                    "approved": null,
+                    "reason": "no longer pending"
+                }),
+            ))
+            .unwrap_or(Value::Null);
+            self.broadcast(notification, task_id);
+        }
+    }
+
+    fn respond_approval(&self, params: &Value) -> Result<Value> {
+        let task_id = params
+            .get("task_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("task_id is required"))?;
+        let requested_id = params.get("id").and_then(Value::as_u64);
+        let approved = params
+            .get("approved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let pending = {
+            let mut approvals = self
+                .approvals
+                .lock()
+                .map_err(|_| anyhow::anyhow!("approval map poisoned"))?;
+            let pending = approvals
+                .get(task_id)
+                .ok_or_else(|| anyhow::anyhow!("no pending approval for {task_id}"))?;
+            if let Some(id) = requested_id {
+                if id != pending.id {
+                    bail!("approval id mismatch for {task_id}");
+                }
+            }
+            approvals.remove(task_id).unwrap()
+        };
+
+        let input = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("task map poisoned"))?;
+            let task = inner
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            task.input.clone()
+        };
+        let write_result = (|| -> Result<()> {
+            let mut slot = input
+                .lock()
+                .map_err(|_| anyhow::anyhow!("task input poisoned"))?;
+            let stdin = slot
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("task {task_id} stdin is not available"))?;
+            writeln!(
+                stdin,
+                "{}",
+                json!({"type": "approval.respond", "id": pending.id, "approved": approved})
+            )?;
+            stdin.flush()?;
+            Ok(())
+        })();
+        if let Err(err) = write_result {
+            self.set_state(task_id, TaskState::Failed, Some(err.to_string()));
+            return Err(err);
+        }
+
+        let notification = serde_json::to_value(RpcNotification::new(
+            "approval.resolved",
+            json!({"task_id": task_id, "id": pending.id, "approved": approved}),
+        ))
+        .unwrap_or(Value::Null);
+        self.broadcast(notification, task_id);
+        Ok(json!({
+            "accepted": true,
+            "task_id": task_id,
+            "id": pending.id,
+            "approved": approved
+        }))
     }
 
     fn set_state(&self, task_id: &str, state: TaskState, error: Option<String>) {
@@ -975,6 +1164,7 @@ impl Daemon {
                 let _ = child.kill();
             }
         }
+        self.clear_approval(task_id);
         self.broadcast_state(task_id, &snapshot);
         Ok(snapshot)
     }
@@ -998,6 +1188,7 @@ impl Daemon {
         if let Some(error) = error {
             eprintln!("mskd task {task_id}: {error}");
         }
+        self.clear_approval(task_id);
         self.broadcast_state(task_id, &snapshot);
     }
 

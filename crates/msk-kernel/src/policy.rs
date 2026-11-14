@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use msk_core::{Capability, PolicyError, PolicyTable};
+use msk_core::{Capability, PolicyDecision, PolicyError, PolicyTable};
 use msk_wasm::{ToolContext, ToolManifest};
 
 pub fn load_manifest(path: &Path) -> Result<ToolManifest> {
@@ -41,6 +41,19 @@ pub fn context_with(
 ) -> Result<ToolContext, PolicyError> {
     let granted = policy.authorize(&manifest.name, &manifest.capabilities)?;
     Ok(ToolContext::new(manifest.name.clone(), granted))
+}
+
+/// Grants the same capabilities as `default_policy`, but prompts before
+/// executing commands. Session creation, reads, resize, close, artifact
+/// reads, and echo remain automatic.
+pub fn policy_with_approvals(ask: bool) -> PolicyTable {
+    let mut table = default_policy();
+    if ask {
+        for tool in ["exec", "session_exec", "session_write"] {
+            table.set_decision(tool, PolicyDecision::Ask);
+        }
+    }
+    table
 }
 
 pub fn context_for(manifest: &ToolManifest) -> Result<ToolContext, PolicyError> {
@@ -84,5 +97,19 @@ mod tests {
         let ctx = context_for(&manifest("session_exec", &["exec.session"])).unwrap();
         assert_eq!(ctx.tool, "session_exec");
         assert!(ctx.allows(Capability::ExecSession));
+    }
+
+    #[test]
+    fn approvals_only_prompt_for_commands() {
+        let policy = policy_with_approvals(true);
+        assert_eq!(policy.decision("exec"), PolicyDecision::Ask);
+        assert_eq!(policy.decision("session_exec"), PolicyDecision::Ask);
+        assert_eq!(policy.decision("session_write"), PolicyDecision::Ask);
+        assert_eq!(policy.decision("session_create"), PolicyDecision::Allow);
+        assert_eq!(policy.decision("artifact_read"), PolicyDecision::Allow);
+        assert_eq!(
+            policy_with_approvals(false).decision("exec"),
+            PolicyDecision::Allow
+        );
     }
 }

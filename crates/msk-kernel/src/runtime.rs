@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use msk_core::context::{ContextLimits, ContextManager, summarize_output};
-use msk_core::{Capability, DataLabel, ObjectRef};
+use msk_core::{Capability, DataLabel, ObjectRef, PolicyDecision, PolicyTable};
 use msk_data::ObjectStore;
 use msk_kernel::policy;
 use msk_llm::{LlmDelta, LlmError, LlmProvider, LlmRequest, LlmResponse, Message, ToolSchema};
@@ -101,6 +101,7 @@ pub struct RegisteredTool {
     pub context: ToolContext,
     pub runtime: WasmtimeRuntime,
     pub manifest: ToolManifest,
+    pub decision: PolicyDecision,
 }
 
 pub fn load_registry(
@@ -109,13 +110,30 @@ pub fn load_registry(
     host: Arc<dyn ToolHost>,
     names: &[&str],
 ) -> Result<HashMap<String, RegisteredTool>> {
+    load_registry_with_policy(
+        tools_dir,
+        fallback_wasm,
+        host,
+        names,
+        &policy::default_policy(),
+    )
+}
+
+pub fn load_registry_with_policy(
+    tools_dir: &Path,
+    fallback_wasm: &Path,
+    host: Arc<dyn ToolHost>,
+    names: &[&str],
+    policy: &PolicyTable,
+) -> Result<HashMap<String, RegisteredTool>> {
     let mut tools = HashMap::new();
     for name in names {
         let manifest_path = tools_dir.join(format!("{name}.json"));
         let manifest = policy::load_manifest(&manifest_path)
             .with_context(|| format!("load manifest {}", manifest_path.display()))?;
-        let context =
-            policy::context_for(&manifest).with_context(|| format!("authorize tool {name}"))?;
+        let context = policy::context_with(policy, &manifest)
+            .with_context(|| format!("authorize tool {name}"))?;
+        let decision = policy.decision(&manifest.name);
 
         let candidate = tools_dir.join(format!("{name}.wat"));
         let wasm = if candidate.exists() {
@@ -131,6 +149,7 @@ pub fn load_registry(
                 context,
                 runtime,
                 manifest,
+                decision,
             },
         );
     }

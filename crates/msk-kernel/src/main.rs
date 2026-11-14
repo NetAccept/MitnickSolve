@@ -4,8 +4,9 @@ mod runtime;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
-use agent::{Session, SessionOptions};
+use agent::{ApprovalHandler, ApprovalRequest, CancelToken, Session, SessionOptions};
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -14,6 +15,7 @@ use msk_core::ToolCall;
 use msk_core::context::{ContextLimits, ContextManager, Role, summarize_output};
 use msk_data::{FileObjectStore, ObjectStore};
 use msk_events::{Event, EventSink, JsonlSink};
+use msk_kernel::policy;
 use msk_llm::{
     EchoProvider, LlmDelta, LlmError, LlmProvider, LlmResponse, OpenAiConfig, OpenAiProvider,
     OpenAiResponsesProvider, ScriptedProvider,
@@ -22,7 +24,7 @@ use msk_mcp::EnvClient;
 use msk_wasm::ToolHost;
 use runtime::{
     EnvHost, build_observation, complete_or_stream, extract_data, llm_request, load_registry,
-    substitute,
+    load_registry_with_policy, substitute,
 };
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
@@ -38,6 +40,12 @@ enum ProviderKind {
     Scripted,
     Openai,
     OpenaiResponses,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum Approvals {
+    Allow,
+    Ask,
 }
 
 #[derive(Debug, Parser)]
@@ -77,6 +85,9 @@ struct Cli {
     /// LLM provider backend.
     #[arg(long, value_enum, default_value_t = ProviderKind::Scripted)]
     provider: ProviderKind,
+    /// Ask before executing commands in a session; allow runs them directly.
+    #[arg(long, value_enum, default_value_t = Approvals::Ask)]
+    approvals: Approvals,
     /// Goal handed to a real model.
     #[arg(
         long,
@@ -126,6 +137,111 @@ enum SessionInput {
     Invalid(String),
 }
 
+struct PendingApproval {
+    id: u64,
+    tx: mpsc::Sender<bool>,
+}
+
+/// Shared between the turn thread (which blocks in `request`) and the stdin
+/// reader (which resolves `y`/`n` or `approval.respond` frames).
+#[derive(Clone)]
+struct ApprovalGate {
+    pending: Arc<Mutex<Option<PendingApproval>>>,
+    stdio_json: bool,
+    timeout: Duration,
+}
+
+impl ApprovalGate {
+    fn new(stdio_json: bool, timeout: Duration) -> Self {
+        Self {
+            pending: Arc::new(Mutex::new(None)),
+            stdio_json,
+            timeout,
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        self.pending
+            .lock()
+            .map(|pending| pending.is_some())
+            .unwrap_or(false)
+    }
+
+    fn respond(&self, id: Option<u64>, approved: bool) -> bool {
+        let Some(pending) = self
+            .pending
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take())
+        else {
+            return false;
+        };
+        if id.is_some_and(|id| id != pending.id) {
+            // Put it back; the frame was for a different request.
+            if let Ok(mut slot) = self.pending.lock() {
+                *slot = Some(pending);
+            }
+            return false;
+        }
+        pending.tx.send(approved).is_ok()
+    }
+
+    fn clear(&self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            *pending = None;
+        }
+    }
+}
+
+impl ApprovalHandler for ApprovalGate {
+    fn request(&mut self, request: &ApprovalRequest, cancel: &CancelToken) -> bool {
+        let (tx, rx) = mpsc::channel();
+        match self.pending.lock() {
+            Ok(mut pending) => {
+                *pending = Some(PendingApproval { id: request.id, tx });
+            }
+            Err(_) => return false,
+        }
+
+        if self.stdio_json {
+            emit_protocol(json!({
+                "type": "approval.request",
+                "id": request.id,
+                "tool": request.tool,
+                "args": request.args,
+                "reason": request.reason
+            }));
+        } else {
+            eprintln!(
+                "\napproval required: {} — {}\nargs: {}\napprove? [y/N] ",
+                request.tool, request.reason, request.args
+            );
+            let _ = io::stderr().flush();
+        }
+
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            if cancel.is_cancelled() {
+                self.clear();
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.clear();
+                return false;
+            }
+            match rx.recv_timeout(remaining.min(Duration::from_millis(200))) {
+                Ok(approved) => return approved,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.clear();
+                    return false;
+                }
+            }
+        }
+    }
+}
+
 /// Reads stdin on its own thread so `/interrupt` (or a JSON interrupt frame)
 /// can reach a turn that is currently blocked on a model or tool call. The
 /// reader sets the cancel token immediately, before the main loop dequeues
@@ -133,6 +249,7 @@ enum SessionInput {
 fn spawn_stdin_reader(
     cancel: agent::CancelToken,
     stdio_json: bool,
+    gate: ApprovalGate,
 ) -> mpsc::Receiver<SessionInput> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -153,7 +270,21 @@ fn spawn_stdin_reader(
                         continue;
                     }
                 };
-                match value.get("type").and_then(Value::as_str).unwrap_or("user") {
+                let kind = value.get("type").and_then(Value::as_str).unwrap_or("user");
+                if kind == "approval.respond" {
+                    let id = value.get("id").and_then(Value::as_u64);
+                    let approved = value
+                        .get("approved")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if !gate.respond(id, approved) {
+                        let _ = tx.send(SessionInput::Invalid(
+                            "approval response did not match a pending request".into(),
+                        ));
+                    }
+                    continue;
+                }
+                match kind {
                     "user" => {
                         let text = value
                             .get("text")
@@ -186,6 +317,25 @@ fn spawn_stdin_reader(
             } else {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
+                    if gate.is_pending() {
+                        gate.respond(None, false);
+                    }
+                    continue;
+                }
+                if gate.is_pending() {
+                    if trimmed == "/interrupt" {
+                        cancel.cancel();
+                        let _ = tx.send(SessionInput::Interrupt);
+                        continue;
+                    }
+                    let answer = trimmed.to_ascii_lowercase();
+                    let approved = matches!(answer.as_str(), "y" | "yes" | "approve");
+                    let denied = matches!(answer.as_str(), "n" | "no" | "deny");
+                    if approved || denied {
+                        gate.respond(None, approved);
+                    } else {
+                        eprintln!("approve? answer y or n");
+                    }
                     continue;
                 }
                 if trimmed == "/quit" || trimmed == "/exit" {
@@ -199,6 +349,9 @@ fn spawn_stdin_reader(
                 }
                 let _ = tx.send(SessionInput::User(trimmed.to_string()));
             }
+        }
+        if gate.is_pending() {
+            gate.respond(None, false);
         }
         let _ = tx.send(SessionInput::Shutdown);
     });
@@ -639,7 +792,14 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         "artifact_read",
         "echo",
     ];
-    let registry = load_registry(&cli.tools_dir, &cli.wasm, host, &tool_names)?;
+    let registry_policy = policy::policy_with_approvals(cli.approvals == Approvals::Ask);
+    let registry = load_registry_with_policy(
+        &cli.tools_dir,
+        &cli.wasm,
+        host,
+        &tool_names,
+        &registry_policy,
+    )?;
     emit(
         sink.as_ref(),
         "tool.registry",
@@ -659,6 +819,12 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
     context.push_pinned(Role::System, format!("env_id={env_id}"));
 
     let provider = session_provider(cli)?;
+    let gate = ApprovalGate::new(cli.stdio_json, Duration::from_secs(300));
+    let approvals: Option<Box<dyn ApprovalHandler>> = if cli.approvals == Approvals::Ask {
+        Some(Box::new(gate.clone()))
+    } else {
+        None
+    };
     let mut session = Session::new(SessionOptions {
         env_id,
         registry,
@@ -671,9 +837,10 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         stream: cli.stream,
         task: cli.task_id.clone(),
         cancel: agent::CancelToken::new(),
+        approvals,
     });
 
-    let inputs = spawn_stdin_reader(session.cancel_token(), cli.stdio_json);
+    let inputs = spawn_stdin_reader(session.cancel_token(), cli.stdio_json, gate);
     loop {
         if !cli.stdio_json {
             eprint!("> ");

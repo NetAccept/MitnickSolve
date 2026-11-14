@@ -64,12 +64,20 @@ M0 scaffold plus the P1 session/turn slice:
   credit-based backpressure; `Ctrl+Q` detaches. The TUI renders it through a
   `vt100` parser (colors, cursor, alternate screen), so full-screen programs are
   usable. `mskctl terminal-*` exposes the control-plane path for scripting.
+- Tri-state tool policy and approvals: `exec`, `session_exec`, and
+  `session_write` are `allow` or `ask`; unknown tools are `deny`. Interactive
+  tasks default to `ask`, so the turn blocks until a human approves or denies.
+  Denials become paired tool-error observations and the model continues.
+- Approval channels: the agent emits `approval.request` on stdout; mskd
+  broadcasts it as `approval.request` and writes `approval.respond` back to the
+  agent's stdin. `mskctl approvals/approve/deny` and the TUI modal (`y`/`n`)
+  resolve it. `--approvals allow` restores unattended execution.
 - Conversational daemon TUI: task list, transcript, message editor, streamed
   assistant text, cooperative interrupt, and a live event pane. `n` creates an
   interactive task; `Enter`/`i` writes, `s` interrupts, `t` opens the PTY.
 - Scripted LLM provider exercising LLM -> tool call -> WASM -> host bridge -> envd;
   `exec.session` is granted by the kernel and checked in `EnvHost`.
-- Approvals and service-mode envd are next.
+- Service-mode envd, persistence/replay, and multi-agent are next.
 
 The Go side is not compiled in this repository yet; see
 [`tools/envd/README.md`](tools/envd/README.md).
@@ -120,7 +128,10 @@ target/debug/msk --envd target/debug/envd --root .msk/session --session
 
 Use `--provider openai` (or `openai-responses`) with the usual model environment
 variables for a real conversation. `--goal` is only used by the one-shot demo;
-in session mode the first turn is whatever the user sends.
+in session mode the first turn is whatever the user sends. Sessions default to
+`--approvals ask`: command-executing tools print an approval prompt and wait
+for `y`/`n` (or an `approval.respond` frame in JSON mode). Use
+`--approvals allow` for unattended runs.
 
 The daemon uses the same engine with a strict protocol:
 
@@ -129,13 +140,14 @@ target/debug/msk --envd target/debug/envd --root .msk/session \
   --session --stdio-json --stream
 ```
 
-In this mode stdout carries only JSON lines: `{"type":"user","text":"..."}` or
-`{"type":"interrupt"}` on stdin, and `agent.text`, `turn.end`, `pong`, or
-`error` frames on stdout. All setup messages go to stderr. `turn.end` has
-`status` `awaiting_input`, `interrupted`, `stopped`, or `error`; errors do not
-terminate the session. Interrupts are cooperative: the current blocking model
-or tool call finishes, the engine stops before the next step, and every
-assistant tool call still gets a paired result so the next turn is valid.
+In this mode stdout carries only JSON lines: `{"type":"user","text":"..."}`,
+`{"type":"interrupt"}`, or `{"type":"approval.respond","id":N,"approved":true}`
+on stdin, and `agent.text`, `approval.request`, `turn.end`, `pong`, or `error`
+frames on stdout. All setup messages go to stderr. `turn.end` has `status`
+`awaiting_input`, `interrupted`, `stopped`, or `error`; errors do not terminate
+the session. Interrupts are cooperative: the current blocking model or tool call
+finishes, the engine stops before the next step, and every assistant tool call
+still gets a paired result so the next turn is valid.
 
 ## Real provider
 
@@ -201,6 +213,9 @@ Interactive tasks stay alive between messages:
 target/debug/mskctl --root .msk create --interactive
 target/debug/mskctl --root .msk send --task task-... --text "list the workspace"
 target/debug/mskctl --root .msk interrupt task-...
+target/debug/mskctl --root .msk approvals
+target/debug/mskctl --root .msk approve --task task-... --id 1
+target/debug/mskctl --root .msk deny --task task-... --id 2
 target/debug/mskctl --root .msk watch --task task-...
 target/debug/mskctl --root .msk state task-...
 ```
@@ -208,17 +223,21 @@ target/debug/mskctl --root .msk state task-...
 `task.message` is accepted only when the task is `waiting_input`; while a turn
 is running it returns an error instead of interleaving messages. `turn.end`
 notifications carry the turn number and any error message, and the agent stays
-available for the next turn. Use `--provider openai` on `create` together with
-`MSK_LLM_*` in the daemon environment for a real model.
+available for the next turn. Interactive tasks default to `approvals=ask`;
+pass `--approvals allow` to `create` for unattended execution. Use
+`--provider openai` on `create` together with `MSK_LLM_*` in the daemon
+environment for a real model.
 
 The TUI in daemon mode is a conversational workbench: a task list, a transcript,
 and a message editor. `Enter` or `i` starts writing; `Enter` sends, `Esc` leaves
 the editor, and `←`/`→`, `Home`/`End`, `Backspace`, and `Ctrl+U` edit the line.
 `s` interrupts the running turn, `n` creates an interactive scripted task,
-`x` cancels, `t` opens/focuses the daemon-managed PTY terminal (`Ctrl+Q`
-detaches), `j`/`k` select tasks, `r` reloads, and `?` shows help. Assistant text
-streams into the transcript as `agent.text` deltas; errors and interrupts appear
-as system lines. The right pane keeps the live event stream for debugging.
+`x` cancels, `a` shows pending approvals, and a pending approval opens a modal
+where `y` approves and `n`/`Esc` denies. `t` opens/focuses the daemon-managed
+PTY terminal (`Ctrl+Q` detaches), `j`/`k` select tasks, `r` reloads, and `?`
+shows help. Assistant text streams into the transcript as `agent.text` deltas;
+errors and interrupts appear as system lines. The right pane keeps the live
+event stream for debugging.
 
 Terminal scripting:
 

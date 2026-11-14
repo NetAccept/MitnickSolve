@@ -166,11 +166,33 @@ pub enum PolicyError {
     NotGranted(String),
 }
 
+/// Tri-state policy for an invocation. Capability grants decide what a tool
+/// may do; this decides whether the kernel executes it directly, asks the
+/// user, or refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyDecision {
+    Allow,
+    Ask,
+    Deny,
+}
+
+impl PolicyDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+        }
+    }
+}
+
 /// Kernel-owned policy table: tool name -> capabilities the kernel is willing
 /// to grant. A manifest may declare a subset of these; it can never self-grant.
 #[derive(Debug, Clone, Default)]
 pub struct PolicyTable {
     grants: HashMap<String, Vec<Capability>>,
+    decisions: HashMap<String, PolicyDecision>,
 }
 
 impl PolicyTable {
@@ -192,6 +214,22 @@ impl PolicyTable {
 
     pub fn grant(&mut self, tool: impl Into<String>, capabilities: Vec<Capability>) {
         self.grants.insert(tool.into(), capabilities);
+    }
+
+    pub fn set_decision(&mut self, tool: impl Into<String>, decision: PolicyDecision) {
+        self.decisions.insert(tool.into(), decision);
+    }
+
+    /// Returns the explicit decision for a tool, or Allow for a granted tool
+    /// and Deny for an unknown one.
+    pub fn decision(&self, tool: &str) -> PolicyDecision {
+        self.decisions.get(tool).copied().unwrap_or_else(|| {
+            if self.grants.contains_key(tool) {
+                PolicyDecision::Allow
+            } else {
+                PolicyDecision::Deny
+            }
+        })
     }
 
     pub fn authorize(
@@ -308,5 +346,15 @@ mod tests {
             policy.authorize("missing", &[]),
             Err(PolicyError::UnknownTool(_))
         ));
+    }
+
+    #[test]
+    fn policy_decisions_default_to_allow_or_deny() {
+        let mut policy = PolicyTable::new();
+        policy.grant("exec", vec![Capability::ExecSession]);
+        assert_eq!(policy.decision("exec"), PolicyDecision::Allow);
+        assert_eq!(policy.decision("missing"), PolicyDecision::Deny);
+        policy.set_decision("exec", PolicyDecision::Ask);
+        assert_eq!(policy.decision("exec"), PolicyDecision::Ask);
     }
 }
