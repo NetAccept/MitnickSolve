@@ -9,6 +9,10 @@ use std::ffi::c_void;
 
 pub const MS_ABI_VERSION: u32 = 1;
 
+/// Symbol every core-component shared library exports. It returns a pointer
+/// to a static `ms_component`.
+pub const MS_COMPONENT_ENTRY: &[u8] = b"ms_component_entry\0";
+
 pub const MS_PORT_LLM: u32 = 1;
 pub const MS_PORT_TRANSPORT: u32 = 2;
 pub const MS_PORT_STORE: u32 = 3;

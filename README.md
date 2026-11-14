@@ -79,6 +79,9 @@ M0 scaffold plus the P1 session/turn slice:
   order, duplicate IDs, and parent links, then prints a transcript or filtered
   JSONL. `msk --session --resume <events.jsonl>` pins a capped transcript into
   the new session so work can continue after an envd/session restart.
+- Signed component manifests: Ed25519 signatures over canonical manifest
+  bytes, an explicit publisher trust store, and SHA-256/path checks for
+  component artifacts. Dynamic library loading is the remaining M2 step.
 - Scripted LLM provider exercising LLM -> tool call -> WASM -> host bridge -> envd;
   `exec.session` is granted by the kernel and checked in `EnvHost`.
 - Service-mode envd, persistence/replay, and multi-agent are next.
