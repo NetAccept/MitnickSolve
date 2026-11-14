@@ -17,3 +17,5 @@ msk-events.workspace = true
 msk-ipc.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true
+unicode-width = "0.1"
+vt100 = "0.15"

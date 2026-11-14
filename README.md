@@ -45,8 +45,9 @@ M0 scaffold:
   tasks and stream events. A per-root token file gates local clients.
 - Daemon-managed PTY terminal: `t` in the daemon TUI opens an interactive
   ConPTY/Unix PTY proxied by the daemon over a binary MSKD data plane with
-  credit-based backpressure; `Ctrl+Q` detaches. `mskctl terminal-*` exposes the
-  control-plane path for scripting.
+  credit-based backpressure; `Ctrl+Q` detaches. The TUI renders it through a
+  `vt100` parser (colors, cursor, alternate screen), so full-screen programs are
+  usable. `mskctl terminal-*` exposes the control-plane path for scripting.
 - Scripted LLM provider exercising LLM -> tool call -> WASM -> host bridge -> envd;
   `exec.session` is granted by the kernel and checked in `EnvHost`.
 - Real streaming providers, session/PTY, and service-mode envd are next.

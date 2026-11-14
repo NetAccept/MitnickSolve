@@ -860,7 +860,7 @@ M0 实现：envd 支持 `pty=true` 的 PTY 会话（Windows ConPTY、Unix PTY）
 - 不与内核链接；GUI 语言可独立选择。
 - 远程前端通过 TLS 网关接入，认证与授权由内核负责。
 
-M0 实现：`mskd` 在 `<root>/kernel.sock`（Windows 命名管道）上提供换行分隔 JSON-RPC，token 存于 `<root>/ipc.token`。`mskctl` 支持 list/create/state/cancel/watch 与 terminal-open/write/read/resize/close；`msk-tui --connect <root>` 接任务列表、事件流和取消，`t` 打开 daemon 代理的 PTY 终端（`Ctrl+Q` 脱离）。终端数据面使用独立本地套接字 `<root>/kernel.data`（Windows 命名管道），帧为 `MSKD`，支持 DATA/CREDIT/RESIZE/EXIT/CLOSE 和基于 credit 的背压；`mskctl terminal-stream` 和 TUI 终端走这条路径。任务当前以受监管的 `msk` 子进程运行；审批端点为占位。
+M0 实现：`mskd` 在 `<root>/kernel.sock`（Windows 命名管道）上提供换行分隔 JSON-RPC，token 存于 `<root>/ipc.token`。`mskctl` 支持 list/create/state/cancel/watch 与 terminal-open/write/read/resize/close；`msk-tui --connect <root>` 接任务列表、事件流和取消，`t` 打开 daemon 代理的 PTY 终端（`Ctrl+Q` 脱离），并用 `vt100` 状态机渲染颜色、光标和备用屏幕。终端数据面使用独立本地套接字 `<root>/kernel.data`（Windows 命名管道），帧为 `MSKD`，支持 DATA/CREDIT/RESIZE/EXIT/CLOSE 和基于 credit 的背压；`mskctl terminal-stream` 和 TUI 终端走这条路径。任务当前以受监管的 `msk` 子进程运行；审批端点为占位。
 
 ---
 

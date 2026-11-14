@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Stdout, stdout};
 use std::path::{Path, PathBuf};
@@ -17,10 +18,12 @@ use msk_ipc::data::{DataClient, DataEvent};
 use msk_ipc::{Client, methods};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap};
 use serde_json::{Value, json};
+use unicode_width::UnicodeWidthStr;
 
 const MAX_EVENTS: usize = 5000;
 const MAX_DETAIL_LINES: usize = 400;
@@ -405,9 +408,34 @@ impl App {
 
 struct TerminalView {
     session_id: String,
-    output: String,
+    parser: vt100::Parser,
     cols: u16,
     rows: u16,
+}
+
+impl TerminalView {
+    fn new(session_id: String, cols: u16, rows: u16) -> Self {
+        Self {
+            session_id,
+            parser: vt100::Parser::new(rows.max(1), cols.max(1), 2000),
+            cols,
+            rows,
+        }
+    }
+
+    fn process(&mut self, bytes: &[u8]) {
+        self.parser.process(bytes);
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) {
+        self.parser.set_size(rows.max(1), cols.max(1));
+        self.cols = cols;
+        self.rows = rows;
+    }
+
+    fn screen(&self) -> &vt100::Screen {
+        self.parser.screen()
+    }
 }
 
 struct DaemonApp {
@@ -418,6 +446,7 @@ struct DaemonApp {
     events: Vec<(String, Event)>,
     terminal: Option<TerminalView>,
     terminal_data: Option<DataClient>,
+    terminal_size: Cell<(u16, u16)>,
     terminal_focus: bool,
     follow: bool,
     show_help: bool,
@@ -440,6 +469,7 @@ impl DaemonApp {
             events: Vec::new(),
             terminal: None,
             terminal_data: None,
+            terminal_size: Cell::new((0, 0)),
             terminal_focus: false,
             follow: true,
             show_help: false,
@@ -514,13 +544,8 @@ impl DaemonApp {
             while let Some(event) = data.try_event() {
                 match event {
                     DataEvent::Data(bytes) => {
-                        let text = sanitize_terminal(&bytes);
                         if let Some(terminal) = self.terminal.as_mut() {
-                            terminal.output.push_str(&text);
-                            if terminal.output.len() > 1_000_000 {
-                                let excess = terminal.output.len() - 1_000_000;
-                                terminal.output.drain(..excess);
-                            }
+                            terminal.process(&bytes);
                         }
                         credits += bytes.len();
                     }
@@ -542,6 +567,20 @@ impl DaemonApp {
                 self.terminal_focus = false;
             } else {
                 self.terminal_data = Some(data);
+            }
+        }
+
+        if self.terminal_focus {
+            let (cols, rows) = self.terminal_size.get();
+            if cols > 0 && rows > 0 {
+                if let Some(terminal) = self.terminal.as_mut() {
+                    if terminal.cols != cols || terminal.rows != rows {
+                        terminal.resize(cols, rows);
+                        if let Some(data) = self.terminal_data.as_ref() {
+                            let _ = data.resize(cols, rows);
+                        }
+                    }
+                }
             }
         }
 
@@ -688,12 +727,11 @@ impl DaemonApp {
         };
         match data.open_terminal(100, 30) {
             Ok(opened) => {
-                self.terminal = Some(TerminalView {
-                    session_id: opened.session_id,
-                    output: String::new(),
-                    cols: opened.cols,
-                    rows: opened.rows,
-                });
+                self.terminal = Some(TerminalView::new(
+                    opened.session_id,
+                    opened.cols,
+                    opened.rows,
+                ));
                 self.terminal_data = Some(data);
                 self.terminal_focus = true;
                 self.status = "terminal opened; Ctrl+Q detaches".into();
@@ -756,18 +794,27 @@ impl DaemonApp {
         if self.terminal_focus {
             if let Some(terminal) = &self.terminal {
                 let area = areas[2];
-                let lines = area.height.saturating_sub(2) as usize;
-                let text = tail_lines(&terminal.output, lines);
                 let title = format!(
                     "terminal {} {}x{}  [Ctrl+Q] detach",
                     terminal.session_id, terminal.cols, terminal.rows
                 );
+                let block = Block::default().borders(Borders::ALL).title(title);
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                self.terminal_size.set((inner.width, inner.height));
                 frame.render_widget(
-                    Paragraph::new(text)
-                        .block(Block::default().borders(Borders::ALL).title(title))
-                        .wrap(Wrap { trim: false }),
-                    area,
+                    TerminalWidget {
+                        screen: terminal.screen(),
+                    },
+                    inner,
                 );
+                let screen = terminal.screen();
+                if !screen.hide_cursor() {
+                    let (row, col) = screen.cursor_position();
+                    if col < inner.width && row < inner.height {
+                        frame.set_cursor_position((inner.x + col, inner.y + row));
+                    }
+                }
             }
             frame.render_widget(Paragraph::new("terminal focused: Ctrl+Q detach"), areas[3]);
             return;
@@ -803,25 +850,28 @@ impl DaemonApp {
             List::new(event_items).block(Block::default().borders(Borders::ALL).title(event_title));
         frame.render_widget(event_list, panes[0]);
 
-        let right = if let Some(terminal) = &self.terminal {
-            let text = tail_lines(&terminal.output, panes[1].height.saturating_sub(2) as usize);
-            Paragraph::new(text)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!("terminal {} [t] focus", terminal.session_id)),
-                )
-                .wrap(Wrap { trim: false })
+        if let Some(terminal) = &self.terminal {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!("terminal {} [t] focus", terminal.session_id));
+            let inner = block.inner(panes[1]);
+            frame.render_widget(block, panes[1]);
+            frame.render_widget(
+                TerminalWidget {
+                    screen: terminal.screen(),
+                },
+                inner,
+            );
         } else {
             let detail = self
                 .selected_event()
                 .map(detail_text)
                 .unwrap_or_else(|| "no events for the selected task".into());
-            Paragraph::new(detail)
+            let detail = Paragraph::new(detail)
                 .block(Block::default().borders(Borders::ALL).title("latest event"))
-                .wrap(Wrap { trim: false })
-        };
-        frame.render_widget(right, panes[1]);
+                .wrap(Wrap { trim: false });
+            frame.render_widget(detail, panes[1]);
+        }
 
         let footer = "q quit  j/k task  n new  x cancel  t terminal  r reload  f follow  a approvals  ? help";
         frame.render_widget(Paragraph::new(footer), areas[3]);
@@ -937,74 +987,86 @@ fn terminal_key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Home => Some(b"\x1b[H".to_vec()),
         KeyCode::End => Some(b"\x1b[F".to_vec()),
         KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+        KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
+        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
+        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
+        KeyCode::F(1) => Some(b"\x1bOP".to_vec()),
+        KeyCode::F(2) => Some(b"\x1bOQ".to_vec()),
+        KeyCode::F(3) => Some(b"\x1bOR".to_vec()),
+        KeyCode::F(4) => Some(b"\x1bOS".to_vec()),
+        KeyCode::F(5) => Some(b"\x1b[15~".to_vec()),
+        KeyCode::F(6) => Some(b"\x1b[17~".to_vec()),
+        KeyCode::F(7) => Some(b"\x1b[18~".to_vec()),
+        KeyCode::F(8) => Some(b"\x1b[19~".to_vec()),
+        KeyCode::F(9) => Some(b"\x1b[20~".to_vec()),
+        KeyCode::F(10) => Some(b"\x1b[21~".to_vec()),
+        KeyCode::F(11) => Some(b"\x1b[23~".to_vec()),
+        KeyCode::F(12) => Some(b"\x1b[24~".to_vec()),
         _ => None,
     }
 }
 
-fn sanitize_terminal(bytes: &[u8]) -> String {
-    let mut out = String::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if byte == 0x1b {
-            index += 1;
-            if index >= bytes.len() {
-                break;
-            }
-            match bytes[index] {
-                b'[' => {
-                    index += 1;
-                    while index < bytes.len() {
-                        let byte = bytes[index];
-                        index += 1;
-                        if (0x40..=0x7e).contains(&byte) {
-                            break;
-                        }
-                    }
-                }
-                b']' => {
-                    index += 1;
-                    while index < bytes.len() {
-                        let byte = bytes[index];
-                        index += 1;
-                        if byte == 0x07 {
-                            break;
-                        }
-                        if byte == 0x1b && index < bytes.len() && bytes[index] == b'\\' {
-                            index += 1;
-                            break;
-                        }
-                    }
-                }
-                _ => index += 1,
-            }
-            continue;
-        }
-        if byte == b'\r' {
-            index += 1;
-            continue;
-        }
-        if byte == b'\n' || byte == b'\t' || (0x20..0x7f).contains(&byte) {
-            out.push(byte as char);
-            index += 1;
-            continue;
-        }
-        if byte >= 0x80 {
-            out.push_str(&String::from_utf8_lossy(&bytes[index..]));
-            break;
-        }
-        index += 1;
-    }
-    out
+struct TerminalWidget<'a> {
+    screen: &'a vt100::Screen,
 }
 
-fn tail_lines(text: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
+impl Widget for TerminalWidget<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let (rows, cols) = self.screen.size();
+        let rows = rows.min(area.height);
+        let cols = cols.min(area.width);
+        for row in 0..rows {
+            let mut col = 0;
+            while col < cols {
+                let Some(cell) = self.screen.cell(row, col) else {
+                    col += 1;
+                    continue;
+                };
+                let symbol = cell.contents();
+                if symbol.is_empty() {
+                    col += 1;
+                    continue;
+                }
+                let width = UnicodeWidthStr::width(symbol.as_str()).max(1) as u16;
+                if col + width > cols {
+                    break;
+                }
+                let style = Style::default()
+                    .fg(map_color(cell.fgcolor()))
+                    .bg(map_color(cell.bgcolor()))
+                    .add_modifier(cell_modifier(cell));
+                buf[(area.x + col, area.y + row)]
+                    .set_symbol(&symbol)
+                    .set_style(style);
+                col += width;
+            }
+        }
     }
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(max);
-    lines[start..].join("\n")
+}
+
+fn map_color(color: vt100::Color) -> Color {
+    match color {
+        vt100::Color::Default => Color::Reset,
+        vt100::Color::Idx(index) => Color::Indexed(index),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+fn cell_modifier(cell: &vt100::Cell) -> Modifier {
+    let mut modifier = Modifier::empty();
+    if cell.bold() {
+        modifier |= Modifier::BOLD;
+    }
+    if cell.italic() {
+        modifier |= Modifier::ITALIC;
+    }
+    if cell.underline() {
+        modifier |= Modifier::UNDERLINED;
+    }
+    if cell.inverse() {
+        modifier |= Modifier::REVERSED;
+    }
+    modifier
 }
 
 fn short_time(ts: &str) -> String {
@@ -1162,9 +1224,17 @@ mod tests {
     }
 
     #[test]
-    fn terminal_helpers() {
-        assert_eq!(tail_lines("a\nb\nc", 2), "b\nc");
-        assert_eq!(sanitize_terminal(b"a\x1b[31mb\r\n"), "ab\n");
+    fn terminal_parser_renders_text() {
+        let mut parser = vt100::Parser::new(2, 10, 0);
+        parser.process(b"hi");
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buffer = Buffer::empty(area);
+        TerminalWidget {
+            screen: parser.screen(),
+        }
+        .render(area, &mut buffer);
+        assert_eq!(buffer[(0, 0)].symbol(), "h");
+        assert_eq!(buffer[(1, 0)].symbol(), "i");
         let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(terminal_key_bytes(key), Some(vec![b'\r']));
     }
