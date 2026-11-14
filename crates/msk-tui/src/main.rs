@@ -4,8 +4,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use clap::Parser;
-use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{
+    self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -400,12 +404,21 @@ impl App {
     }
 }
 
+struct TerminalView {
+    session_id: String,
+    output: String,
+    cols: u16,
+    rows: u16,
+}
+
 struct DaemonApp {
     client: Client,
     root: PathBuf,
     tasks: Vec<Value>,
     selected_task: usize,
     events: Vec<(String, Event)>,
+    terminal: Option<TerminalView>,
+    terminal_focus: bool,
     follow: bool,
     show_help: bool,
     status: String,
@@ -425,6 +438,8 @@ impl DaemonApp {
             tasks: Vec::new(),
             selected_task: 0,
             events: Vec::new(),
+            terminal: None,
+            terminal_focus: false,
             follow: true,
             show_help: false,
             status: "connected".into(),
@@ -492,6 +507,37 @@ impl DaemonApp {
             self.events.drain(0..excess);
         }
 
+        if let Some(session_id) = self
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.session_id.clone())
+        {
+            match self.client.request(
+                methods::TERMINAL_READ,
+                json!({"session_id": session_id, "max_bytes": 65536, "timeout_ms": 0}),
+            ) {
+                Ok(result) => {
+                    if let Some(encoded) = result.get("data_base64").and_then(Value::as_str) {
+                        if let Ok(bytes) = STANDARD.decode(encoded) {
+                            let text = sanitize_terminal(&bytes);
+                            if let Some(terminal) = self.terminal.as_mut() {
+                                terminal.output.push_str(&text);
+                                if terminal.output.len() > 1_000_000 {
+                                    let excess = terminal.output.len() - 1_000_000;
+                                    terminal.output.drain(..excess);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    self.status = format!("terminal read failed: {err}");
+                    self.terminal = None;
+                    self.terminal_focus = false;
+                }
+            }
+        }
+
         if self.last_refresh.elapsed() >= Duration::from_secs(1) {
             if let Err(err) = self.reload_tasks() {
                 self.status = format!("refresh failed: {err}");
@@ -529,8 +575,35 @@ impl DaemonApp {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if self.terminal_focus {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
+                self.terminal_focus = false;
+                self.status = "terminal detached".into();
+                return false;
+            }
+            if let Some(bytes) = terminal_key_bytes(key) {
+                if let Some(session_id) = self
+                    .terminal
+                    .as_ref()
+                    .map(|terminal| terminal.session_id.clone())
+                {
+                    let encoded = STANDARD.encode(bytes);
+                    if let Err(err) = self.client.request(
+                        methods::TERMINAL_WRITE,
+                        json!({"session_id": session_id, "data_base64": encoded}),
+                    ) {
+                        self.status = format!("terminal write failed: {err}");
+                    }
+                }
+            }
+            return false;
+        }
+
         match key.code {
-            KeyCode::Char('q') => return true,
+            KeyCode::Char('q') => {
+                self.close_terminal();
+                return true;
+            }
             KeyCode::Char('?') => self.show_help = !self.show_help,
             KeyCode::Char('j') | KeyCode::Down => {
                 if !self.tasks.is_empty() {
@@ -555,6 +628,7 @@ impl DaemonApp {
             KeyCode::Char('a') => {
                 self.status = "approvals: none pending (M0 agent has no approval calls yet)".into();
             }
+            KeyCode::Char('t') => self.toggle_terminal(),
             _ => {}
         }
         false
@@ -597,6 +671,42 @@ impl DaemonApp {
         {
             Ok(_) => self.status = format!("cancelled {task_id}"),
             Err(err) => self.status = format!("cancel failed: {err}"),
+        }
+    }
+
+    fn toggle_terminal(&mut self) {
+        if let Some(terminal) = &self.terminal {
+            self.terminal_focus = true;
+            self.status = format!("terminal {} focused; Ctrl+Q detaches", terminal.session_id);
+            return;
+        }
+        match self
+            .client
+            .request(methods::TERMINAL_OPEN, json!({"cols": 100, "rows": 30}))
+        {
+            Ok(result) => {
+                if let Some(session_id) = result.get("session_id").and_then(Value::as_str) {
+                    self.terminal = Some(TerminalView {
+                        session_id: session_id.to_string(),
+                        output: String::new(),
+                        cols: 100,
+                        rows: 30,
+                    });
+                    self.terminal_focus = true;
+                    self.status = "terminal opened; Ctrl+Q detaches".into();
+                }
+            }
+            Err(err) => self.status = format!("terminal open failed: {err}"),
+        }
+    }
+
+    fn close_terminal(&mut self) {
+        self.terminal_focus = false;
+        if let Some(terminal) = self.terminal.take() {
+            let _ = self.client.request(
+                methods::TERMINAL_CLOSE,
+                json!({"session_id": terminal.session_id}),
+            );
         }
     }
 
@@ -643,6 +753,26 @@ impl DaemonApp {
             .highlight_symbol("› ");
         frame.render_stateful_widget(tasks, areas[1], &mut task_state);
 
+        if self.terminal_focus {
+            if let Some(terminal) = &self.terminal {
+                let area = areas[2];
+                let lines = area.height.saturating_sub(2) as usize;
+                let text = tail_lines(&terminal.output, lines);
+                let title = format!(
+                    "terminal {} {}x{}  [Ctrl+Q] detach",
+                    terminal.session_id, terminal.cols, terminal.rows
+                );
+                frame.render_widget(
+                    Paragraph::new(text)
+                        .block(Block::default().borders(Borders::ALL).title(title))
+                        .wrap(Wrap { trim: false }),
+                    area,
+                );
+            }
+            frame.render_widget(Paragraph::new("terminal focused: Ctrl+Q detach"), areas[3]);
+            return;
+        }
+
         let panes = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
@@ -673,16 +803,27 @@ impl DaemonApp {
             List::new(event_items).block(Block::default().borders(Borders::ALL).title(event_title));
         frame.render_widget(event_list, panes[0]);
 
-        let detail = self
-            .selected_event()
-            .map(detail_text)
-            .unwrap_or_else(|| "no events for the selected task".into());
-        let detail = Paragraph::new(detail)
-            .block(Block::default().borders(Borders::ALL).title("latest event"))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(detail, panes[1]);
+        let right = if let Some(terminal) = &self.terminal {
+            let text = tail_lines(&terminal.output, panes[1].height.saturating_sub(2) as usize);
+            Paragraph::new(text)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!("terminal {} [t] focus", terminal.session_id)),
+                )
+                .wrap(Wrap { trim: false })
+        } else {
+            let detail = self
+                .selected_event()
+                .map(detail_text)
+                .unwrap_or_else(|| "no events for the selected task".into());
+            Paragraph::new(detail)
+                .block(Block::default().borders(Borders::ALL).title("latest event"))
+                .wrap(Wrap { trim: false })
+        };
+        frame.render_widget(right, panes[1]);
 
-        let footer = "q quit  j/k task  n new  x cancel  r reload  f follow  a approvals  ? help";
+        let footer = "q quit  j/k task  n new  x cancel  t terminal  r reload  f follow  a approvals  ? help";
         frame.render_widget(Paragraph::new(footer), areas[3]);
 
         if self.show_help {
@@ -695,6 +836,8 @@ impl DaemonApp {
                  g / G      first / last task\n\
                  n          create a scripted session task\n\
                  x          cancel the selected task\n\
+                 t          open/focus the PTY terminal\n\
+                 Ctrl+Q     detach from terminal focus\n\
                  r          reload the task list\n\
                  f          follow new events\n\
                  a          show pending approvals\n\
@@ -718,7 +861,12 @@ fn run_daemon(
     loop {
         app.refresh()?;
         terminal.draw(|frame| app.draw(frame))?;
-        if event::poll(Duration::from_millis(app.refresh_ms))?
+        let poll_ms = if app.terminal_focus {
+            50
+        } else {
+            app.refresh_ms
+        };
+        if event::poll(Duration::from_millis(poll_ms))?
             && let CrosstermEvent::Key(key) = event::read()?
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && app.handle_key(key)
@@ -766,6 +914,97 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cli: Cli) -> Result<()
             return Ok(());
         }
     }
+}
+
+fn terminal_key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if let KeyCode::Char(ch) = key.code {
+            let ch = ch.to_ascii_lowercase();
+            return Some(vec![(ch as u8) & 0x1f]);
+        }
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(ch) => Some(ch.to_string().into_bytes()),
+        KeyCode::Enter => Some(vec![b'\r']),
+        KeyCode::Backspace => Some(vec![0x7f]),
+        KeyCode::Tab => Some(vec![b'\t']),
+        KeyCode::Esc => Some(vec![0x1b]),
+        KeyCode::Up => Some(b"\x1b[A".to_vec()),
+        KeyCode::Down => Some(b"\x1b[B".to_vec()),
+        KeyCode::Right => Some(b"\x1b[C".to_vec()),
+        KeyCode::Left => Some(b"\x1b[D".to_vec()),
+        KeyCode::Home => Some(b"\x1b[H".to_vec()),
+        KeyCode::End => Some(b"\x1b[F".to_vec()),
+        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+        _ => None,
+    }
+}
+
+fn sanitize_terminal(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == 0x1b {
+            index += 1;
+            if index >= bytes.len() {
+                break;
+            }
+            match bytes[index] {
+                b'[' => {
+                    index += 1;
+                    while index < bytes.len() {
+                        let byte = bytes[index];
+                        index += 1;
+                        if (0x40..=0x7e).contains(&byte) {
+                            break;
+                        }
+                    }
+                }
+                b']' => {
+                    index += 1;
+                    while index < bytes.len() {
+                        let byte = bytes[index];
+                        index += 1;
+                        if byte == 0x07 {
+                            break;
+                        }
+                        if byte == 0x1b && index < bytes.len() && bytes[index] == b'\\' {
+                            index += 1;
+                            break;
+                        }
+                    }
+                }
+                _ => index += 1,
+            }
+            continue;
+        }
+        if byte == b'\r' {
+            index += 1;
+            continue;
+        }
+        if byte == b'\n' || byte == b'\t' || (0x20..0x7f).contains(&byte) {
+            out.push(byte as char);
+            index += 1;
+            continue;
+        }
+        if byte >= 0x80 {
+            out.push_str(&String::from_utf8_lossy(&bytes[index..]));
+            break;
+        }
+        index += 1;
+    }
+    out
+}
+
+fn tail_lines(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max);
+    lines[start..].join("\n")
 }
 
 fn short_time(ts: &str) -> String {
@@ -920,5 +1159,13 @@ mod tests {
     fn time_and_truncate_helpers() {
         assert_eq!(short_time("2026-11-14T08:01:09.123Z"), "08:01:09");
         assert_eq!(truncate("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn terminal_helpers() {
+        assert_eq!(tail_lines("a\nb\nc", 2), "b\nc");
+        assert_eq!(sanitize_terminal(b"a\x1b[31mb\r\n"), "ab\n");
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(terminal_key_bytes(key), Some(vec![b'\r']));
     }
 }

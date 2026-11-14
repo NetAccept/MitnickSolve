@@ -13,6 +13,7 @@ use clap::Parser;
 use msk_events::Event;
 use msk_ipc::local::{self, Stream};
 use msk_ipc::{RpcNotification, RpcRequest, RpcResponse, TryClone, methods};
+use msk_mcp::EnvClient;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -84,6 +85,13 @@ struct Subscriber {
     tx: mpsc::Sender<Value>,
 }
 
+struct TerminalSession {
+    client: EnvClient,
+    session_id: String,
+    cols: u16,
+    rows: u16,
+}
+
 #[derive(Default)]
 struct Inner {
     tasks: HashMap<String, Task>,
@@ -97,6 +105,7 @@ struct Daemon {
     token: String,
     inner: Mutex<Inner>,
     subscribers: Mutex<Vec<Subscriber>>,
+    terminal: Mutex<Option<TerminalSession>>,
     next_task: AtomicU64,
     next_sub: AtomicU64,
 }
@@ -137,6 +146,7 @@ fn main() -> Result<()> {
         token,
         inner: Mutex::new(Inner::default()),
         subscribers: Mutex::new(Vec::new()),
+        terminal: Mutex::new(None),
         next_task: AtomicU64::new(1),
         next_sub: AtomicU64::new(1),
     });
@@ -324,6 +334,26 @@ impl Daemon {
                 ),
                 None,
             ),
+            methods::TERMINAL_OPEN => match self.terminal_open(&params) {
+                Ok(value) => (RpcResponse::ok(id, value), None),
+                Err(err) => (RpcResponse::err(id, -32000, err.to_string()), None),
+            },
+            methods::TERMINAL_WRITE => match self.terminal_write(&params) {
+                Ok(value) => (RpcResponse::ok(id, value), None),
+                Err(err) => (RpcResponse::err(id, -32000, err.to_string()), None),
+            },
+            methods::TERMINAL_READ => match self.terminal_read(&params) {
+                Ok(value) => (RpcResponse::ok(id, value), None),
+                Err(err) => (RpcResponse::err(id, -32000, err.to_string()), None),
+            },
+            methods::TERMINAL_RESIZE => match self.terminal_resize(&params) {
+                Ok(value) => (RpcResponse::ok(id, value), None),
+                Err(err) => (RpcResponse::err(id, -32000, err.to_string()), None),
+            },
+            methods::TERMINAL_CLOSE => match self.terminal_close(&params) {
+                Ok(value) => (RpcResponse::ok(id, value), None),
+                Err(err) => (RpcResponse::err(id, -32000, err.to_string()), None),
+            },
             other => (
                 RpcResponse::err(id, -32601, format!("method not found: {other}")),
                 None,
@@ -594,6 +624,172 @@ impl Daemon {
             subscribers.retain(|subscriber| subscriber.id != id);
         }
     }
+
+    fn terminal_open(&self, params: &Value) -> Result<Value> {
+        let mut guard = self
+            .terminal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal lock poisoned"))?;
+        if let Some(terminal) = guard.as_ref() {
+            return Ok(json!({
+                "session_id": terminal.session_id,
+                "cols": terminal.cols,
+                "rows": terminal.rows
+            }));
+        }
+
+        let cols = params.get("cols").and_then(Value::as_u64).unwrap_or(100) as u16;
+        let rows = params.get("rows").and_then(Value::as_u64).unwrap_or(30) as u16;
+        let envd_root = self.root.join("terminal-envd");
+        fs::create_dir_all(&envd_root)?;
+        let mut client = EnvClient::spawn(&self.envd, &envd_root).context("spawn terminal envd")?;
+        client.handshake("mskd-terminal")?;
+        client.initialize()?;
+
+        let env = client.call_tool(
+            "env_create",
+            json!({"name": "terminal", "kind": "managed", "profile": "dev"}),
+        )?;
+        let env_data = mcp_data(&env)?;
+        let env_id = env_data
+            .get("env_id")
+            .and_then(Value::as_str)
+            .context("terminal env_id")?
+            .to_string();
+        let session = client.call_tool(
+            "session_create",
+            json!({"env_id": env_id, "pty": true, "cols": cols, "rows": rows}),
+        )?;
+        let session_data = mcp_data(&session)?;
+        let session_id = session_data
+            .get("session_id")
+            .and_then(Value::as_str)
+            .context("terminal session_id")?
+            .to_string();
+
+        *guard = Some(TerminalSession {
+            client,
+            session_id: session_id.clone(),
+            cols,
+            rows,
+        });
+        Ok(json!({"session_id": session_id, "cols": cols, "rows": rows}))
+    }
+
+    fn terminal_write(&self, params: &Value) -> Result<Value> {
+        let session_id = params
+            .get("session_id")
+            .and_then(Value::as_str)
+            .context("session_id")?;
+        let data = params
+            .get("data_base64")
+            .and_then(Value::as_str)
+            .context("data_base64")?;
+        let mut guard = self
+            .terminal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal lock poisoned"))?;
+        let terminal = guard.as_mut().context("terminal is not open")?;
+        if terminal.session_id != session_id {
+            bail!("terminal session mismatch");
+        }
+        let result = terminal.client.call_tool(
+            "session_write",
+            json!({"session_id": session_id, "data_base64": data}),
+        )?;
+        mcp_data(&result)
+    }
+
+    fn terminal_read(&self, params: &Value) -> Result<Value> {
+        let session_id = params
+            .get("session_id")
+            .and_then(Value::as_str)
+            .context("session_id")?;
+        let max_bytes = params
+            .get("max_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(64 * 1024);
+        let timeout_ms = params
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let mut guard = self
+            .terminal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal lock poisoned"))?;
+        let terminal = guard.as_mut().context("terminal is not open")?;
+        if terminal.session_id != session_id {
+            bail!("terminal session mismatch");
+        }
+        let result = terminal.client.call_tool(
+            "session_read",
+            json!({
+                "session_id": session_id,
+                "max_bytes": max_bytes,
+                "timeout_ms": timeout_ms
+            }),
+        )?;
+        mcp_data(&result)
+    }
+
+    fn terminal_resize(&self, params: &Value) -> Result<Value> {
+        let session_id = params
+            .get("session_id")
+            .and_then(Value::as_str)
+            .context("session_id")?
+            .to_string();
+        let cols = params.get("cols").and_then(Value::as_u64).context("cols")? as u16;
+        let rows = params.get("rows").and_then(Value::as_u64).context("rows")? as u16;
+        let mut guard = self
+            .terminal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal lock poisoned"))?;
+        let terminal = guard.as_mut().context("terminal is not open")?;
+        if terminal.session_id != session_id {
+            bail!("terminal session mismatch");
+        }
+        let result = terminal.client.call_tool(
+            "session_resize",
+            json!({"session_id": session_id, "cols": cols, "rows": rows}),
+        )?;
+        terminal.cols = cols;
+        terminal.rows = rows;
+        mcp_data(&result)
+    }
+
+    fn terminal_close(&self, params: &Value) -> Result<Value> {
+        let session_id = params
+            .get("session_id")
+            .and_then(Value::as_str)
+            .context("session_id")?
+            .to_string();
+        let mut guard = self
+            .terminal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal lock poisoned"))?;
+        let data = {
+            let terminal = guard.as_mut().context("terminal is not open")?;
+            if terminal.session_id != session_id {
+                bail!("terminal session mismatch");
+            }
+            let result = terminal
+                .client
+                .call_tool("session_close", json!({"session_id": session_id}))?;
+            mcp_data(&result)?
+        };
+        *guard = None;
+        Ok(data)
+    }
+}
+
+fn mcp_data(result: &Value) -> Result<Value> {
+    let structured = result
+        .get("structuredContent")
+        .context("missing structuredContent")?;
+    if structured.get("ok").and_then(Value::as_bool) != Some(true) {
+        bail!("tool not ok: {structured}");
+    }
+    Ok(structured.get("data").cloned().unwrap_or(Value::Null))
 }
 
 fn now_ms() -> u128 {

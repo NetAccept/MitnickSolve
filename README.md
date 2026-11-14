@@ -43,6 +43,9 @@ M0 scaffold:
 - Daemon and local IPC: `mskd` supervises agent tasks over a Unix socket or
   Windows named pipe; `mskctl` and `msk-tui --connect` can list/create/cancel
   tasks and stream events. A per-root token file gates local clients.
+- Daemon-managed PTY terminal: `t` in the daemon TUI opens an interactive
+  ConPTY/Unix PTY proxied by the daemon; `Ctrl+Q` detaches. `mskctl terminal-*`
+  exposes the same path for scripting.
 - Scripted LLM provider exercising LLM -> tool call -> WASM -> host bridge -> envd;
   `exec.session` is granted by the kernel and checked in `EnvHost`.
 - Real streaming providers, session/PTY, and service-mode envd are next.
@@ -142,8 +145,19 @@ automatically. On Unix the socket and token are mode 0600; Windows named pipes
 currently rely on local-user access rather than an explicit DACL.
 
 The TUI in daemon mode supports `j`/`k` task selection, `n` to create a default
-session task, `x` to cancel, `r` to reload, `a` for the approvals placeholder,
-and `?` for help.
+session task, `x` to cancel, `t` to open/focus the daemon-managed PTY terminal
+(`Ctrl+Q` detaches), `r` to reload, `a` for the approvals placeholder, and `?`
+for help.
+
+Terminal scripting:
+
+```sh
+target/debug/mskctl --root .msk terminal-open
+target/debug/mskctl --root .msk terminal-write --session ses_... --line "echo hi"
+target/debug/mskctl --root .msk terminal-read --session ses_... --timeout-ms 300
+target/debug/mskctl --root .msk terminal-resize --session ses_... --cols 120 --rows 40
+target/debug/mskctl --root .msk terminal-close --session ses_...
+```
 
 ## Layout
 
