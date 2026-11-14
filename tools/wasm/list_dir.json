@@ -1,0 +1,9 @@
+{
+  "name": "list_dir",
+  "description": "List a directory inside an envd environment workspace.",
+  "input_schema": {
+    "type": "object",
+    "required": ["env_id", "path"]
+  },
+  "capabilities": ["fs.workspace"]
+}

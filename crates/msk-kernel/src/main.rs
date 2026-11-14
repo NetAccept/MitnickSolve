@@ -793,6 +793,11 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         "session_resize",
         "session_close",
         "artifact_read",
+        "read_file",
+        "write_file",
+        "list_dir",
+        "stat_file",
+        "http_request",
         "echo",
     ];
     let registry_policy = policy::policy_with_approvals(cli.approvals == Approvals::Ask);

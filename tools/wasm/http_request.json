@@ -1,0 +1,9 @@
+{
+  "name": "http_request",
+  "description": "Perform an HTTP(S) request. Body and response body are base64; redirects are followed.",
+  "input_schema": {
+    "type": "object",
+    "required": ["url"]
+  },
+  "capabilities": ["net.egress"]
+}

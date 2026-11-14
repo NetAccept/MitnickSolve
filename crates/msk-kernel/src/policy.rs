@@ -31,6 +31,11 @@ pub fn default_policy() -> PolicyTable {
         ("session_resize", vec![Capability::ExecSession]),
         ("session_close", vec![Capability::ExecSession]),
         ("artifact_read", vec![Capability::ArtifactRead]),
+        ("read_file", vec![Capability::FsWorkspace]),
+        ("write_file", vec![Capability::FsWorkspace]),
+        ("list_dir", vec![Capability::FsWorkspace]),
+        ("stat_file", vec![Capability::FsWorkspace]),
+        ("http_request", vec![Capability::NetEgress]),
         ("echo", vec![]),
     ])
 }
@@ -49,7 +54,7 @@ pub fn context_with(
 pub fn policy_with_approvals(ask: bool) -> PolicyTable {
     let mut table = default_policy();
     if ask {
-        for tool in ["exec", "session_exec", "session_write"] {
+        for tool in ["exec", "session_exec", "session_write", "write_file"] {
             table.set_decision(tool, PolicyDecision::Ask);
         }
     }
@@ -107,6 +112,8 @@ mod tests {
         assert_eq!(policy.decision("session_write"), PolicyDecision::Ask);
         assert_eq!(policy.decision("session_create"), PolicyDecision::Allow);
         assert_eq!(policy.decision("artifact_read"), PolicyDecision::Allow);
+        assert_eq!(policy.decision("write_file"), PolicyDecision::Ask);
+        assert_eq!(policy.decision("read_file"), PolicyDecision::Allow);
         assert_eq!(
             policy_with_approvals(false).decision("exec"),
             PolicyDecision::Allow

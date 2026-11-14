@@ -13,6 +13,14 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 class Handler(BaseHTTPRequestHandler):
     calls = 0
 
+    def do_GET(self):
+        body = json.dumps({"ok": True, "path": self.path}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length)
@@ -114,8 +122,47 @@ class Handler(BaseHTTPRequestHandler):
                 return True
         return False
 
+    def wants_file(self, request):
+        for message in request.get("messages", []):
+            if message.get("role") == "user" and "file" in (message.get("content") or ""):
+                return True
+        return False
+
+    def wants_http(self, request):
+        for message in request.get("messages", []):
+            if message.get("role") == "user" and "http" in (message.get("content") or ""):
+                return True
+        return False
+
     def chat_payload(self, request):
+        wants_file = self.wants_file(request)
         if Handler.calls == 1:
+            if self.wants_http(request):
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_http",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "http_request",
+                                            "arguments": json.dumps(
+                                                {
+                                                    "url": "http://127.0.0.1:8765/healthz",
+                                                    "method": "GET",
+                                                }
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                    "usage": {"total_tokens": 7},
+                }
             if self.wants_exec(request):
                 return {
                     "choices": [
@@ -146,6 +193,34 @@ class Handler(BaseHTTPRequestHandler):
                     ],
                     "usage": {"total_tokens": 7},
                 }
+            if wants_file:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_write",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "write_file",
+                                            "arguments": json.dumps(
+                                                {
+                                                    "env_id": "$ENV",
+                                                    "path": "note.txt",
+                                                    "data": "aGVsbG8gZmlsZQ==",
+                                                    "atomic": True,
+                                                }
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                    "usage": {"total_tokens": 7},
+                }
             return {
                 "choices": [
                     {
@@ -159,6 +234,32 @@ class Handler(BaseHTTPRequestHandler):
                                         "name": "echo",
                                         "arguments": json.dumps(
                                             {"message": "hello from mock"}
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ],
+                "usage": {"total_tokens": 7},
+            }
+        if Handler.calls == 2 and wants_file:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_read",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": json.dumps(
+                                            {
+                                                "env_id": "$ENV",
+                                                "path": "note.txt",
+                                            }
                                         ),
                                     },
                                 }

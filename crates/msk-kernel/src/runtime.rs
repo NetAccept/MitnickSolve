@@ -3,8 +3,10 @@
 //! paths exercise the same WASM/policy boundary.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -31,6 +33,93 @@ struct ReadArtifactArgs {
     offset: Option<usize>,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct HttpRequestArgs {
+    #[serde(default = "default_http_method")]
+    method: String,
+    url: String,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    #[serde(default)]
+    body_base64: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    max_bytes: Option<usize>,
+}
+
+fn default_http_method() -> String {
+    "GET".into()
+}
+
+/// Host-side HTTP egress for the `http_request` WASM tool. The WASM guest
+/// cannot bypass the capability check in `EnvHost::call`; this function only
+/// performs the I/O after that check. Redirects and http/https only.
+fn http_request(input: &[u8]) -> Result<Vec<u8>, String> {
+    let args: HttpRequestArgs = serde_json::from_slice(input)
+        .map_err(|err| format!("invalid http request input: {err}"))?;
+    let method = args.method.to_ascii_uppercase();
+    if method.is_empty() {
+        return Err("method is empty".into());
+    }
+    if !args.url.starts_with("http://") && !args.url.starts_with("https://") {
+        return Err("only http:// and https:// URLs are allowed".into());
+    }
+    let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(30_000).clamp(100, 120_000));
+    let max_bytes = args
+        .max_bytes
+        .unwrap_or(4 * 1024 * 1024)
+        .clamp(1, 16 * 1024 * 1024);
+    let body = match &args.body_base64 {
+        Some(encoded) => STANDARD
+            .decode(encoded)
+            .map_err(|err| format!("body_base64: {err}"))?,
+        None => Vec::new(),
+    };
+
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut builder = ureq::http::Request::builder()
+        .method(method.as_str())
+        .uri(&args.url);
+    for (name, value) in &args.headers {
+        builder = builder.header(name, value);
+    }
+    let request = builder
+        .body(body)
+        .map_err(|err| format!("http request: {err}"))?;
+    let mut response = agent
+        .run(request)
+        .map_err(|err| format!("http request failed: {err}"))?;
+    let status = response.status().as_u16();
+    let mut headers = Vec::new();
+    for (name, value) in response.headers().iter() {
+        if let Ok(value) = value.to_str() {
+            headers.push((name.to_string(), value.to_string()));
+        }
+    }
+    let mut buffer = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .take((max_bytes + 1) as u64)
+        .read_to_end(&mut buffer)
+        .map_err(|err| format!("http body: {err}"))?;
+    let truncated = buffer.len() > max_bytes;
+    buffer.truncate(max_bytes);
+    let response = json!({
+        "status": status,
+        "headers": headers,
+        "body_base64": STANDARD.encode(&buffer),
+        "bytes": buffer.len(),
+        "truncated": truncated
+    });
+    serde_json::to_vec(&response).map_err(|err| err.to_string())
 }
 
 impl EnvHost {
@@ -69,6 +158,12 @@ impl EnvHost {
 
 impl ToolHost for EnvHost {
     fn call(&self, ctx: &ToolContext, input: &[u8]) -> Result<Vec<u8>, String> {
+        if ctx.tool == "http_request" {
+            if !ctx.allows(Capability::NetEgress) {
+                return Err("denied: net.egress not granted".to_string());
+            }
+            return http_request(input);
+        }
         if ctx.tool == "artifact_read" {
             if !ctx.allows(Capability::ArtifactRead) {
                 return Err("denied: artifact.read not granted".to_string());
@@ -76,13 +171,16 @@ impl ToolHost for EnvHost {
             return self.read_artifact(input);
         }
 
-        let envd_tool = match ctx.tool.as_str() {
+        let (envd_tool, capability) = match ctx.tool.as_str() {
             "exec" | "session_create" | "session_exec" | "session_close" | "session_write"
-            | "session_read" | "session_resize" => ctx.tool.as_str(),
+            | "session_read" | "session_resize" => (ctx.tool.as_str(), Capability::ExecSession),
+            "read_file" | "write_file" | "list_dir" | "stat_file" => {
+                (ctx.tool.as_str(), Capability::FsWorkspace)
+            }
             other => return Err(format!("denied: tool {other} is not allowed")),
         };
-        if !ctx.allows(Capability::ExecSession) {
-            return Err("denied: exec.session not granted".to_string());
+        if !ctx.allows(capability.clone()) {
+            return Err(format!("denied: {} not granted", capability.as_str()));
         }
         let args: Value =
             serde_json::from_slice(input).map_err(|err| format!("invalid tool input: {err}"))?;
@@ -280,4 +378,57 @@ pub fn extract_data(value: &Value) -> Result<Value> {
         return Ok(structured.get("data").cloned().unwrap_or(Value::Null));
     }
     Ok(value.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn http_request_returns_status_headers_and_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = "hello http";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let input = serde_json::to_vec(&json!({
+            "url": format!("http://{address}/"),
+            "headers": {"X-Test": "1"}
+        }))
+        .unwrap();
+        let output = http_request(&input).unwrap();
+        let value: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["status"], 200);
+        let body = STANDARD
+            .decode(value["body_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(body, b"hello http");
+        assert!(
+            value["headers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|header| header[0] == "content-type")
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_request_rejects_non_http_urls() {
+        let input = serde_json::to_vec(&json!({"url": "file:///etc/passwd"})).unwrap();
+        assert!(http_request(&input).is_err());
+    }
 }

@@ -88,6 +88,10 @@ M0 scaffold plus the P1 session/turn slice:
   validates the ABI header, port kind, id, and version against the signed
   manifest, and keeps the library loaded. A cdylib test component exercises the
   path end to end. Host `init`/vtable dispatch is the next M2 step.
+- File and HTTP tools: `read_file`/`write_file`/`list_dir`/`stat_file` run
+  through envd with `fs.workspace` (writes require approval); `http_request`
+  performs host-side HTTP(S) under `net.egress` with a 30 s default timeout and
+  4 MiB response cap. Only http/https URLs are accepted.
 - Scripted LLM provider exercising LLM -> tool call -> WASM -> host bridge -> envd;
   `exec.session` is granted by the kernel and checked in `EnvHost`.
 - Service-mode envd, persistence/replay, and multi-agent are next.

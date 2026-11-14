@@ -1,0 +1,9 @@
+{
+  "name": "read_file",
+  "description": "Read a file from an envd environment (base64 chunks with offset/limit).",
+  "input_schema": {
+    "type": "object",
+    "required": ["env_id", "path"]
+  },
+  "capabilities": ["fs.workspace"]
+}
