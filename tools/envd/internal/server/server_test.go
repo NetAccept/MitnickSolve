@@ -122,6 +122,9 @@ func TestSessionExec(t *testing.T) {
 	if !strings.Contains(first["stdout"].(string), "one") {
 		t.Fatalf("first stdout: %q", first["stdout"])
 	}
+	if strings.Contains(first["stdout"].(string), "__MSK_PROMPT__") {
+		t.Fatalf("prompt leaked into stdout: %q", first["stdout"])
+	}
 	if first["exit_code"].(float64) != 0 {
 		t.Fatalf("first exit code: %v", first["exit_code"])
 	}

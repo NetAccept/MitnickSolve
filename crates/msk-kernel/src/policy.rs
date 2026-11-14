@@ -24,7 +24,9 @@ pub fn load_manifest(path: &Path) -> Result<ToolManifest> {
 pub fn default_policy() -> PolicyTable {
     PolicyTable::from_grants([
         ("exec", vec![Capability::ExecSession]),
+        ("session_create", vec![Capability::ExecSession]),
         ("session_exec", vec![Capability::ExecSession]),
+        ("session_close", vec![Capability::ExecSession]),
         ("echo", vec![]),
     ])
 }
@@ -71,5 +73,12 @@ mod tests {
     #[test]
     fn unknown_tool_is_denied() {
         assert!(context_for(&manifest("missing", &[])).is_err());
+    }
+
+    #[test]
+    fn session_tools_are_granted() {
+        let ctx = context_for(&manifest("session_exec", &["exec.session"])).unwrap();
+        assert_eq!(ctx.tool, "session_exec");
+        assert!(ctx.allows(Capability::ExecSession));
     }
 }

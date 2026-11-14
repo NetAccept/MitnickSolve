@@ -1,18 +1,25 @@
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use msk_core::{Capability, ToolCall};
 use msk_events::{Event, EventSink, JsonlSink};
 use msk_kernel::policy;
-use msk_llm::{LlmProvider, LlmRequest, LlmResponse, Message, ScriptedProvider};
+use msk_llm::{LlmError, LlmProvider, LlmRequest, LlmResponse, Message, ScriptedProvider};
 use msk_mcp::EnvClient;
 use msk_wasm::{ToolContext, ToolHost, WasmtimeRuntime};
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Demo {
+    Session,
+    Echo,
+}
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -22,16 +29,18 @@ struct Cli {
     /// Kernel state directory (events, envd data).
     #[arg(long, default_value = ".msk")]
     root: PathBuf,
-    /// WAT/WasM tool to invoke in the M0 tool-call slice.
+    /// Directory containing tool manifests and WAT modules.
+    #[arg(long, default_value = "tools/wasm")]
+    tools_dir: PathBuf,
+    /// Fallback module for tools without a matching <tool>.wat.
     #[arg(long, default_value = "tools/wasm/exec.wat")]
     wasm: PathBuf,
-    /// Manifest declaring the tool name and requested capabilities.
-    #[arg(long, default_value = "tools/wasm/exec.json")]
-    manifest: PathBuf,
+    /// Scripted agent demo to run.
+    #[arg(long, value_enum, default_value_t = Demo::Session)]
+    demo: Demo,
 }
 
 /// M0 host bridge: the only native capability exposed to WASM tools.
-/// It currently forwards to envd `exec`; policy and data handles come later.
 struct EnvHost {
     client: Mutex<EnvClient>,
 }
@@ -39,8 +48,7 @@ struct EnvHost {
 impl ToolHost for EnvHost {
     fn call(&self, ctx: &ToolContext, input: &[u8]) -> Result<Vec<u8>, String> {
         let envd_tool = match ctx.tool.as_str() {
-            "exec" => "exec",
-            "session_exec" => "session_exec",
+            "exec" | "session_create" | "session_exec" | "session_close" => ctx.tool.as_str(),
             other => return Err(format!("denied: tool {other} is not allowed")),
         };
         if !ctx.allows(Capability::ExecSession) {
@@ -59,6 +67,11 @@ impl ToolHost for EnvHost {
     }
 }
 
+struct RegisteredTool {
+    context: ToolContext,
+    runtime: WasmtimeRuntime,
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -72,48 +85,7 @@ fn main() -> Result<()> {
     emit(
         &sink,
         "kernel.start",
-        json!({"root": cli.root.display().to_string()}),
-    )?;
-
-    if !cli.manifest.exists() {
-        bail!("tool manifest not found: {}", cli.manifest.display());
-    }
-    let manifest = policy::load_manifest(&cli.manifest)?;
-    emit(
-        &sink,
-        "tool.manifest",
-        json!({
-            "path": cli.manifest.display().to_string(),
-            "name": manifest.name.clone(),
-            "capabilities": manifest.capabilities.clone()
-        }),
-    )?;
-
-    let tool_ctx = match policy::context_for(&manifest) {
-        Ok(context) => context,
-        Err(err) => {
-            emit(
-                &sink,
-                "policy.decision",
-                json!({
-                    "tool": manifest.name.clone(),
-                    "declared": manifest.capabilities.clone(),
-                    "decision": "deny",
-                    "reason": err.to_string()
-                }),
-            )?;
-            return Err(err.into());
-        }
-    };
-    emit(
-        &sink,
-        "policy.decision",
-        json!({
-            "tool": tool_ctx.tool.clone(),
-            "declared": manifest.capabilities.clone(),
-            "granted": tool_ctx.capabilities.clone(),
-            "decision": "allow"
-        }),
+        json!({"root": cli.root.display().to_string(), "demo": format!("{:?}", cli.demo)}),
     )?;
 
     let envd_bin = cli.envd.canonicalize().unwrap_or_else(|_| cli.envd.clone());
@@ -123,11 +95,11 @@ fn main() -> Result<()> {
             envd_bin.display()
         );
     }
+    if !cli.tools_dir.exists() {
+        bail!("tool directory not found: {}", cli.tools_dir.display());
+    }
     if !cli.wasm.exists() {
-        bail!(
-            "WASM tool not found: {} — expected tools/wasm/exec.wat or tools/wasm/echo.wat",
-            cli.wasm.display()
-        );
+        bail!("fallback WASM module not found: {}", cli.wasm.display());
     }
 
     let envd_root = cli.root.join("envd");
@@ -152,7 +124,7 @@ fn main() -> Result<()> {
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or(0);
-    println!("tools: {tool_count}");
+    println!("envd tools: {tool_count}");
     emit(&sink, "mcp.tools", json!({"count": tool_count}))?;
 
     let env = tool_data(
@@ -206,110 +178,115 @@ fn main() -> Result<()> {
     }
     println!("file roundtrip: ok ({} bytes)", decoded.len());
 
-    let argv = if cfg!(windows) {
-        json!(["cmd.exe", "/C", "echo exec-ok"])
-    } else {
-        json!(["/bin/sh", "-c", "echo exec-ok"])
-    };
-    let exec = tool_data(
-        &mut client,
-        "exec",
-        json!({"env_id": env_id.clone(), "argv": argv.clone(), "timeout_ms": 10000}),
-        &sink,
-    )?;
-    let exit_code = exec.get("exit_code").and_then(Value::as_i64).unwrap_or(-1);
-    let stdout = exec.get("stdout").and_then(Value::as_str).unwrap_or("");
-    println!("direct exec exit={exit_code} stdout={stdout:?}");
-
-    // Scripted LLM -> tool call -> WASM -> host bridge -> envd.
-    let wasm_argv = if cfg!(windows) {
-        json!(["cmd.exe", "/C", "echo from-wasm"])
-    } else {
-        json!(["/bin/sh", "-c", "echo from-wasm"])
-    };
-    let provider = ScriptedProvider::new(
-        "scripted",
-        vec![LlmResponse {
-            text: "run the demo command through the WASM tool".into(),
-            tool_calls: vec![ToolCall {
-                id: "call-1".into(),
-                tool: "exec".into(),
-                args: json!({
-                    "env_id": env_id.clone(),
-                    "argv": wasm_argv,
-                    "timeout_ms": 10000
-                }),
-            }],
-            usage_tokens: 42,
-        }],
-    );
-    let request = LlmRequest {
-        messages: vec![Message {
-            role: "user".into(),
-            content: "run the demo command".into(),
-        }],
-        tools: vec![],
-        max_tokens: Some(256),
-    };
-    let response = provider.complete(&request).context("scripted LLM")?;
-    emit(
-        &sink,
-        "llm.response",
-        json!({
-            "text": response.text.clone(),
-            "tool_calls": response.tool_calls.len(),
-            "usage_tokens": response.usage_tokens
-        }),
-    )?;
-
     let env_host = Arc::new(EnvHost {
         client: Mutex::new(client),
     });
     let host: Arc<dyn ToolHost> = env_host.clone();
-    let runtime = WasmtimeRuntime::from_file(host, &cli.wasm)
-        .with_context(|| format!("load WASM tool {}", cli.wasm.display()))?;
+
+    let tool_names: &[&str] = match cli.demo {
+        Demo::Session => &["session_create", "session_exec", "session_close"],
+        Demo::Echo => &["echo"],
+    };
+    let registry = load_registry(&cli.tools_dir, &cli.wasm, host, tool_names)?;
     emit(
         &sink,
-        "wasm.load",
-        json!({"path": cli.wasm.display().to_string()}),
+        "tool.registry",
+        json!({"tools": tool_names, "dir": cli.tools_dir.display().to_string()}),
     )?;
 
-    for call in response.tool_calls {
-        let input = serde_json::to_vec(&call.args)?;
-        emit(
-            &sink,
-            "wasm.call",
-            json!({"tool": call.tool, "input_bytes": input.len()}),
-        )?;
-        let started = std::time::Instant::now();
-        let output = runtime
-            .run_with_context(&tool_ctx, &input)
-            .context("WASM tool run")?;
-        let duration_ms = started.elapsed().as_millis();
-        let value: Value =
-            serde_json::from_slice(&output).context("WASM tool returned non-JSON")?;
-        emit(
-            &sink,
-            "wasm.result",
-            json!({"tool": call.tool, "duration_ms": duration_ms, "result": value}),
-        )?;
+    let provider = ScriptedProvider::new("scripted", demo_responses(cli.demo));
+    let mut transcript = vec![Message {
+        role: "user".into(),
+        content: "run the M0 agent demo".into(),
+    }];
+    let request = LlmRequest {
+        messages: transcript.clone(),
+        tools: Vec::new(),
+        max_tokens: Some(512),
+    };
+    let mut response = provider.complete(&request).context("scripted LLM")?;
+    let mut last_session: Option<String> = None;
 
-        let is_error = value
-            .get("isError")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if is_error {
-            bail!("WASM tool failed: {value}");
+    loop {
+        emit(
+            &sink,
+            "llm.response",
+            json!({
+                "text": response.text.clone(),
+                "tool_calls": response.tool_calls.len(),
+                "usage_tokens": response.usage_tokens
+            }),
+        )?;
+        transcript.push(Message {
+            role: "assistant".into(),
+            content: response.text.clone(),
+        });
+        if response.tool_calls.is_empty() {
+            break;
         }
-        let structured = value
-            .get("structuredContent")
-            .cloned()
-            .unwrap_or_else(|| value.clone());
-        let data = structured
-            .get("data")
-            .cloned()
-            .unwrap_or_else(|| structured.clone());
-        println!("wasm tool result: {}", serde_json::to_string(&data)?);
+
+        for call in response.tool_calls {
+            let mut args = call.args.clone();
+            substitute(&mut args, &env_id, last_session.as_deref())?;
+
+            let tool = registry
+                .get(&call.tool)
+                .with_context(|| format!("tool not registered: {}", call.tool))?;
+            emit(&sink, "tool.call", json!({"tool": call.tool, "args": args}))?;
+            emit(
+                &sink,
+                "policy.decision",
+                json!({
+                    "tool": tool.context.tool.clone(),
+                    "granted": tool.context.capabilities.clone(),
+                    "decision": "allow"
+                }),
+            )?;
+
+            let input = serde_json::to_vec(&args)?;
+            let started = std::time::Instant::now();
+            let output = tool
+                .runtime
+                .run_with_context(&tool.context, &input)
+                .with_context(|| format!("WASM tool {}", call.tool))?;
+            let duration_ms = started.elapsed().as_millis();
+            let value: Value =
+                serde_json::from_slice(&output).context("WASM tool returned non-JSON")?;
+            let data = extract_data(&value)?;
+            emit(
+                &sink,
+                "wasm.result",
+                json!({"tool": call.tool, "duration_ms": duration_ms, "data": data}),
+            )?;
+            println!("[{}] {}", call.tool, serde_json::to_string(&data)?);
+
+            if call.tool == "session_create" {
+                last_session = data
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if last_session.is_none() {
+                    bail!("session_create did not return session_id");
+                }
+            } else if call.tool == "session_close" {
+                last_session = None;
+            }
+
+            transcript.push(Message {
+                role: "user".into(),
+                content: format!("observation {}: {}", call.tool, data),
+            });
+        }
+
+        match provider.complete(&LlmRequest {
+            messages: transcript.clone(),
+            tools: Vec::new(),
+            max_tokens: Some(512),
+        }) {
+            Ok(next) => response = next,
+            Err(LlmError::Exhausted) => break,
+            Err(err) => return Err(err.into()),
+        }
     }
 
     if let Ok(mut client) = env_host.client.lock() {
@@ -317,6 +294,147 @@ fn main() -> Result<()> {
     }
     println!("events: {}", events_path.display());
     Ok(())
+}
+
+fn load_registry(
+    tools_dir: &Path,
+    fallback_wasm: &Path,
+    host: Arc<dyn ToolHost>,
+    names: &[&str],
+) -> Result<HashMap<String, RegisteredTool>> {
+    let mut tools = HashMap::new();
+    for name in names {
+        let manifest_path = tools_dir.join(format!("{name}.json"));
+        let manifest = policy::load_manifest(&manifest_path)
+            .with_context(|| format!("load manifest {}", manifest_path.display()))?;
+        let context =
+            policy::context_for(&manifest).with_context(|| format!("authorize tool {name}"))?;
+
+        let candidate = tools_dir.join(format!("{name}.wat"));
+        let wasm = if candidate.exists() {
+            candidate
+        } else {
+            fallback_wasm.to_path_buf()
+        };
+        let runtime = WasmtimeRuntime::from_file(host.clone(), &wasm)
+            .with_context(|| format!("load WASM {}", wasm.display()))?;
+        tools.insert((*name).to_string(), RegisteredTool { context, runtime });
+    }
+    Ok(tools)
+}
+
+fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
+    match demo {
+        Demo::Echo => vec![
+            LlmResponse {
+                text: "echo the tool arguments".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    tool: "echo".into(),
+                    args: json!({"message": "hello from echo"}),
+                }],
+                usage_tokens: 5,
+            },
+            LlmResponse {
+                text: "echo demo complete".into(),
+                tool_calls: Vec::new(),
+                usage_tokens: 5,
+            },
+        ],
+        Demo::Session => {
+            let state_command = if cfg!(windows) {
+                "set MSK_DEMO=42 && echo !MSK_DEMO!"
+            } else {
+                "MSK_DEMO=42; echo $MSK_DEMO"
+            };
+            vec![
+                LlmResponse {
+                    text: "create a persistent shell".into(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        tool: "session_create".into(),
+                        args: json!({"env_id": "$ENV"}),
+                    }],
+                    usage_tokens: 10,
+                },
+                LlmResponse {
+                    text: "run a command".into(),
+                    tool_calls: vec![ToolCall {
+                        id: "c2".into(),
+                        tool: "session_exec".into(),
+                        args: json!({"session_id": "$SESSION", "command": "echo session-one"}),
+                    }],
+                    usage_tokens: 10,
+                },
+                LlmResponse {
+                    text: "verify shell state persists".into(),
+                    tool_calls: vec![ToolCall {
+                        id: "c3".into(),
+                        tool: "session_exec".into(),
+                        args: json!({"session_id": "$SESSION", "command": state_command}),
+                    }],
+                    usage_tokens: 10,
+                },
+                LlmResponse {
+                    text: "close the session".into(),
+                    tool_calls: vec![ToolCall {
+                        id: "c4".into(),
+                        tool: "session_close".into(),
+                        args: json!({"session_id": "$SESSION"}),
+                    }],
+                    usage_tokens: 10,
+                },
+                LlmResponse {
+                    text: "session demo complete".into(),
+                    tool_calls: Vec::new(),
+                    usage_tokens: 10,
+                },
+            ]
+        }
+    }
+}
+
+fn substitute(value: &mut Value, env_id: &str, session: Option<&str>) -> Result<()> {
+    match value {
+        Value::String(text) => {
+            if text == "$ENV" {
+                *text = env_id.to_string();
+            } else if text == "$SESSION" {
+                let session = session
+                    .ok_or_else(|| anyhow::anyhow!("$SESSION used before session_create"))?;
+                *text = session.to_string();
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                substitute(item, env_id, session)?;
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                substitute(item, env_id, session)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn extract_data(value: &Value) -> Result<Value> {
+    if value
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("tool failed: {value}");
+    }
+    if let Some(structured) = value.get("structuredContent") {
+        if structured.get("ok").and_then(Value::as_bool) != Some(true) {
+            bail!("tool returned not ok: {structured}");
+        }
+        return Ok(structured.get("data").cloned().unwrap_or(Value::Null));
+    }
+    Ok(value.clone())
 }
 
 fn tool_data(

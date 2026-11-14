@@ -1,0 +1,9 @@
+{
+  "name": "session_create",
+  "description": "Start a persistent shell session inside an environment.",
+  "input_schema": {
+    "type": "object",
+    "required": ["env_id"]
+  },
+  "capabilities": ["exec.session"]
+}

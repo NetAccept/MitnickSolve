@@ -1,0 +1,9 @@
+{
+  "name": "session_exec",
+  "description": "Run a command in a persistent envd shell session.",
+  "input_schema": {
+    "type": "object",
+    "required": ["session_id", "command"]
+  },
+  "capabilities": ["exec.session"]
+}

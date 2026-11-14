@@ -1,0 +1,9 @@
+{
+  "name": "session_close",
+  "description": "Close a persistent envd shell session.",
+  "input_schema": {
+    "type": "object",
+    "required": ["session_id"]
+  },
+  "capabilities": ["exec.session"]
+}

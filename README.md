@@ -18,6 +18,9 @@ M0 scaffold:
   declared capabilities with kernel grants; a manifest can never self-grant.
 - Persistent shell sessions in envd (`session_create` / `session_exec` /
   `session_close`): repeated commands reuse one shell instead of spawning a process.
+- Multi-turn scripted agent loop: each LLM turn can issue tool calls, observations
+  feed the next turn. The default demo creates a session, runs commands, verifies
+  shell state, and closes it through WASM + manifest policy.
 - Scripted LLM provider exercising LLM -> tool call -> WASM -> host bridge -> envd;
   `exec.session` is granted by the kernel and checked in `EnvHost`.
 - Real streaming providers, session/PTY, and service-mode envd are next.
@@ -45,10 +48,14 @@ go build -o ../../target/debug/envd ./cmd/envd
 cargo run -p msk-kernel --bin msk -- --envd target/debug/envd --root .msk
 ```
 
-On Windows the envd binary is `target/debug/envd.exe`. The demo uses
-`tools/wasm/exec.wat` with `tools/wasm/exec.json` by default; pass
-`--wasm tools/wasm/echo.wat --manifest tools/wasm/echo.json` to exercise the
-tool boundary without the envd host bridge.
+On Windows the envd binary is `target/debug/envd.exe`. The default
+`--demo session` uses `tools/wasm/session_*.json` and falls back to
+`tools/wasm/exec.wat` for the host bridge. Use `--demo echo` for the echo-only
+tool boundary:
+
+```sh
+cargo run -p msk-kernel --bin msk -- --envd target/debug/envd --root .msk --demo echo
+```
 
 Benchmarks:
 

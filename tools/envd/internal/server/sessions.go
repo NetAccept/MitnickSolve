@@ -17,6 +17,8 @@ import (
 	"time"
 )
 
+const sessionPromptMarker = "__MSK_PROMPT__"
+
 // Session is a persistent shell inside an environment. Commands are wrapped
 // with a unique marker so the server can return exactly one command's output
 // without prompt detection.
@@ -53,6 +55,9 @@ func (s *Server) toolSessionCreate(raw json.RawMessage) toolResult {
 
 	cmd := exec.Command(shell, shellArgs...)
 	cmd.Dir = env.Workspace
+	if runtime.GOOS == "windows" {
+		cmd.Env = append(os.Environ(), "PROMPT="+sessionPromptMarker)
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return errResult(codeInternal, "INTERNAL", err.Error())
@@ -82,6 +87,16 @@ func (s *Server) toolSessionCreate(raw json.RawMessage) toolResult {
 	}
 	go sess.readLoop()
 	go func() { _ = cmd.Wait() }()
+
+	readyMarker := "__MSK_READY_" + randomToken() + "__"
+	if err := sess.sendReady(readyMarker); err != nil {
+		sess.close()
+		return errResult(codeInternal, "INTERNAL", err.Error())
+	}
+	if err := sess.waitReady(readyMarker, 5*time.Second); err != nil {
+		sess.close()
+		return errResult(codeInternal, "INTERNAL", err.Error())
+	}
 
 	s.mu.Lock()
 	s.sessions[sess.ID] = sess
@@ -148,7 +163,10 @@ func (s *Server) toolSessionExec(raw json.RawMessage) toolResult {
 					"session exited before marker; partial output: "+out.String())
 			}
 			if index := strings.Index(line, marker); index >= 0 {
-				appendLimited(&out, line[:index], args.MaxOutputBytes, &truncated)
+				prefix := cleanSessionLine(line[:index])
+				if prefix != "" {
+					appendLimited(&out, prefix+"\n", args.MaxOutputBytes, &truncated)
+				}
 				code := parseExitCode(line[index+len(marker):])
 				return okResult(fmt.Sprintf("exit code %d", code), map[string]any{
 					"stdout":      out.String(),
@@ -157,7 +175,10 @@ func (s *Server) toolSessionExec(raw json.RawMessage) toolResult {
 					"duration_ms": time.Since(started).Milliseconds(),
 				})
 			}
-			appendLimited(&out, line, args.MaxOutputBytes, &truncated)
+			cleaned := cleanSessionLine(line)
+			if cleaned != "" {
+				appendLimited(&out, cleaned+"\n", args.MaxOutputBytes, &truncated)
+			}
 		case <-deadline.C:
 			sess.closed = true
 			_ = sess.cmd.Process.Kill()
@@ -237,6 +258,42 @@ func (sess *Session) readLoop() {
 			return
 		}
 	}
+}
+
+func (sess *Session) sendReady(marker string) error {
+	var script string
+	if runtime.GOOS == "windows" {
+		script = "echo " + marker + "\r\n"
+	} else {
+		script = "printf '" + marker + "\\n'\n"
+	}
+	_, err := io.WriteString(sess.stdin, script)
+	return err
+}
+
+func (sess *Session) waitReady(marker string, timeout time.Duration) error {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		select {
+		case line, ok := <-sess.lines:
+			if !ok {
+				return fmt.Errorf("shell exited before ready")
+			}
+			if strings.Contains(line, marker) {
+				return nil
+			}
+		case <-deadline.C:
+			return fmt.Errorf("shell did not become ready within %s", timeout)
+		}
+	}
+}
+
+func cleanSessionLine(line string) string {
+	line = strings.TrimSuffix(line, "\n")
+	line = strings.TrimSuffix(line, "\r")
+	line = strings.TrimPrefix(line, sessionPromptMarker)
+	return strings.TrimRight(line, " \t")
 }
 
 func (sess *Session) close() {
