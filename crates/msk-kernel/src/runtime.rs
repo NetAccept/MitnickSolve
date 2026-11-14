@@ -18,13 +18,13 @@ use msk_data::ObjectStore;
 use msk_ipc::{Client, methods};
 use msk_kernel::policy;
 use msk_llm::{LlmDelta, LlmError, LlmProvider, LlmRequest, LlmResponse, Message, ToolSchema};
-use msk_mcp::EnvClient;
+use msk_mcp::EnvTransport;
 use msk_wasm::{ToolContext, ToolHost, ToolManifest, WasmtimeRuntime};
 use serde_json::{Value, json};
 
 /// M0 host bridge: the only native capability exposed to WASM tools.
 pub struct EnvHost {
-    pub client: Arc<Mutex<EnvClient>>,
+    pub client: Arc<Mutex<Box<dyn EnvTransport>>>,
     pub artifacts: Arc<dyn ObjectStore>,
     pub control: Option<Arc<ControlPlane>>,
     pub agent_depth: u32,

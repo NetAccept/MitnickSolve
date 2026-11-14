@@ -962,11 +962,12 @@ profile = "host"
 - 事件完整性与恢复：`msk-replay` 校验 schema/seq/重复 ID/父链接并输出转录；`msk --session --resume <events.jsonl>` 将截断后的历史转录固定为新会话上下文，并显式标记旧 env/session 已失效。`turn.start` 现在记录用户原文，使日志成为完整对话来源。
 - 组件签名（M2 前半）：`ComponentManifest` 带 Ed25519 签名，签名覆盖去掉签名字段的规范化 JSON；`TrustStore` 按发布者显式信任公钥；工件校验 SHA-256 并拒绝越界路径。
 - 组件加载（M2）：`libloading` 解析 `ms_component_entry`，在调用 init 之前校验 ABI 版本、header 大小、port kind、id/version 与签名清单一致，并保持库加载；工作区内的 cdylib 测试组件端到端覆盖该路径。host `init`/vtable、conformance 套件与进程外宿主仍属后续。
-- envd 服务模式（P5 前半）：`--service` 提供 MCP JSON-RPC over HTTP(S)，Bearer token 与 TLS 1.3；数据面为 TCP/TLS 上的 MSDP `HELLO/OPEN/DATA/RESIZE/CLOSE/EXIT`，直接引用控制面创建的 `session_id`。CREDIT 帧被接受但尚未用于限流；数据视图独占该会话输出。Rust 端目前仍默认 embedded stdio，服务客户端与断线重连待接。
+- envd 服务模式（P5 前半）：`--service` 提供 MCP JSON-RPC over HTTP(S)，Bearer token 与 TLS 1.3；数据面为 TCP/TLS 上的 MSDP `HELLO/OPEN/DATA/RESIZE/CLOSE/EXIT`，直接引用控制面创建的 `session_id`。CREDIT 帧被接受但尚未用于限流；数据视图独占该会话输出。
+- 远程 envd 客户端：`msk --envd-url/--envd-token` 通过 HTTP(S) 调 MCP，`EnvTransport` 抽象让 embedded 与 service 共用同一 WASM 宿主桥；已用服务模式完成 headless 会话和远程 `exec`。mskd 任务与终端仍使用 embedded；断线重连与服务模式终端待接。
 - 文件与网络工具：`read_file/write_file/list_dir/stat_file` 经 envd 的 `fs.workspace` 能力执行，写入默认审批；`http_request` 在宿主侧执行 HTTP(S)，受 `net.egress` 能力约束，仅允许 http/https、默认 30s 超时、4 MiB 响应上限并跟随重定向。SSRF/私网访问目前不做内建阻断，应由部署网络策略或沙箱负责。
 - 多 agent（M4 首个切片）：`spawn_agent` 通过控制面创建 headless 子任务，`agent_result` 轮询 `task.result` 并返回状态与转录；两者受 `agent.spawn` 能力约束，spawn 默认审批，子 agent 以委派策略 `allow` 运行，深度上限 2。`task.result` 从事件日志重建转录，`mskctl create --headless` / `result` 可直接使用。
-- 验收：同一会话连续两轮消息得到两次 `turn.end`，第二轮请求携带第一轮上下文；真实 mock provider 的 echo 工具调用跨轮保留；工具 trap 后该轮仍能收到下一次模型响应；审批通过后命令实际执行，拒绝后下一轮仍可用；父 agent 能 spawn 子 agent 并取回其转录。
-- 尚未进入本切片：Rust 服务客户端/断线重连、检查点级工具状态恢复、子 agent 结果合并/黑板与并发预算。
+- 验收：同一会话连续两轮消息得到两次 `turn.end`，第二轮请求携带第一轮上下文；真实 mock provider 的 echo 工具调用跨轮保留；工具 trap 后该轮仍能收到下一次模型响应；审批通过后命令实际执行，拒绝后下一轮仍可用；父 agent 能 spawn 子 agent 并取回其转录；`msk --envd-url` 可对远程 envd 执行会话与命令。
+- 尚未进入本切片：mskd 远程 envd 任务/终端与断线重连、检查点级工具状态恢复、子 agent 结果合并/黑板与并发预算。
 
 ---
 

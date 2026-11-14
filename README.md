@@ -9,6 +9,9 @@ results are in [`docs/performance.md`](docs/performance.md).
 M0 scaffold plus the P1 session/turn slice:
 
 - Rust workspace with the kernel/TUI skeleton and core types.
+- Remote envd client: `msk --envd-url http://host:7800 --envd-token ...`
+  speaks MCP over HTTP(S) instead of spawning envd; the same WASM tools and
+  host bridge run unchanged. Embedded stdio remains the default.
 - Embedded `envd` over stdio frames (Go; `go-pty` for cross-platform PTY) and
   service mode: MCP JSON-RPC over HTTP(S) plus an MSDP TCP/TLS data plane, both
   behind a bearer token.
@@ -129,8 +132,16 @@ curl -H "Authorization: Bearer $ENVD_TOKEN" \
 
 Add `--tls-cert` and `--tls-key` for TLS 1.3. The data plane accepts MSDP
 `HELLO`/`OPEN`/`DATA`/`RESIZE`/`CLOSE` frames for an existing `session_id`; see
-[`tools/envd/README.md`](tools/envd/README.md). The kernel still uses embedded
-stdio by default.
+[`tools/envd/README.md`](tools/envd/README.md). The kernel defaults to embedded
+stdio; point it at the service explicitly:
+
+```sh
+target/debug/msk --envd-url http://127.0.0.1:7800 --envd-token "$ENVD_TOKEN" \
+  --root .msk/remote --session
+```
+
+The same flags work with `--headless` and `--goal`. mskd task spawning still
+uses embedded envd; remote task orchestration is the next step.
 
 ## Run the M0 demo
 

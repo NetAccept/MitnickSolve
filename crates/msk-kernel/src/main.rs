@@ -20,7 +20,7 @@ use msk_llm::{
     EchoProvider, LlmDelta, LlmError, LlmProvider, LlmResponse, OpenAiConfig, OpenAiProvider,
     OpenAiResponsesProvider, ScriptedProvider,
 };
-use msk_mcp::EnvClient;
+use msk_mcp::{EnvClient, EnvTransport, ServiceClient};
 use msk_wasm::ToolHost;
 use runtime::{
     ControlPlane, EnvHost, build_observation, complete_or_stream, extract_data, llm_request,
@@ -50,9 +50,15 @@ enum Approvals {
 
 #[derive(Debug, Parser)]
 struct Cli {
-    /// Path to the envd binary built from tools/envd.
+    /// Path to the envd binary built from tools/envd (embedded mode).
     #[arg(long)]
-    envd: PathBuf,
+    envd: Option<PathBuf>,
+    /// Connect to a running envd --service instead of spawning the binary.
+    #[arg(long)]
+    envd_url: Option<String>,
+    /// Bearer token for --envd-url (defaults to ENVD_TOKEN).
+    #[arg(long)]
+    envd_token: Option<String>,
     /// Kernel state directory (events, envd data).
     #[arg(long, default_value = ".msk")]
     root: PathBuf,
@@ -370,6 +376,129 @@ fn spawn_stdin_reader(
     rx
 }
 
+struct Backend {
+    client: Box<dyn EnvTransport>,
+    env_id: String,
+}
+
+fn connect_backend(cli: &Cli, sink: &dyn EventSink, name: &str) -> Result<Backend> {
+    if !cli.tools_dir.exists() {
+        bail!("tool directory not found: {}", cli.tools_dir.display());
+    }
+    if !cli.wasm.exists() {
+        bail!("fallback WASM module not found: {}", cli.wasm.display());
+    }
+    if cli.envd_url.is_some() && cli.envd.is_some() {
+        bail!("use either --envd or --envd-url, not both");
+    }
+
+    if let Some(url) = &cli.envd_url {
+        let token = cli
+            .envd_token
+            .clone()
+            .or_else(|| std::env::var("ENVD_TOKEN").ok())
+            .context("--envd-token or ENVD_TOKEN is required with --envd-url")?;
+        let mut service = ServiceClient::new(url, token);
+        let init = service.initialize().context("envd service initialize")?;
+        emit(sink, "mcp.initialize", init)?;
+        let tools = service.request("tools/list", json!({}))?;
+        let tool_count = tools
+            .get("tools")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        human_line(cli, &format!("envd service: {url} ({tool_count} tools)"));
+        emit(sink, "mcp.tools", json!({"count": tool_count}))?;
+        let env = tool_data(
+            &mut service,
+            "env_create",
+            json!({"name": name, "kind": "managed", "profile": "dev"}),
+            sink,
+        )?;
+        let env_id = env
+            .get("env_id")
+            .and_then(Value::as_str)
+            .context("env_create did not return env_id")?
+            .to_string();
+        human_line(cli, &format!("env: {env_id}"));
+        emit(
+            sink,
+            "env.create",
+            json!({"env_id": env_id, "workspace": env.get("workspace")}),
+        )?;
+        return Ok(Backend {
+            client: Box::new(service),
+            env_id,
+        });
+    }
+
+    let envd = cli
+        .envd
+        .as_ref()
+        .context("either --envd or --envd-url is required")?;
+    let envd_bin = envd.canonicalize().unwrap_or_else(|_| envd.clone());
+    if !envd_bin.exists() {
+        bail!(
+            "envd binary not found: {} — build it with `cd tools/envd && go build -o ../../target/debug/envd ./cmd/envd`",
+            envd_bin.display()
+        );
+    }
+    let envd_root = cli.root.join("envd");
+    std::fs::create_dir_all(&envd_root)?;
+    let mut embedded = EnvClient::spawn(&envd_bin, &envd_root).context("spawn embedded envd")?;
+    let ack = embedded
+        .handshake("agent-local")
+        .context("envd handshake")?;
+    human_line(
+        cli,
+        &format!(
+            "envd: {} (protocol {}, max_frame {})",
+            ack.server, ack.protocol, ack.max_frame
+        ),
+    );
+    emit(
+        sink,
+        "envd.hello",
+        json!({"server": ack.server, "protocol": ack.protocol, "max_frame": ack.max_frame}),
+    )?;
+    let init = embedded.initialize().context("MCP initialize")?;
+    emit(sink, "mcp.initialize", init)?;
+    let tools = embedded.request("tools/list", json!({}))?;
+    let tool_count = tools
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    human_line(cli, &format!("envd tools: {tool_count}"));
+    emit(sink, "mcp.tools", json!({"count": tool_count}))?;
+    let env = tool_data(
+        &mut embedded,
+        "env_create",
+        json!({"name": name, "kind": "managed", "profile": "dev"}),
+        sink,
+    )?;
+    let env_id = env
+        .get("env_id")
+        .and_then(Value::as_str)
+        .context("env_create did not return env_id")?
+        .to_string();
+    human_line(
+        cli,
+        &format!(
+            "env: {env_id} at {}",
+            env.get("workspace").and_then(Value::as_str).unwrap_or("?")
+        ),
+    );
+    emit(
+        sink,
+        "env.create",
+        json!({"env_id": env_id, "workspace": env.get("workspace")}),
+    )?;
+    Ok(Backend {
+        client: Box::new(embedded),
+        env_id,
+    })
+}
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -399,69 +528,13 @@ fn main() -> Result<()> {
         return run_session(&cli, sink, &events_path);
     }
 
-    let envd_bin = cli.envd.canonicalize().unwrap_or_else(|_| cli.envd.clone());
-    if !envd_bin.exists() {
-        bail!(
-            "envd binary not found: {} — build it with `cd tools/envd && go build -o ../../target/debug/envd ./cmd/envd`",
-            envd_bin.display()
-        );
-    }
-    if !cli.tools_dir.exists() {
-        bail!("tool directory not found: {}", cli.tools_dir.display());
-    }
-    if !cli.wasm.exists() {
-        bail!("fallback WASM module not found: {}", cli.wasm.display());
-    }
-
-    let envd_root = cli.root.join("envd");
-    std::fs::create_dir_all(&envd_root)?;
-    let mut client = EnvClient::spawn(&envd_bin, &envd_root).context("spawn embedded envd")?;
-    let ack = client.handshake("agent-local").context("envd handshake")?;
-    println!(
-        "envd: {} (protocol {}, max_frame {})",
-        ack.server, ack.protocol, ack.max_frame
-    );
-    emit(
-        sink.as_ref(),
-        "envd.hello",
-        json!({"server": ack.server, "protocol": ack.protocol, "max_frame": ack.max_frame}),
-    )?;
-
-    let init = client.initialize().context("MCP initialize")?;
-    emit(sink.as_ref(), "mcp.initialize", init)?;
-    let tools = client.request("tools/list", json!({}))?;
-    let tool_count = tools
-        .get("tools")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
-    println!("envd tools: {tool_count}");
-    emit(sink.as_ref(), "mcp.tools", json!({"count": tool_count}))?;
-
-    let env = tool_data(
-        &mut client,
-        "env_create",
-        json!({"name": "demo", "kind": "managed", "profile": "dev"}),
-        sink.as_ref(),
-    )?;
-    let env_id = env
-        .get("env_id")
-        .and_then(Value::as_str)
-        .context("env_create did not return env_id")?
-        .to_string();
-    println!(
-        "env: {env_id} at {}",
-        env.get("workspace").and_then(Value::as_str).unwrap_or("?")
-    );
-    emit(
-        sink.as_ref(),
-        "env.create",
-        json!({"env_id": env_id, "workspace": env.get("workspace")}),
-    )?;
+    let backend = connect_backend(&cli, sink.as_ref(), "demo")?;
+    let env_id = backend.env_id.clone();
+    let mut client = backend.client;
 
     let content = b"hello from msk\n";
     let write = tool_data(
-        &mut client,
+        &mut *client,
         "write_file",
         json!({
             "env_id": env_id.clone(),
@@ -474,7 +547,7 @@ fn main() -> Result<()> {
     emit(sink.as_ref(), "file.write", write)?;
 
     let read = tool_data(
-        &mut client,
+        &mut *client,
         "read_file",
         json!({"env_id": env_id.clone(), "path": "hello.txt"}),
         sink.as_ref(),
@@ -491,7 +564,7 @@ fn main() -> Result<()> {
 
     let large_content: String = (0..500).map(|index| format!("line-{index}\n")).collect();
     let large_write = tool_data(
-        &mut client,
+        &mut *client,
         "write_file",
         json!({
             "env_id": env_id.clone(),
@@ -728,65 +801,9 @@ fn main() -> Result<()> {
 }
 
 fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Path) -> Result<()> {
-    let envd_bin = cli.envd.canonicalize().unwrap_or_else(|_| cli.envd.clone());
-    if !envd_bin.exists() {
-        bail!(
-            "envd binary not found: {} — build it with `cd tools/envd && go build -o ../../target/debug/envd ./cmd/envd`",
-            envd_bin.display()
-        );
-    }
-    if !cli.tools_dir.exists() {
-        bail!("tool directory not found: {}", cli.tools_dir.display());
-    }
-    if !cli.wasm.exists() {
-        bail!("fallback WASM module not found: {}", cli.wasm.display());
-    }
-
-    let envd_root = cli.root.join("envd");
-    std::fs::create_dir_all(&envd_root)?;
-    let mut client = EnvClient::spawn(&envd_bin, &envd_root).context("spawn embedded envd")?;
-    let ack = client.handshake("agent-local").context("envd handshake")?;
-    human_line(
-        cli,
-        &format!(
-            "envd: {} (protocol {}, max_frame {})",
-            ack.server, ack.protocol, ack.max_frame
-        ),
-    );
-    emit(
-        sink.as_ref(),
-        "envd.hello",
-        json!({"server": ack.server, "protocol": ack.protocol, "max_frame": ack.max_frame}),
-    )?;
-
-    let init = client.initialize().context("MCP initialize")?;
-    emit(sink.as_ref(), "mcp.initialize", init)?;
-    let tools = client.request("tools/list", json!({}))?;
-    let tool_count = tools
-        .get("tools")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
-    human_line(cli, &format!("envd tools: {tool_count}"));
-    emit(sink.as_ref(), "mcp.tools", json!({"count": tool_count}))?;
-
-    let env = tool_data(
-        &mut client,
-        "env_create",
-        json!({"name": "session", "kind": "managed", "profile": "dev"}),
-        sink.as_ref(),
-    )?;
-    let env_id = env
-        .get("env_id")
-        .and_then(Value::as_str)
-        .context("env_create did not return env_id")?
-        .to_string();
-    human_line(cli, &format!("env: {env_id}"));
-    emit(
-        sink.as_ref(),
-        "env.create",
-        json!({"env_id": env_id, "workspace": env.get("workspace")}),
-    )?;
+    let backend = connect_backend(cli, sink.as_ref(), "session")?;
+    let env_id = backend.env_id;
+    let client = backend.client;
 
     let object_store: Arc<dyn ObjectStore> =
         Arc::new(FileObjectStore::open(cli.root.join("artifacts")).context("open artifact store")?);
@@ -1177,7 +1194,7 @@ fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
 }
 
 fn tool_data(
-    client: &mut EnvClient,
+    client: &mut dyn EnvTransport,
     name: &str,
     args: Value,
     sink: &dyn EventSink,
