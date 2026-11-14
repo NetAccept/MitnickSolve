@@ -1,0 +1,9 @@
+{
+  "name": "exec",
+  "description": "Run one command through envd and return captured output.",
+  "input_schema": {
+    "type": "object",
+    "required": ["env_id", "argv"]
+  },
+  "capabilities": ["exec.session"]
+}

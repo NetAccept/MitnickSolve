@@ -1,0 +1,85 @@
+# MitnickSolve
+
+CTF agent with a lightweight Rust kernel, WASM-only tools, and a uniform execution
+backend (`envd`). Design documents live in [`docs/`](docs/). Performance notes and benchmark
+results are in [`docs/performance.md`](docs/performance.md).
+
+## Status
+
+M0 scaffold:
+
+- Rust workspace with the kernel/TUI skeleton and core types.
+- Embedded `envd` over stdio frames (Go, standard library only).
+- One end-to-end demo: kernel -> embedded envd -> `env_create` -> `write_file` ->
+  `read_file` -> `exec` -> JSONL events.
+- wasmtime-backed WASM tool runtime: fresh store per call, fuel limit, 64 MiB
+  memory cap, JSON-in-linear-memory ABI, and a capability-gated host bridge.
+- Manifest-driven policy: `msk-core::PolicyTable` intersects the manifest's
+  declared capabilities with kernel grants; a manifest can never self-grant.
+- Persistent shell sessions in envd (`session_create` / `session_exec` /
+  `session_close`): repeated commands reuse one shell instead of spawning a process.
+- Scripted LLM provider exercising LLM -> tool call -> WASM -> host bridge -> envd;
+  `exec.session` is granted by the kernel and checked in `EnvHost`.
+- Real streaming providers, session/PTY, and service-mode envd are next.
+
+The Go side is not compiled in this repository yet; see
+[`tools/envd/README.md`](tools/envd/README.md).
+
+## Build
+
+```sh
+cargo build --workspace
+cargo test --workspace
+```
+
+Build the embedded execution environment (requires Go 1.25+):
+
+```sh
+cd tools/envd
+go build -o ../../target/debug/envd ./cmd/envd
+```
+
+## Run the M0 demo
+
+```sh
+cargo run -p msk-kernel --bin msk -- --envd target/debug/envd --root .msk
+```
+
+On Windows the envd binary is `target/debug/envd.exe`. The demo uses
+`tools/wasm/exec.wat` with `tools/wasm/exec.json` by default; pass
+`--wasm tools/wasm/echo.wat --manifest tools/wasm/echo.json` to exercise the
+tool boundary without the envd host bridge.
+
+Benchmarks:
+
+```sh
+cargo build --release -p msk-kernel --bin msk-bench
+target/release/msk-bench wasm-echo --iterations 5000
+target/release/msk-bench envd-exec --envd target/debug/envd --iterations 10
+target/release/msk-bench session-exec --envd target/debug/envd --iterations 50
+```
+
+The demo writes events to `.msk/events.jsonl`. Inspect them with the TUI:
+
+```sh
+cargo run -p msk-tui -- --events .msk/events.jsonl
+```
+
+## Layout
+
+| Path | Purpose |
+| --- | --- |
+| `crates/msk-core` | Domain types and ports |
+| `crates/msk-abi` | C ABI definitions for kernel components |
+| `crates/msk-events` | Append-only event log |
+| `crates/msk-ipc` | Frontend JSON-RPC types |
+| `crates/msk-data` | Shared objects and views |
+| `crates/msk-llm` | LLM provider port and scripted provider |
+| `crates/msk-mcp` | MCP client and embedded stdio frame transport |
+| `crates/msk-wasm` | WASM tool runtime boundary (stub) |
+| `crates/msk-loader` | Signed core component manifest/loader boundary |
+| `crates/msk-kernel` | Kernel binary and M0 demo |
+| `crates/msk-tui` | Minimal event viewer |
+| `tools/envd` | Go execution environment |
+| `tools/wasm` | WAT modules and manifests |
+| `docs/` | Design and protocol drafts |

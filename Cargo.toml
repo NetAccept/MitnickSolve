@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/msk-core",
+    "crates/msk-abi",
+    "crates/msk-events",
+    "crates/msk-ipc",
+    "crates/msk-data",
+    "crates/msk-llm",
+    "crates/msk-mcp",
+    "crates/msk-wasm",
+    "crates/msk-loader",
+    "crates/msk-kernel",
+    "crates/msk-tui",
+    "crates/msk-testkit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.96"
+
+[workspace.dependencies]
+msk-core = { path = "crates/msk-core" }
+msk-events = { path = "crates/msk-events" }
+msk-llm = { path = "crates/msk-llm" }
+msk-mcp = { path = "crates/msk-mcp" }
+msk-wasm = { path = "crates/msk-wasm" }
+
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+lto = "thin"

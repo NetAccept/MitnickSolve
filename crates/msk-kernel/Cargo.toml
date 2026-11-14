@@ -1,0 +1,27 @@
+[package]
+name = "msk-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "msk"
+path = "src/main.rs"
+
+[[bin]]
+name = "msk-bench"
+path = "src/bin/msk-bench.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+msk-core.workspace = true
+msk-events.workspace = true
+msk-llm.workspace = true
+msk-mcp.workspace = true
+msk-wasm.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

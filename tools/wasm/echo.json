@@ -1,0 +1,8 @@
+{
+  "name": "echo",
+  "description": "Echo tool arguments back through the WASM boundary.",
+  "input_schema": {
+    "type": "object"
+  },
+  "capabilities": []
+}
