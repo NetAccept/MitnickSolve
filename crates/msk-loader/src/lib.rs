@@ -5,12 +5,17 @@
 //! execution follow in the rest of M2.
 
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use msk_abi::{
+    MS_ABI_VERSION, MS_COMPONENT_ENTRY, MS_PORT_EVENT_SINK, MS_PORT_LLM, MS_PORT_SECRET_STORE,
+    MS_PORT_STORE, MS_PORT_TRANSPORT, ms_component,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -81,6 +86,8 @@ pub enum LoadError {
     Key(String),
     #[error("artifact hash mismatch: expected {expected}, got {actual}")]
     ArtifactHash { expected: String, actual: String },
+    #[error("dynamic load: {0}")]
+    Load(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -95,6 +102,108 @@ pub fn validate_port(port: &str) -> Result<(), LoadError> {
         }
         other => Err(LoadError::UnknownPort(other.into())),
     }
+}
+
+fn port_constant(port: &str) -> Option<u32> {
+    match port {
+        "llm.provider" => Some(MS_PORT_LLM),
+        "transport.http" => Some(MS_PORT_TRANSPORT),
+        "store" => Some(MS_PORT_STORE),
+        "event.sink" => Some(MS_PORT_EVENT_SINK),
+        "secret.store" => Some(MS_PORT_SECRET_STORE),
+        _ => None,
+    }
+}
+
+/// A loaded shared library whose ABI header has been validated. `init` is not
+/// called yet; this is the load/conformance boundary, not the port host.
+pub struct LoadedComponent {
+    _library: libloading::Library,
+    component: *const ms_component,
+}
+
+impl LoadedComponent {
+    pub fn load(
+        path: &Path,
+        manifest: &ComponentManifest,
+        trust: &TrustStore,
+        base_dir: &Path,
+    ) -> Result<Self, LoadError> {
+        trust.verify(manifest)?;
+        if let Some(artifact) = &manifest.artifact {
+            let verified = artifact.verify(base_dir)?;
+            let requested = path.canonicalize()?;
+            if verified != requested {
+                return Err(LoadError::Manifest(
+                    "loaded path does not match the manifest artifact".into(),
+                ));
+            }
+        }
+
+        let library = unsafe { libloading::Library::new(path) }
+            .map_err(|err| LoadError::Load(err.to_string()))?;
+        let entry: libloading::Symbol<unsafe extern "C" fn() -> *const ms_component> =
+            unsafe { library.get(MS_COMPONENT_ENTRY) }
+                .map_err(|err| LoadError::Load(err.to_string()))?;
+        let component = unsafe { entry() };
+        if component.is_null() {
+            return Err(LoadError::Load("component entry returned null".into()));
+        }
+        validate_component_header(unsafe { &*component }, manifest)?;
+        Ok(Self {
+            _library: library,
+            component,
+        })
+    }
+
+    pub fn port_kind(&self) -> u32 {
+        unsafe { (*self.component).port_kind }
+    }
+}
+
+fn validate_component_header(
+    component: &ms_component,
+    manifest: &ComponentManifest,
+) -> Result<(), LoadError> {
+    let header = &component.header;
+    if header.abi_version != MS_ABI_VERSION {
+        return Err(LoadError::Abi(header.abi_version));
+    }
+    if header.struct_size < std::mem::size_of::<msk_abi::ms_abi_header>() as u32 {
+        return Err(LoadError::Manifest("component header is too small".into()));
+    }
+    if header.id.is_null() || header.version.is_null() {
+        return Err(LoadError::Manifest(
+            "component header id/version is null".into(),
+        ));
+    }
+    let id = unsafe { CStr::from_ptr(header.id.cast()) }
+        .to_str()
+        .map_err(|err| LoadError::Manifest(format!("component id: {err}")))?;
+    let version = unsafe { CStr::from_ptr(header.version.cast()) }
+        .to_str()
+        .map_err(|err| LoadError::Manifest(format!("component version: {err}")))?;
+    if id != manifest.component.id {
+        return Err(LoadError::Manifest(format!(
+            "component id mismatch: manifest {}, library {id}",
+            manifest.component.id
+        )));
+    }
+    if version != manifest.component.version {
+        return Err(LoadError::Manifest(format!(
+            "component version mismatch: manifest {}, library {version}",
+            manifest.component.version
+        )));
+    }
+    let expected = port_constant(&manifest.component.port)
+        .ok_or_else(|| LoadError::UnknownPort(manifest.component.port.clone()))?;
+    if component.port_kind != expected {
+        return Err(LoadError::Manifest(format!(
+            "port mismatch: manifest {} is {}, library reports {}",
+            manifest.component.port, expected, component.port_kind
+        )));
+    }
+    Ok(())
 }
 
 impl ComponentManifest {
@@ -332,5 +441,124 @@ mod tests {
             signed.canonical_bytes().unwrap()
         );
         assert!(signed.signature.is_some());
+    }
+
+    fn component_with_header(
+        id: &std::ffi::CStr,
+        version: &std::ffi::CStr,
+        port_kind: u32,
+    ) -> ms_component {
+        ms_component {
+            header: msk_abi::ms_abi_header {
+                abi_version: MS_ABI_VERSION,
+                struct_size: std::mem::size_of::<msk_abi::ms_abi_header>() as u32,
+                id: id.as_ptr().cast(),
+                version: version.as_ptr().cast(),
+            },
+            port_kind,
+            vtable: std::ptr::null(),
+            init: None,
+            shutdown: None,
+        }
+    }
+
+    #[test]
+    fn component_header_must_match_the_manifest() {
+        let id = std::ffi::CString::new("test.component").unwrap();
+        let version = std::ffi::CString::new("1.0.0").unwrap();
+        let component = component_with_header(&id, &version, MS_PORT_LLM);
+        let mut component_manifest = manifest("llm.provider");
+        component_manifest.component.id = "test.component".into();
+        component_manifest.component.version = "1.0.0".into();
+        assert!(validate_component_header(&component, &component_manifest).is_ok());
+
+        component_manifest.component.version = "2.0.0".into();
+        assert!(matches!(
+            validate_component_header(&component, &component_manifest),
+            Err(LoadError::Manifest(_))
+        ));
+
+        component_manifest.component.version = "1.0.0".into();
+        component_manifest.component.port = "store".into();
+        assert!(matches!(
+            validate_component_header(&component, &component_manifest),
+            Err(LoadError::Manifest(_))
+        ));
+    }
+
+    fn looks_like_component(name: &str) -> bool {
+        name.contains("msk_test_component")
+            && (name.ends_with(".dll") || name.ends_with(".so") || name.ends_with(".dylib"))
+    }
+
+    fn component_artifact() -> Option<PathBuf> {
+        let target = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .canonicalize()
+            .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"));
+        for profile in ["debug", "release"] {
+            for directory in [target.join(profile), target.join(profile).join("deps")] {
+                let Ok(entries) = std::fs::read_dir(directory) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    if looks_like_component(&entry.file_name().to_string_lossy()) {
+                        return Some(entry.path());
+                    }
+                }
+            }
+            // A cdylib used as a dependency is placed in OUT_DIR for linking.
+            let build_dir = target.join(profile).join("build");
+            let packages = match std::fs::read_dir(&build_dir) {
+                Ok(packages) => packages,
+                Err(err) => {
+                    eprintln!("build dir {build_dir:?}: {err}");
+                    continue;
+                }
+            };
+            for package in packages.flatten() {
+                let mut out_dirs = vec![package.path().join("out")];
+                if let Ok(children) = std::fs::read_dir(package.path()) {
+                    for child in children.flatten() {
+                        out_dirs.push(child.path().join("out"));
+                    }
+                }
+                for out_dir in out_dirs {
+                    let Ok(files) = std::fs::read_dir(out_dir) else {
+                        continue;
+                    };
+                    for file in files.flatten() {
+                        if looks_like_component(&file.file_name().to_string_lossy()) {
+                            return Some(file.path());
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("msk-test-component artifact not built under {target:?}; skipping load test");
+        None
+    }
+
+    #[test]
+    fn loads_and_validates_a_real_shared_library() {
+        let Some(path) = component_artifact() else {
+            eprintln!("msk-test-component artifact not built; skipping load test");
+            return;
+        };
+        let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let bytes = std::fs::read(&path).unwrap();
+        let mut component_manifest = manifest("llm.provider");
+        component_manifest.component.id = "test.component".into();
+        component_manifest.artifact = Some(Artifact {
+            file: file_name,
+            sha256: hex_digest(&Sha256::digest(&bytes)),
+        });
+        let component_manifest = sign(component_manifest);
+        let base_dir = path.parent().unwrap();
+
+        let loaded =
+            LoadedComponent::load(&path, &component_manifest, &trust_for(&key()), base_dir)
+                .unwrap();
+        assert_eq!(loaded.port_kind(), MS_PORT_LLM);
     }
 }

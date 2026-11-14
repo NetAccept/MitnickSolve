@@ -13,6 +13,7 @@ members = [
     "crates/msk-kernel",
     "crates/msk-tui",
     "crates/msk-testkit",
+    "crates/msk-test-component",
 ]
 
 [workspace.package]
@@ -22,6 +23,7 @@ license = "Apache-2.0"
 rust-version = "1.96"
 
 [workspace.dependencies]
+msk-abi = { path = "crates/msk-abi" }
 msk-core = { path = "crates/msk-core" }
 msk-data = { path = "crates/msk-data" }
 msk-events = { path = "crates/msk-events" }
@@ -35,6 +37,7 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 ed25519-dalek = "2"
+libloading = "0.8"
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
