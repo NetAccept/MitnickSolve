@@ -1,0 +1,9 @@
+{
+  "name": "spawn_agent",
+  "description": "Spawn a headless subagent with a goal. Returns task_id for agent_result.",
+  "input_schema": {
+    "type": "object",
+    "required": ["goal"]
+  },
+  "capabilities": ["agent.spawn"]
+}

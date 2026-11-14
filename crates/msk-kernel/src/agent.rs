@@ -470,6 +470,7 @@ fn approval_reason(tool: &str) -> String {
         "exec" | "session_exec" => "execute a command".to_string(),
         "session_write" => "write input to a terminal session".to_string(),
         "write_file" => "write a file in the environment workspace".to_string(),
+        "spawn_agent" => "spawn a subagent with delegated tool access".to_string(),
         _ => "tool requires approval".to_string(),
     }
 }

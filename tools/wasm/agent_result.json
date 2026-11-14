@@ -1,0 +1,9 @@
+{
+  "name": "agent_result",
+  "description": "Wait for a subagent and return its state and transcript.",
+  "input_schema": {
+    "type": "object",
+    "required": ["task_id"]
+  },
+  "capabilities": ["agent.spawn"]
+}

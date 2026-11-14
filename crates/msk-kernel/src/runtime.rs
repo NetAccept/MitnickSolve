@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -14,6 +15,7 @@ use base64::engine::general_purpose::STANDARD;
 use msk_core::context::{ContextLimits, ContextManager, summarize_output};
 use msk_core::{Capability, DataLabel, ObjectRef, PolicyDecision, PolicyTable};
 use msk_data::ObjectStore;
+use msk_ipc::{Client, methods};
 use msk_kernel::policy;
 use msk_llm::{LlmDelta, LlmError, LlmProvider, LlmRequest, LlmResponse, Message, ToolSchema};
 use msk_mcp::EnvClient;
@@ -24,6 +26,77 @@ use serde_json::{Value, json};
 pub struct EnvHost {
     pub client: Arc<Mutex<EnvClient>>,
     pub artifacts: Arc<dyn ObjectStore>,
+    pub control: Option<Arc<ControlPlane>>,
+    pub agent_depth: u32,
+    pub default_provider: String,
+}
+
+/// Daemon control plane used by spawn_agent/agent_result. The agent process
+/// connects with the same per-root token as mskctl.
+pub struct ControlPlane {
+    client: Mutex<Client>,
+}
+
+impl ControlPlane {
+    pub fn connect(root: &Path) -> std::io::Result<Self> {
+        let mut client = Client::connect(root)?;
+        client.hello()?;
+        Ok(Self {
+            client: Mutex::new(client),
+        })
+    }
+
+    pub fn spawn_agent(
+        &self,
+        goal: &str,
+        provider: &str,
+        max_steps: usize,
+        depth: u32,
+    ) -> std::result::Result<Value, String> {
+        if depth >= 2 {
+            return Err("subagent depth limit reached (max 2)".into());
+        }
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|_| "control client lock poisoned".to_string())?;
+        client
+            .request(
+                methods::TASK_CREATE,
+                json!({
+                    "goal": goal,
+                    "provider": provider,
+                    "interactive": false,
+                    "headless": true,
+                    "approvals": "allow",
+                    "agent_depth": depth + 1,
+                    "max_steps": max_steps
+                }),
+            )
+            .map_err(|err| err.to_string())
+    }
+
+    pub fn agent_result(&self, task_id: &str, wait_ms: u64) -> std::result::Result<Value, String> {
+        let deadline = Instant::now() + Duration::from_millis(wait_ms.min(300_000));
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|_| "control client lock poisoned".to_string())?;
+        loop {
+            let value = client
+                .request(methods::TASK_RESULT, json!({"task_id": task_id}))
+                .map_err(|err| err.to_string())?;
+            let state = value
+                .get("task")
+                .and_then(|task| task.get("state"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if matches!(state, "done" | "failed" | "cancelled") || Instant::now() >= deadline {
+                return Ok(value);
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -158,6 +231,44 @@ impl EnvHost {
 
 impl ToolHost for EnvHost {
     fn call(&self, ctx: &ToolContext, input: &[u8]) -> Result<Vec<u8>, String> {
+        if matches!(ctx.tool.as_str(), "spawn_agent" | "agent_result") {
+            if !ctx.allows(Capability::AgentSpawn) {
+                return Err("denied: agent.spawn not granted".to_string());
+            }
+            let control = self
+                .control
+                .as_ref()
+                .ok_or_else(|| "control plane is not configured".to_string())?;
+            let args: Value = serde_json::from_slice(input)
+                .map_err(|err| format!("invalid agent input: {err}"))?;
+            let value = if ctx.tool == "spawn_agent" {
+                let goal = args
+                    .get("goal")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "goal is required".to_string())?;
+                let provider = args
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&self.default_provider);
+                let max_steps = args
+                    .get("max_steps")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(8)
+                    .clamp(1, 50) as usize;
+                control.spawn_agent(goal, provider, max_steps, self.agent_depth)?
+            } else {
+                let task_id = args
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "task_id is required".to_string())?;
+                let wait_ms = args
+                    .get("wait_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(10_000);
+                control.agent_result(task_id, wait_ms)?
+            };
+            return serde_json::to_vec(&value).map_err(|err| err.to_string());
+        }
         if ctx.tool == "http_request" {
             if !ctx.allows(Capability::NetEgress) {
                 return Err("denied: net.egress not granted".to_string());

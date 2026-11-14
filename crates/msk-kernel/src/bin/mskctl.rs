@@ -40,6 +40,9 @@ enum Command {
         /// Ask the agent to stream text deltas.
         #[arg(long)]
         stream: bool,
+        /// Run one goal turn without stdin, then exit.
+        #[arg(long)]
+        headless: bool,
         /// Command policy: ask before executing, or allow directly.
         /// Defaults to ask for interactive tasks and allow otherwise.
         #[arg(long, value_parser = ["allow", "ask"])]
@@ -72,6 +75,8 @@ enum Command {
     },
     /// Print one task snapshot.
     State { task: String },
+    /// Print a task's state, event count, and transcript.
+    Result { task: String },
     /// Cancel a running task.
     Cancel { task: String },
     /// Subscribe to events and print notifications.
@@ -149,6 +154,7 @@ fn main() -> Result<()> {
             provider,
             interactive,
             stream,
+            headless,
             approvals,
         } => {
             let mut params = json!({
@@ -156,7 +162,8 @@ fn main() -> Result<()> {
                 "demo": demo,
                 "provider": provider,
                 "interactive": interactive,
-                "stream": stream
+                "stream": stream,
+                "headless": headless
             });
             if let Some(approvals) = approvals {
                 params["approvals"] = json!(approvals);
@@ -195,6 +202,10 @@ fn main() -> Result<()> {
         }
         Command::State { task } => {
             let result = client.request(methods::TASK_STATE, json!({"task_id": task}))?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::Result { task } => {
+            let result = client.request(methods::TASK_RESULT, json!({"task_id": task}))?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Cancel { task } => {

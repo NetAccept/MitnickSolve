@@ -419,6 +419,7 @@ pub mod methods {
     pub const TASK_CANCEL: &str = "task.cancel";
     pub const TASK_STATE: &str = "task.state";
     pub const TASK_LIST: &str = "task.list";
+    pub const TASK_RESULT: &str = "task.result";
     pub const APPROVAL_LIST: &str = "approval.list";
     pub const APPROVAL_RESPOND: &str = "approval.respond";
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";

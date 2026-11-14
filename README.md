@@ -88,6 +88,11 @@ M0 scaffold plus the P1 session/turn slice:
   validates the ABI header, port kind, id, and version against the signed
   manifest, and keeps the library loaded. A cdylib test component exercises the
   path end to end. Host `init`/vtable dispatch is the next M2 step.
+- Subagents: `spawn_agent` creates a headless child task and `agent_result`
+  waits for its state/transcript. Both require `agent.spawn`; spawning is
+  approval-gated by default, the child runs with delegated `approvals=allow`,
+  and depth is capped at 2. `mskctl create --headless --goal ...` and
+  `mskctl result task-...` expose the same path.
 - File and HTTP tools: `read_file`/`write_file`/`list_dir`/`stat_file` run
   through envd with `fs.workspace` (writes require approval); `http_request`
   performs host-side HTTP(S) under `net.egress` with a 30 s default timeout and
@@ -255,6 +260,8 @@ Interactive tasks stay alive between messages:
 
 ```sh
 target/debug/mskctl --root .msk create --interactive
+target/debug/mskctl --root .msk create --headless --goal "run one task and exit"
+target/debug/mskctl --root .msk result task-...
 target/debug/mskctl --root .msk send --task task-... --text "list the workspace"
 target/debug/mskctl --root .msk interrupt task-...
 target/debug/mskctl --root .msk approvals

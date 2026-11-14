@@ -36,6 +36,8 @@ pub fn default_policy() -> PolicyTable {
         ("list_dir", vec![Capability::FsWorkspace]),
         ("stat_file", vec![Capability::FsWorkspace]),
         ("http_request", vec![Capability::NetEgress]),
+        ("spawn_agent", vec![Capability::AgentSpawn]),
+        ("agent_result", vec![Capability::AgentSpawn]),
         ("echo", vec![]),
     ])
 }
@@ -54,7 +56,13 @@ pub fn context_with(
 pub fn policy_with_approvals(ask: bool) -> PolicyTable {
     let mut table = default_policy();
     if ask {
-        for tool in ["exec", "session_exec", "session_write", "write_file"] {
+        for tool in [
+            "exec",
+            "session_exec",
+            "session_write",
+            "write_file",
+            "spawn_agent",
+        ] {
             table.set_decision(tool, PolicyDecision::Ask);
         }
     }
@@ -114,6 +122,8 @@ mod tests {
         assert_eq!(policy.decision("artifact_read"), PolicyDecision::Allow);
         assert_eq!(policy.decision("write_file"), PolicyDecision::Ask);
         assert_eq!(policy.decision("read_file"), PolicyDecision::Allow);
+        assert_eq!(policy.decision("spawn_agent"), PolicyDecision::Ask);
+        assert_eq!(policy.decision("agent_result"), PolicyDecision::Allow);
         assert_eq!(
             policy_with_approvals(false).decision("exec"),
             PolicyDecision::Allow

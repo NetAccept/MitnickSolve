@@ -23,8 +23,8 @@ use msk_llm::{
 use msk_mcp::EnvClient;
 use msk_wasm::ToolHost;
 use runtime::{
-    EnvHost, build_observation, complete_or_stream, extract_data, llm_request, load_registry,
-    load_registry_with_policy, substitute,
+    ControlPlane, EnvHost, build_observation, complete_or_stream, extract_data, llm_request,
+    load_registry, load_registry_with_policy, substitute,
 };
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
@@ -69,6 +69,15 @@ struct Cli {
     /// Without this flag the binary runs the one-shot scripted demo.
     #[arg(long)]
     session: bool,
+    /// Run exactly one `--goal` turn without reading stdin, then exit.
+    #[arg(long)]
+    headless: bool,
+    /// Control-plane root used by spawn_agent/agent_result (set by mskd).
+    #[arg(long)]
+    control_root: Option<PathBuf>,
+    /// Subagent depth; 0 is a root agent.
+    #[arg(long, default_value_t = 0)]
+    agent_depth: u32,
     /// Session protocol on stdout: JSON lines only, human output on stderr.
     /// Implies --session.
     #[arg(long)]
@@ -380,13 +389,13 @@ fn main() -> Result<()> {
         "kernel.start",
         json!({
             "root": cli.root.display().to_string(),
-            "mode": if cli.session || cli.stdio_json { "session" } else { "demo" },
+            "mode": if cli.session || cli.stdio_json || cli.headless { "session" } else { "demo" },
             "task_id": cli.task_id,
             "demo": format!("{:?}", cli.demo)
         }),
     )?;
 
-    if cli.session || cli.stdio_json {
+    if cli.session || cli.stdio_json || cli.headless {
         return run_session(&cli, sink, &events_path);
     }
 
@@ -500,6 +509,9 @@ fn main() -> Result<()> {
     let env_host = Arc::new(EnvHost {
         client: client.clone(),
         artifacts: object_store.clone(),
+        control: None,
+        agent_depth: 0,
+        default_provider: "scripted".into(),
     });
     let host: Arc<dyn ToolHost> = env_host.clone();
 
@@ -779,9 +791,20 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
     let object_store: Arc<dyn ObjectStore> =
         Arc::new(FileObjectStore::open(cli.root.join("artifacts")).context("open artifact store")?);
     let client = Arc::new(Mutex::new(client));
+    let control = cli
+        .control_root
+        .as_ref()
+        .map(|root| {
+            ControlPlane::connect(root)
+                .with_context(|| format!("connect control plane {}", root.display()))
+        })
+        .transpose()?;
     let env_host = Arc::new(EnvHost {
         client,
         artifacts: object_store.clone(),
+        control: control.map(Arc::new),
+        agent_depth: cli.agent_depth,
+        default_provider: provider_kind_str(cli.provider).into(),
     });
     let host: Arc<dyn ToolHost> = env_host.clone();
     let tool_names = [
@@ -798,6 +821,8 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         "list_dir",
         "stat_file",
         "http_request",
+        "spawn_agent",
+        "agent_result",
         "echo",
     ];
     let registry_policy = policy::policy_with_approvals(cli.approvals == Approvals::Ask);
@@ -870,6 +895,50 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         cancel: agent::CancelToken::new(),
         approvals,
     });
+
+    if cli.headless {
+        let stdio = cli.stdio_json;
+        let stream = cli.stream;
+        let mut printed = false;
+        let outcome = {
+            let mut on_text = |chunk: &str| {
+                printed = true;
+                if stdio {
+                    emit_protocol(json!({"type": "agent.text", "text": chunk, "delta": stream}));
+                } else {
+                    print!("{chunk}");
+                    let _ = io::stdout().flush();
+                }
+            };
+            session.run_turn(&cli.goal, &mut on_text)
+        };
+        if !stdio && printed {
+            println!();
+        }
+        let mut end = json!({
+            "type": "turn.end",
+            "status": outcome.status(),
+            "turns": session.turns()
+        });
+        if let Some(message) = outcome.message() {
+            end["message"] = json!(message);
+        }
+        if stdio {
+            emit_protocol(end);
+        } else if let Some(message) = outcome.message() {
+            eprintln!("{}: {message}", outcome.status());
+        }
+        env_host.shutdown();
+        emit(
+            sink.as_ref(),
+            "session.end",
+            json!({
+                "turns": session.turns(),
+                "messages": session.context().messages().len()
+            }),
+        )?;
+        return Ok(());
+    }
 
     let inputs = spawn_stdin_reader(session.cancel_token(), cli.stdio_json, gate);
     loop {
@@ -951,6 +1020,14 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
     )?;
     human_line(cli, &format!("events: {}", events_path.display()));
     Ok(())
+}
+
+fn provider_kind_str(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::Scripted => "scripted",
+        ProviderKind::Openai => "openai",
+        ProviderKind::OpenaiResponses => "openai-responses",
+    }
 }
 
 fn session_provider(cli: &Cli) -> Result<Box<dyn LlmProvider>> {

@@ -65,6 +65,9 @@ struct Task {
     interactive: bool,
     stream: bool,
     approvals: String,
+    headless: bool,
+    agent_depth: u32,
+    max_steps: usize,
     state: TaskState,
     dir: PathBuf,
     child: Arc<Mutex<Option<Child>>>,
@@ -85,6 +88,9 @@ impl Task {
             "interactive": self.interactive,
             "stream": self.stream,
             "approvals": self.approvals,
+            "headless": self.headless,
+            "agent_depth": self.agent_depth,
+            "max_steps": self.max_steps,
             "state": self.state.as_str(),
             "dir": self.dir.display().to_string(),
             "events": self.events,
@@ -352,7 +358,31 @@ impl Daemon {
                             "allow".to_string()
                         }
                     });
-                match self.create_task(goal, demo, provider, interactive, stream, approvals) {
+                let headless = params
+                    .get("headless")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let agent_depth = params
+                    .get("agent_depth")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .min(8) as u32;
+                let max_steps = params
+                    .get("max_steps")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(12)
+                    .clamp(1, 50) as usize;
+                match self.create_task(
+                    goal,
+                    demo,
+                    provider,
+                    interactive,
+                    stream,
+                    approvals,
+                    headless,
+                    agent_depth,
+                    max_steps,
+                ) {
                     Ok(snapshot) => (RpcResponse::ok(id, snapshot), None),
                     Err(err) => (RpcResponse::err(id, -32000, err.to_string()), None),
                 }
@@ -398,6 +428,16 @@ impl Daemon {
                 match snapshot {
                     Some(snapshot) => (RpcResponse::ok(id, snapshot), None),
                     None => (RpcResponse::err(id, -32002, "task not found"), None),
+                }
+            }
+            methods::TASK_RESULT => {
+                let task_id = params
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                match self.task_result(task_id) {
+                    Ok(value) => (RpcResponse::ok(id, value), None),
+                    Err(err) => (RpcResponse::err(id, -32002, err.to_string()), None),
                 }
             }
             methods::TASK_CANCEL => {
@@ -481,6 +521,9 @@ impl Daemon {
         interactive: bool,
         stream: bool,
         approvals: String,
+        headless: bool,
+        agent_depth: u32,
+        max_steps: usize,
     ) -> Result<Value> {
         if !matches!(approvals.as_str(), "allow" | "ask") {
             bail!("approvals must be allow or ask");
@@ -502,6 +545,9 @@ impl Daemon {
             interactive,
             stream,
             approvals,
+            headless,
+            agent_depth,
+            max_steps,
             state: TaskState::Running,
             dir,
             child: child.clone(),
@@ -524,7 +570,20 @@ impl Daemon {
     }
 
     fn run_task(self: Arc<Self>, task_id: String) {
-        let (dir, goal, demo, provider, interactive, stream, approvals, child_handle, input_handle) = {
+        let (
+            dir,
+            goal,
+            demo,
+            provider,
+            interactive,
+            stream,
+            approvals,
+            headless,
+            agent_depth,
+            max_steps,
+            child_handle,
+            input_handle,
+        ) = {
             let inner = match self.inner.lock() {
                 Ok(inner) => inner,
                 Err(_) => return,
@@ -538,6 +597,9 @@ impl Daemon {
                     task.interactive,
                     task.stream,
                     task.approvals.clone(),
+                    task.headless,
+                    task.agent_depth,
+                    task.max_steps,
                     task.child.clone(),
                     task.input.clone(),
                 ),
@@ -570,18 +632,30 @@ impl Daemon {
             .arg("--provider")
             .arg(&provider)
             .arg("--approvals")
-            .arg(&approvals);
+            .arg(&approvals)
+            .arg("--control-root")
+            .arg(&self.root)
+            .arg("--task-id")
+            .arg(&task_id)
+            .arg("--agent-depth")
+            .arg(agent_depth.to_string())
+            .arg("--max-steps")
+            .arg(max_steps.to_string());
         if interactive {
             command
                 .arg("--session")
                 .arg("--stdio-json")
-                .arg("--task-id")
-                .arg(&task_id)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped());
             if stream {
                 command.arg("--stream");
             }
+        } else if headless {
+            command
+                .arg("--headless")
+                .arg("--goal")
+                .arg(&goal)
+                .stdout(Stdio::null());
         } else {
             command
                 .arg("--demo")
@@ -882,6 +956,27 @@ impl Daemon {
         .unwrap_or(Value::Null);
         self.broadcast(notification, task_id);
         Ok(snapshot)
+    }
+
+    fn task_result(&self, task_id: &str) -> Result<Value> {
+        let (snapshot, dir) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("task map poisoned"))?;
+            let task = inner
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            (task.snapshot(), task.dir.clone())
+        };
+        let events = msk_events::read_events(dir.join("events.jsonl")).unwrap_or_default();
+        let transcript = msk_kernel::replay::summarize(&events, Some(task_id), 8_000);
+        Ok(json!({
+            "task": snapshot,
+            "events": events.len(),
+            "transcript": transcript
+        }))
     }
 
     fn record_turn_end(

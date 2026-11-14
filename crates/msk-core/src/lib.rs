@@ -105,6 +105,8 @@ pub enum Capability {
     ArtifactRead,
     #[serde(rename = "mcp.connect")]
     McpConnect,
+    #[serde(rename = "agent.spawn")]
+    AgentSpawn,
 }
 
 impl Capability {
@@ -118,6 +120,7 @@ impl Capability {
             Self::DataExport => "data.export",
             Self::ArtifactRead => "artifact.read",
             Self::McpConnect => "mcp.connect",
+            Self::AgentSpawn => "agent.spawn",
         }
     }
 
@@ -131,6 +134,7 @@ impl Capability {
             "data.export" => Some(Self::DataExport),
             "artifact.read" => Some(Self::ArtifactRead),
             "mcp.connect" => Some(Self::McpConnect),
+            "agent.spawn" => Some(Self::AgentSpawn),
             _ => None,
         }
     }

@@ -134,8 +134,91 @@ class Handler(BaseHTTPRequestHandler):
                 return True
         return False
 
+    def wants_spawn(self, request):
+        for message in request.get("messages", []):
+            if message.get("role") == "user" and "spawn" in (message.get("content") or ""):
+                return True
+        return False
+
+    def spawn_context(self, request):
+        task_id = None
+        has_result = False
+        for message in request.get("messages", []):
+            if message.get("role") != "tool":
+                continue
+            try:
+                value = json.loads(message.get("content") or "{}")
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and "task_id" in value:
+                task_id = value["task_id"]
+            if isinstance(value, dict) and "transcript" in value:
+                has_result = True
+        return task_id, has_result
+
     def chat_payload(self, request):
         wants_file = self.wants_file(request)
+        wants_spawn = self.wants_spawn(request)
+        if wants_spawn and Handler.calls > 1:
+            task_id, has_result = self.spawn_context(request)
+            if task_id and not has_result:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_agent_result",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "agent_result",
+                                            "arguments": json.dumps(
+                                                {
+                                                    "task_id": task_id,
+                                                    "wait_ms": 10000,
+                                                }
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                    "usage": {"total_tokens": 7},
+                }
+            return {
+                "choices": [
+                    {"message": {"content": "spawn complete", "tool_calls": []}}
+                ],
+                "usage": {"total_tokens": 5},
+            }
+        if Handler.calls == 1 and wants_spawn:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_spawn",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "spawn_agent",
+                                        "arguments": json.dumps(
+                                            {
+                                                "goal": "say hello child",
+                                                "max_steps": 4,
+                                            }
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ],
+                "usage": {"total_tokens": 7},
+            }
         if Handler.calls == 1:
             if self.wants_http(request):
                 return {
