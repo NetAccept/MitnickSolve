@@ -21,6 +21,10 @@ path = "src/bin/mskd.rs"
 name = "mskctl"
 path = "src/bin/mskctl.rs"
 
+[[bin]]
+name = "msk-replay"
+path = "src/bin/msk-replay.rs"
+
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true

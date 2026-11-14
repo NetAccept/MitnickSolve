@@ -75,6 +75,10 @@ M0 scaffold plus the P1 session/turn slice:
 - Conversational daemon TUI: task list, transcript, message editor, streamed
   assistant text, cooperative interrupt, and a live event pane. `n` creates an
   interactive task; `Enter`/`i` writes, `s` interrupts, `t` opens the PTY.
+- Event integrity and replay: `msk-replay` validates `schema_version`, seq
+  order, duplicate IDs, and parent links, then prints a transcript or filtered
+  JSONL. `msk --session --resume <events.jsonl>` pins a capped transcript into
+  the new session so work can continue after an envd/session restart.
 - Scripted LLM provider exercising LLM -> tool call -> WASM -> host bridge -> envd;
   `exec.session` is granted by the kernel and checked in `EnvHost`.
 - Service-mode envd, persistence/replay, and multi-agent are next.
@@ -124,7 +128,12 @@ provider echoes the current user turn, so this path is usable without a model:
 
 ```sh
 target/debug/msk --envd target/debug/envd --root .msk/session --session
+target/debug/msk --envd target/debug/envd --root .msk/session --session \
+  --resume .msk/tasks/task-.../events.jsonl
 ```
+
+The resumed transcript is pinned as context; old envd environment and session
+IDs are explicitly marked stale, so the model should create a new session.
 
 Use `--provider openai` (or `openai-responses`) with the usual model environment
 variables for a real conversation. `--goal` is only used by the one-shot demo;
@@ -179,6 +188,14 @@ cargo build --release -p msk-kernel --bin msk-bench
 target/release/msk-bench wasm-echo --iterations 5000
 target/release/msk-bench envd-exec --envd target/debug/envd --iterations 10
 target/release/msk-bench session-exec --envd target/debug/envd --iterations 50
+```
+
+Inspect and validate an event log without executing anything:
+
+```sh
+target/debug/msk-replay --events .msk/events.jsonl --check
+target/debug/msk-replay --events .msk/events.jsonl --task task-... --max-chars 4000
+target/debug/msk-replay --events .msk/events.jsonl --from-seq 100 --format jsonl
 ```
 
 The demo writes events to `.msk/events.jsonl`. Inspect them with the TUI:

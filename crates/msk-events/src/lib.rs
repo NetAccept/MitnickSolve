@@ -1,6 +1,8 @@
 //! Append-only event log. Every model call, tool call, policy decision, and
 //! envd interaction is recorded here so runs can be replayed and audited.
 
+use std::collections::HashSet;
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -131,6 +133,103 @@ pub fn read_events(path: impl AsRef<Path>) -> Result<Vec<Event>, EventError> {
     Ok(events)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone)]
+pub struct EventIssue {
+    pub index: usize,
+    pub id: String,
+    pub severity: IssueSeverity,
+    pub message: String,
+}
+
+impl fmt::Display for EventIssue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let level = match self.severity {
+            IssueSeverity::Error => "error",
+            IssueSeverity::Warning => "warning",
+        };
+        write!(
+            formatter,
+            "{} at event {} ({}): {}",
+            level, self.index, self.id, self.message
+        )
+    }
+}
+
+/// Checks envelope integrity without executing any tool. Errors mean the log
+/// cannot be trusted for replay; warnings point at older or incomplete logs.
+pub fn check_events(events: &[Event]) -> Vec<EventIssue> {
+    let mut issues = Vec::new();
+    let mut seen = HashSet::new();
+    let mut last_seq = 0u64;
+
+    for (index, event) in events.iter().enumerate() {
+        if event.schema_version != SCHEMA_VERSION {
+            issues.push(EventIssue {
+                index,
+                id: event.id.clone(),
+                severity: IssueSeverity::Error,
+                message: format!(
+                    "unsupported schema_version {} (expected {})",
+                    event.schema_version, SCHEMA_VERSION
+                ),
+            });
+        }
+        if !seen.insert(event.id.clone()) {
+            issues.push(EventIssue {
+                index,
+                id: event.id.clone(),
+                severity: IssueSeverity::Error,
+                message: "duplicate event id".into(),
+            });
+        }
+        if event.seq == 0 {
+            issues.push(EventIssue {
+                index,
+                id: event.id.clone(),
+                severity: IssueSeverity::Warning,
+                message: "event has no seq (legacy or non-JSONL sink)".into(),
+            });
+        } else {
+            if event.seq <= last_seq {
+                issues.push(EventIssue {
+                    index,
+                    id: event.id.clone(),
+                    severity: IssueSeverity::Error,
+                    message: format!(
+                        "seq {} is not greater than previous {}",
+                        event.seq, last_seq
+                    ),
+                });
+            } else if last_seq > 0 && event.seq != last_seq + 1 {
+                issues.push(EventIssue {
+                    index,
+                    id: event.id.clone(),
+                    severity: IssueSeverity::Warning,
+                    message: format!("seq gap: {} -> {}", last_seq, event.seq),
+                });
+            }
+            last_seq = event.seq.max(last_seq);
+        }
+        for parent in &event.parents {
+            if !seen.contains(parent) {
+                issues.push(EventIssue {
+                    index,
+                    id: event.id.clone(),
+                    severity: IssueSeverity::Warning,
+                    message: format!("parent {parent} is not in this log"),
+                });
+            }
+        }
+    }
+    issues
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +266,45 @@ mod tests {
         let event: Event = serde_json::from_str(line).unwrap();
         assert_eq!(event.schema_version, SCHEMA_VERSION);
         assert_eq!(event.seq, 0);
+    }
+
+    #[test]
+    fn check_reports_gaps_duplicates_and_bad_schema() {
+        let mut first = Event::new("a", "test", serde_json::json!({}));
+        first.seq = 1;
+        let mut second = Event::new("b", "test", serde_json::json!({}));
+        second.seq = 3;
+        let mut third = Event::new("c", "test", serde_json::json!({}));
+        third.seq = 2;
+        third.schema_version = 99;
+        let duplicate = first.clone();
+
+        let issues = check_events(&[first, second, third, duplicate]);
+        assert!(issues.iter().any(|issue| issue.message.contains("seq gap")));
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.message.contains("not greater"))
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.message.contains("schema_version"))
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.message.contains("duplicate"))
+        );
+    }
+
+    #[test]
+    fn check_accepts_a_clean_log() {
+        let mut first = Event::new("a", "test", serde_json::json!({}));
+        first.seq = 1;
+        let mut second = Event::new("b", "test", serde_json::json!({}));
+        second.seq = 2;
+        second.parents.push(first.id.clone());
+        assert!(check_events(&[first, second]).is_empty());
     }
 }

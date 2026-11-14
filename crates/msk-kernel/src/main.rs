@@ -76,6 +76,9 @@ struct Cli {
     /// Task ID attached to events written by this process (set by mskd).
     #[arg(long)]
     task_id: Option<String>,
+    /// Replay this event log into the new session's pinned context.
+    #[arg(long)]
+    resume: Option<PathBuf>,
     /// Approximate token budget for the agent context.
     #[arg(long, default_value_t = 100_000)]
     max_context_tokens: usize,
@@ -817,6 +820,29 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
          as an artifact; use artifact_read to inspect it. Keep responses concise.",
     );
     context.push_pinned(Role::System, format!("env_id={env_id}"));
+    if let Some(path) = &cli.resume {
+        let events =
+            msk_events::read_events(path).with_context(|| format!("read {}", path.display()))?;
+        let text = msk_kernel::replay::summarize(&events, cli.task_id.as_deref(), 12_000);
+        if !text.is_empty() {
+            context.push_pinned(
+                Role::System,
+                format!(
+                    "Previous session transcript. Environment and session IDs from it are stale; \
+                     create a new session before running commands.\n\n{text}"
+                ),
+            );
+            emit(
+                sink.as_ref(),
+                "session.resume",
+                json!({
+                    "path": path.display().to_string(),
+                    "events": events.len(),
+                    "chars": text.chars().count()
+                }),
+            )?;
+        }
+    }
 
     let provider = session_provider(cli)?;
     let gate = ApprovalGate::new(cli.stdio_json, Duration::from_secs(300));

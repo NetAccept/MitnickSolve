@@ -163,7 +163,7 @@ impl Session {
     /// this turn, so the caller can keep the session alive.
     pub fn run_turn<F: FnMut(&str)>(&mut self, user: &str, mut on_text: F) -> TurnOutcome {
         self.turns += 1;
-        self.emit("turn.start", json!({"turn": self.turns}));
+        self.emit("turn.start", json!({"turn": self.turns, "user": user}));
         self.context.push(Role::User, user.to_string());
         self.compact();
 
