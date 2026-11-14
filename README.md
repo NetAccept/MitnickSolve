@@ -12,7 +12,9 @@ M0 scaffold plus the P1 session/turn slice:
 - Remote envd client: `msk --envd-url http://host:7800 --envd-token ...`
   (and the same flags on `mskd`) speaks MCP over HTTP(S) instead of spawning
   envd; tasks, subagents, and the daemon terminal share the remote service.
-  Embedded stdio remains the default.
+  `mskd --envd-data-addr host:7801` uses the binary MSDP data plane for
+  terminals, with CREDIT and replay-cursor reconnects. Embedded stdio remains
+  the default.
 - Embedded `envd` over stdio frames (Go; `go-pty` for cross-platform PTY) and
   service mode: MCP JSON-RPC over HTTP(S) plus an MSDP TCP/TLS data plane, both
   behind a bearer token. The data plane uses absolute byte offsets, a bounded
@@ -156,8 +158,13 @@ a service; tasks and the daemon-managed PTY then use it as well:
 
 ```sh
 target/debug/mskd --root .msk --envd-url http://127.0.0.1:7800 \
-  --envd-token "$ENVD_TOKEN" --tools-dir tools/wasm
+  --envd-token "$ENVD_TOKEN" --envd-data-addr 127.0.0.1:7801 \
+  --tools-dir tools/wasm
 ```
+
+With `--envd-data-addr`, the daemon terminal uses the binary MSDP data plane
+(`DATA`/`CREDIT`/`RESIZE`); without it, terminal I/O falls back to control-plane
+`session_read`/`session_write`.
 
 ## Run the M0 demo
 

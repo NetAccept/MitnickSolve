@@ -75,7 +75,8 @@ and kept in a bounded replay log (`session_create.output_buffer_bytes`, default
 outside the retained window. A data connection owns the session's output while
 attached; after detach, new output also feeds control-plane `session_read`, and
 the replay log remains available for a reconnect. Input credit, `SEEK`, and
-WebSocket transport are not implemented yet.
+WebSocket transport are not implemented yet. The Rust `EnvDataClient` and mskd
+`--envd-data-addr` use this path for remote terminals.
 
 ## Notes
 

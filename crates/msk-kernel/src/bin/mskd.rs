@@ -16,7 +16,7 @@ use msk_events::Event;
 use msk_ipc::data::{DATA_MAX_FRAME, DataFrame, DataKind, write_frame};
 use msk_ipc::local::{self, Stream};
 use msk_ipc::{RpcNotification, RpcRequest, RpcResponse, TryClone, methods};
-use msk_mcp::{EnvClient, EnvTransport, ServiceClient};
+use msk_mcp::{EnvClient, EnvDataClient, EnvTransport, ServiceClient};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -34,6 +34,9 @@ struct Cli {
     /// Bearer token for --envd-url (defaults to ENVD_TOKEN).
     #[arg(long)]
     envd_token: Option<String>,
+    /// envd service data address; enables the binary terminal path.
+    #[arg(long)]
+    envd_data_addr: Option<String>,
     /// Signed llm.provider manifest forwarded to component-provider tasks.
     #[arg(long)]
     component_manifest: Option<PathBuf>,
@@ -124,6 +127,7 @@ struct Subscriber {
 
 struct TerminalSession {
     client: Box<dyn EnvTransport>,
+    data: Option<EnvDataClient>,
     session_id: String,
     cols: u16,
     rows: u16,
@@ -161,6 +165,7 @@ struct Daemon {
     envd: Option<PathBuf>,
     envd_url: Option<String>,
     envd_token: Option<String>,
+    envd_data_addr: Option<String>,
     component_manifest: Option<PathBuf>,
     component_trust: Option<PathBuf>,
     component_host: Option<PathBuf>,
@@ -198,6 +203,7 @@ fn main() -> Result<()> {
         .envd_token
         .clone()
         .or_else(|| std::env::var("ENVD_TOKEN").ok());
+    let envd_data_addr = cli.envd_data_addr.clone();
     if envd_url.is_some() && envd_token.is_none() {
         bail!("--envd-token or ENVD_TOKEN is required with --envd-url");
     }
@@ -244,6 +250,7 @@ fn main() -> Result<()> {
         envd,
         envd_url,
         envd_token,
+        envd_data_addr,
         component_manifest,
         component_trust,
         component_host,
@@ -1423,8 +1430,28 @@ impl Daemon {
             .context("terminal session_id")?
             .to_string();
 
+        let data = if let (Some(address), Some(_)) = (&self.envd_data_addr, &self.envd_url) {
+            match EnvDataClient::connect(
+                address,
+                self.envd_token.as_deref().unwrap_or_default(),
+                &session_id,
+                cols,
+                rows,
+                None,
+            ) {
+                Ok(data) => Some(data),
+                Err(err) => {
+                    let _ = client.call_tool("session_close", json!({"session_id": session_id}));
+                    return Err(err).context("connect envd data plane");
+                }
+            }
+        } else {
+            None
+        };
+
         *guard = Some(TerminalSession {
             client,
+            data,
             session_id: session_id.clone(),
             cols,
             rows,
@@ -1448,6 +1475,11 @@ impl Daemon {
         let terminal = guard.as_mut().context("terminal is not open")?;
         if terminal.session_id != session_id {
             bail!("terminal session mismatch");
+        }
+        if let Some(data_client) = &terminal.data {
+            let bytes = STANDARD.decode(data)?;
+            data_client.send_data(&bytes)?;
+            return Ok(json!({"bytes": bytes.len()}));
         }
         let result = terminal.client.call_tool(
             "session_write",
@@ -1477,6 +1509,15 @@ impl Daemon {
         if terminal.session_id != session_id {
             bail!("terminal session mismatch");
         }
+        if let Some(data_client) = &mut terminal.data {
+            let bytes = data_client.read(max_bytes as usize, Duration::from_millis(timeout_ms))?;
+            return Ok(json!({
+                "data_base64": STANDARD.encode(&bytes),
+                "bytes": bytes.len(),
+                "closed": data_client.is_closed(),
+                "error": data_client.last_error()
+            }));
+        }
         let result = terminal.client.call_tool(
             "session_read",
             json!({
@@ -1504,6 +1545,12 @@ impl Daemon {
         if terminal.session_id != session_id {
             bail!("terminal session mismatch");
         }
+        if let Some(data_client) = &terminal.data {
+            data_client.resize(cols, rows)?;
+            terminal.cols = cols;
+            terminal.rows = rows;
+            return Ok(json!({"cols": cols, "rows": rows}));
+        }
         let result = terminal.client.call_tool(
             "session_resize",
             json!({"session_id": session_id, "cols": cols, "rows": rows}),
@@ -1527,6 +1574,9 @@ impl Daemon {
             let terminal = guard.as_mut().context("terminal is not open")?;
             if terminal.session_id != session_id {
                 bail!("terminal session mismatch");
+            }
+            if let Some(data_client) = &terminal.data {
+                let _ = data_client.close();
             }
             let result = terminal
                 .client
@@ -1738,7 +1788,12 @@ fn pump_terminal(
                         *credit = credit.saturating_sub(bytes.len() as u64);
                     }
                 }
-                if value.get("eof").and_then(Value::as_bool).unwrap_or(false) {
+                if value.get("eof").and_then(Value::as_bool).unwrap_or(false)
+                    || value
+                        .get("closed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                {
                     let frame = DataFrame::new(DataKind::Exit, 1, Vec::new());
                     if let Ok(mut writer) = writer.lock() {
                         let _ = write_frame(&mut *writer, &frame);
