@@ -35,6 +35,8 @@ M0 scaffold:
   offline default.
 - Chat Completions SSE streaming: `--stream` prints text deltas as they arrive;
   Responses currently falls back to the provider's non-streaming `complete`.
+- TUI event workbench: incremental JSONL tail, kind filters, search, detail pane,
+  context/artifact/tool counters, and live follow mode.
 - Scripted LLM provider exercising LLM -> tool call -> WASM -> host bridge -> envd;
   `exec.session` is granted by the kernel and checked in `EnvHost`.
 - Real streaming providers, session/PTY, and service-mode envd are next.
@@ -112,6 +114,11 @@ The demo writes events to `.msk/events.jsonl`. Inspect them with the TUI:
 ```sh
 cargo run -p msk-tui -- --events .msk/events.jsonl
 ```
+
+TUI keys: `q` quit, `j`/`k` move, `g`/`G` top/bottom, `tab` cycle filters,
+`1..5` all/llm/tools/artifacts/context, `/` search, `f` follow, `r` reload,
+`?` help. The viewer reads the JSONL log incrementally and shows the selected
+event's full payload, including `data.put` artifact metadata.
 
 ## Layout
 
