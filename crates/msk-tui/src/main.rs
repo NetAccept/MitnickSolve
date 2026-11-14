@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Stdout, stdout};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -11,11 +11,13 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use msk_events::{Event, read_events};
+use msk_ipc::{Client, methods};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use serde_json::{Value, json};
 
 const MAX_EVENTS: usize = 5000;
 const MAX_DETAIL_LINES: usize = 400;
@@ -25,6 +27,9 @@ struct Cli {
     /// Path to the JSONL event log produced by the kernel.
     #[arg(long, default_value = ".msk/events.jsonl")]
     events: PathBuf,
+    /// Connect to a running mskd daemon instead of reading a log file.
+    #[arg(long)]
+    connect: Option<PathBuf>,
     /// Refresh interval in milliseconds.
     #[arg(long, default_value_t = 500)]
     refresh_ms: u64,
@@ -395,6 +400,334 @@ impl App {
     }
 }
 
+struct DaemonApp {
+    client: Client,
+    root: PathBuf,
+    tasks: Vec<Value>,
+    selected_task: usize,
+    events: Vec<(String, Event)>,
+    follow: bool,
+    show_help: bool,
+    status: String,
+    refresh_ms: u64,
+    last_refresh: Instant,
+}
+
+impl DaemonApp {
+    fn connect(root: PathBuf, refresh_ms: u64) -> Result<Self> {
+        let mut client =
+            Client::connect(&root).with_context(|| format!("connect {}", root.display()))?;
+        client.hello().context("kernel.hello")?;
+        client.subscribe(None)?;
+        let mut app = Self {
+            client,
+            root,
+            tasks: Vec::new(),
+            selected_task: 0,
+            events: Vec::new(),
+            follow: true,
+            show_help: false,
+            status: "connected".into(),
+            refresh_ms,
+            last_refresh: Instant::now(),
+        };
+        app.reload_tasks()?;
+        Ok(app)
+    }
+
+    fn reload_tasks(&mut self) -> Result<()> {
+        let result = self.client.request(methods::TASK_LIST, json!({}))?;
+        self.tasks = result
+            .get("tasks")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        self.tasks.sort_by(|left, right| {
+            left.get("task_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .cmp(right.get("task_id").and_then(Value::as_str).unwrap_or(""))
+        });
+        if self.selected_task >= self.tasks.len() {
+            self.selected_task = self.tasks.len().saturating_sub(1);
+        }
+        Ok(())
+    }
+
+    fn refresh(&mut self) -> Result<()> {
+        while let Some(value) = self.client.try_notification() {
+            match value.get("method").and_then(Value::as_str) {
+                Some("event") => {
+                    let params = value.get("params").cloned().unwrap_or(Value::Null);
+                    let task_id = params
+                        .get("task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if let Some(event) = params.get("event") {
+                        if let Ok(event) = serde_json::from_value::<Event>(event.clone()) {
+                            self.events.push((task_id, event));
+                        }
+                    }
+                }
+                Some("task.state") => {
+                    if let Some(snapshot) = value.get("params") {
+                        let task_id = snapshot
+                            .get("task_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        if let Some(existing) = self.tasks.iter_mut().find(|task| {
+                            task.get("task_id").and_then(Value::as_str) == Some(task_id)
+                        }) {
+                            *existing = snapshot.clone();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if self.events.len() > MAX_EVENTS {
+            let excess = self.events.len() - MAX_EVENTS;
+            self.events.drain(0..excess);
+        }
+
+        if self.last_refresh.elapsed() >= Duration::from_secs(1) {
+            if let Err(err) = self.reload_tasks() {
+                self.status = format!("refresh failed: {err}");
+            }
+            self.last_refresh = Instant::now();
+        }
+        Ok(())
+    }
+
+    fn selected_task_id(&self) -> Option<String> {
+        self.tasks
+            .get(self.selected_task)
+            .and_then(|task| task.get("task_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    fn selected_events(&self) -> Vec<usize> {
+        let task_id = self.selected_task_id();
+        self.events
+            .iter()
+            .enumerate()
+            .filter(|(_, (id, _))| Some(id.as_str()) == task_id.as_deref())
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn selected_event(&self) -> Option<&Event> {
+        let task_id = self.selected_task_id()?;
+        self.events
+            .iter()
+            .rev()
+            .find(|(id, _)| *id == task_id)
+            .map(|(_, event)| event)
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('q') => return true,
+            KeyCode::Char('?') => self.show_help = !self.show_help,
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.tasks.is_empty() {
+                    self.selected_task = (self.selected_task + 1).min(self.tasks.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.selected_task = self.selected_task.saturating_sub(1);
+            }
+            KeyCode::Char('g') => self.selected_task = 0,
+            KeyCode::Char('G') => {
+                self.selected_task = self.tasks.len().saturating_sub(1);
+            }
+            KeyCode::Char('f') => self.follow = !self.follow,
+            KeyCode::Char('r') => {
+                if let Err(err) = self.reload_tasks() {
+                    self.status = format!("reload failed: {err}");
+                }
+            }
+            KeyCode::Char('n') => self.create_task(),
+            KeyCode::Char('x') => self.cancel_task(),
+            KeyCode::Char('a') => {
+                self.status = "approvals: none pending (M0 agent has no approval calls yet)".into();
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn create_task(&mut self) {
+        let result = self.client.request(
+            methods::TASK_CREATE,
+            json!({
+                "goal": "Create a persistent shell, run a command, and close it.",
+                "demo": "session",
+                "provider": "scripted"
+            }),
+        );
+        match result {
+            Ok(snapshot) => {
+                self.status = format!(
+                    "created {}",
+                    snapshot
+                        .get("task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?")
+                );
+                if let Err(err) = self.reload_tasks() {
+                    self.status = format!("reload failed: {err}");
+                }
+            }
+            Err(err) => self.status = format!("create failed: {err}"),
+        }
+    }
+
+    fn cancel_task(&mut self) {
+        let Some(task_id) = self.selected_task_id() else {
+            self.status = "no task selected".into();
+            return;
+        };
+        match self
+            .client
+            .request(methods::TASK_CANCEL, json!({"task_id": task_id}))
+        {
+            Ok(_) => self.status = format!("cancelled {task_id}"),
+            Err(err) => self.status = format!("cancel failed: {err}"),
+        }
+    }
+
+    fn draw(&self, frame: &mut ratatui::Frame) {
+        let areas = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(7),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(frame.area());
+
+        let header = Paragraph::new(format!(
+            "mskd  {}  tasks {}  follow {}\n{}",
+            self.root.display(),
+            self.tasks.len(),
+            if self.follow { "on" } else { "off" },
+            self.status
+        ))
+        .block(Block::default().borders(Borders::ALL).title("task list"));
+        frame.render_widget(header, areas[0]);
+
+        let items: Vec<ListItem> = self
+            .tasks
+            .iter()
+            .map(|task| {
+                ListItem::new(format!(
+                    "{}  {:<10} {}",
+                    task.get("task_id").and_then(Value::as_str).unwrap_or("?"),
+                    task.get("state").and_then(Value::as_str).unwrap_or("?"),
+                    truncate(task.get("goal").and_then(Value::as_str).unwrap_or(""), 70)
+                ))
+            })
+            .collect();
+        let mut task_state = ListState::default();
+        if !items.is_empty() {
+            task_state.select(Some(self.selected_task.min(items.len() - 1)));
+        }
+        let tasks = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title("tasks"))
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .highlight_symbol("› ");
+        frame.render_stateful_widget(tasks, areas[1], &mut task_state);
+
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(areas[2]);
+
+        let visible = self.selected_events();
+        let event_items: Vec<ListItem> = visible
+            .iter()
+            .rev()
+            .take(400)
+            .map(|index| {
+                let (_, event) = &self.events[*index];
+                ListItem::new(format!(
+                    "{}  {:<20} {}",
+                    short_time(&event.ts),
+                    event.kind,
+                    summarize(event, 90)
+                ))
+            })
+            .collect();
+        let event_title = format!(
+            "events{}",
+            self.selected_task_id()
+                .map(|id| format!(" for {id}"))
+                .unwrap_or_default()
+        );
+        let event_list =
+            List::new(event_items).block(Block::default().borders(Borders::ALL).title(event_title));
+        frame.render_widget(event_list, panes[0]);
+
+        let detail = self
+            .selected_event()
+            .map(detail_text)
+            .unwrap_or_else(|| "no events for the selected task".into());
+        let detail = Paragraph::new(detail)
+            .block(Block::default().borders(Borders::ALL).title("latest event"))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(detail, panes[1]);
+
+        let footer = "q quit  j/k task  n new  x cancel  r reload  f follow  a approvals  ? help";
+        frame.render_widget(Paragraph::new(footer), areas[3]);
+
+        if self.show_help {
+            let area = centered_rect(64, 56, frame.area());
+            frame.render_widget(Clear, area);
+            let help = Paragraph::new(
+                "mskd task inspector\n\n\
+                 q          quit\n\
+                 j / k      previous / next task\n\
+                 g / G      first / last task\n\
+                 n          create a scripted session task\n\
+                 x          cancel the selected task\n\
+                 r          reload the task list\n\
+                 f          follow new events\n\
+                 a          show pending approvals\n\
+                 ?          toggle this help\n\n\
+                 Tasks run as isolated agent processes supervised by mskd.\n\
+                 Event and task.state notifications stream over the IPC socket.",
+            )
+            .block(Block::default().borders(Borders::ALL).title("help"))
+            .wrap(Wrap { trim: false });
+            frame.render_widget(help, area);
+        }
+    }
+}
+
+fn run_daemon(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    root: PathBuf,
+    refresh_ms: u64,
+) -> Result<()> {
+    let mut app = DaemonApp::connect(root, refresh_ms)?;
+    loop {
+        app.refresh()?;
+        terminal.draw(|frame| app.draw(frame))?;
+        if event::poll(Duration::from_millis(app.refresh_ms))?
+            && let CrosstermEvent::Key(key) = event::read()?
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && app.handle_key(key)
+        {
+            return Ok(());
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -404,7 +737,11 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal, cli);
+    let result = if let Some(root) = cli.connect.clone() {
+        run_daemon(&mut terminal, root, cli.refresh_ms)
+    } else {
+        run(&mut terminal, cli)
+    };
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;

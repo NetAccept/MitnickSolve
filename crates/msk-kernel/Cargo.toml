@@ -13,6 +13,14 @@ path = "src/main.rs"
 name = "msk-bench"
 path = "src/bin/msk-bench.rs"
 
+[[bin]]
+name = "mskd"
+path = "src/bin/mskd.rs"
+
+[[bin]]
+name = "mskctl"
+path = "src/bin/mskctl.rs"
+
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
@@ -20,6 +28,7 @@ clap.workspace = true
 msk-core.workspace = true
 msk-data.workspace = true
 msk-events.workspace = true
+msk-ipc.workspace = true
 msk-llm.workspace = true
 msk-mcp.workspace = true
 msk-wasm.workspace = true
@@ -27,3 +36,4 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true

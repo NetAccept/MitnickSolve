@@ -37,6 +37,9 @@ M0 scaffold:
   Responses currently falls back to the provider's non-streaming `complete`.
 - TUI event workbench: incremental JSONL tail, kind filters, search, detail pane,
   context/artifact/tool counters, and live follow mode.
+- Daemon and local IPC: `mskd` supervises agent tasks over a Unix socket or
+  Windows named pipe; `mskctl` and `msk-tui --connect` can list/create/cancel
+  tasks and stream events. A per-root token file gates local clients.
 - Scripted LLM provider exercising LLM -> tool call -> WASM -> host bridge -> envd;
   `exec.session` is granted by the kernel and checked in `EnvHost`.
 - Real streaming providers, session/PTY, and service-mode envd are next.
@@ -120,6 +123,25 @@ TUI keys: `q` quit, `j`/`k` move, `g`/`G` top/bottom, `tab` cycle filters,
 `?` help. The viewer reads the JSONL log incrementally and shows the selected
 event's full payload, including `data.put` artifact metadata.
 
+## Daemon mode
+
+```sh
+cargo build --bins -p msk-kernel -p msk-tui
+target/debug/mskd --root .msk --envd target/debug/envd --tools-dir tools/wasm
+target/debug/mskctl --root .msk list
+target/debug/mskctl --root .msk create --goal "Create a shell, run echo hi, and close it."
+target/debug/mskctl --root .msk watch --timeout-ms 5000
+target/debug/msk-tui --connect .msk
+```
+
+`mskd` writes a per-root token to `.msk/ipc.token`; `mskctl` and the TUI read it
+automatically. On Unix the socket and token are mode 0600; Windows named pipes
+currently rely on local-user access rather than an explicit DACL.
+
+The TUI in daemon mode supports `j`/`k` task selection, `n` to create a default
+session task, `x` to cancel, `r` to reload, `a` for the approvals placeholder,
+and `?` for help.
+
 ## Layout
 
 | Path | Purpose |
@@ -127,7 +149,7 @@ event's full payload, including `data.put` artifact metadata.
 | `crates/msk-core` | Domain types and ports |
 | `crates/msk-abi` | C ABI definitions for kernel components |
 | `crates/msk-events` | Append-only event log |
-| `crates/msk-ipc` | Frontend JSON-RPC types |
+| `crates/msk-ipc` | Local-socket JSON-RPC types, transport, and client |
 | `crates/msk-data` | Content-addressed artifact store |
 | `crates/msk-llm` | LLM provider port and scripted provider |
 | `crates/msk-mcp` | MCP client and embedded stdio frame transport |
