@@ -27,6 +27,7 @@ pub fn default_policy() -> PolicyTable {
         ("session_create", vec![Capability::ExecSession]),
         ("session_exec", vec![Capability::ExecSession]),
         ("session_close", vec![Capability::ExecSession]),
+        ("artifact_read", vec![Capability::ArtifactRead]),
         ("echo", vec![]),
     ])
 }

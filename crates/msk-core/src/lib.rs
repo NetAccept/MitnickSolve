@@ -101,6 +101,8 @@ pub enum Capability {
     SecretsRead,
     #[serde(rename = "data.export")]
     DataExport,
+    #[serde(rename = "artifact.read")]
+    ArtifactRead,
     #[serde(rename = "mcp.connect")]
     McpConnect,
 }
@@ -114,6 +116,7 @@ impl Capability {
             Self::FsHost => "fs.host",
             Self::SecretsRead => "secrets.read",
             Self::DataExport => "data.export",
+            Self::ArtifactRead => "artifact.read",
             Self::McpConnect => "mcp.connect",
         }
     }
@@ -126,6 +129,7 @@ impl Capability {
             "fs.host" => Some(Self::FsHost),
             "secrets.read" => Some(Self::SecretsRead),
             "data.export" => Some(Self::DataExport),
+            "artifact.read" => Some(Self::ArtifactRead),
             "mcp.connect" => Some(Self::McpConnect),
             _ => None,
         }
@@ -255,6 +259,10 @@ mod tests {
         assert_eq!(
             Capability::parse("exec.session"),
             Some(Capability::ExecSession)
+        );
+        assert_eq!(
+            Capability::parse("artifact.read"),
+            Some(Capability::ArtifactRead)
         );
     }
 

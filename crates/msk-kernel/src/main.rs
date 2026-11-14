@@ -11,9 +11,12 @@ use msk_core::{Capability, DataLabel, ToolCall};
 use msk_data::{MemoryObjectStore, ObjectStore};
 use msk_events::{Event, EventSink, JsonlSink};
 use msk_kernel::policy;
-use msk_llm::{LlmError, LlmProvider, LlmRequest, LlmResponse, Message, ScriptedProvider};
+use msk_llm::{
+    LlmError, LlmProvider, LlmRequest, LlmResponse, Message, OpenAiConfig, OpenAiProvider,
+    ScriptedProvider, ToolSchema,
+};
 use msk_mcp::EnvClient;
-use msk_wasm::{ToolContext, ToolHost, WasmtimeRuntime};
+use msk_wasm::{ToolContext, ToolHost, ToolManifest, WasmtimeRuntime};
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 
@@ -21,6 +24,12 @@ use tracing_subscriber::EnvFilter;
 enum Demo {
     Session,
     Echo,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ProviderKind {
+    Scripted,
+    Openai,
 }
 
 #[derive(Debug, Parser)]
@@ -46,15 +55,77 @@ struct Cli {
     /// Minimum recent observations kept during compaction.
     #[arg(long, default_value_t = 4)]
     min_recent_observations: usize,
+    /// LLM provider backend.
+    #[arg(long, value_enum, default_value_t = ProviderKind::Scripted)]
+    provider: ProviderKind,
+    /// Goal handed to a real model.
+    #[arg(
+        long,
+        default_value = "Create a persistent shell, run a command, and close it."
+    )]
+    goal: String,
+    /// Maximum agent turns before aborting.
+    #[arg(long, default_value_t = 12)]
+    max_steps: usize,
+    /// OpenAI-compatible base URL (defaults to MSK_LLM_BASE_URL or OpenAI).
+    #[arg(long)]
+    llm_base_url: Option<String>,
+    /// Model name (defaults to MSK_LLM_MODEL).
+    #[arg(long)]
+    llm_model: Option<String>,
+    /// API key (prefer MSK_LLM_API_KEY over the command line).
+    #[arg(long)]
+    llm_api_key: Option<String>,
 }
 
 /// M0 host bridge: the only native capability exposed to WASM tools.
 struct EnvHost {
     client: Mutex<EnvClient>,
+    artifacts: Arc<MemoryObjectStore>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReadArtifactArgs {
+    id: String,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+impl EnvHost {
+    fn read_artifact(&self, input: &[u8]) -> Result<Vec<u8>, String> {
+        let args: ReadArtifactArgs = serde_json::from_slice(input)
+            .map_err(|err| format!("invalid artifact read input: {err}"))?;
+        let bytes = self
+            .artifacts
+            .get(&args.id)
+            .map_err(|err| err.to_string())?;
+        let offset = args.offset.unwrap_or(0).min(bytes.len());
+        let limit = args.limit.unwrap_or(64 * 1024).min(1024 * 1024);
+        let end = offset.saturating_add(limit).min(bytes.len());
+        let data = String::from_utf8(bytes[offset..end].to_vec())
+            .map_err(|_| "artifact is not UTF-8 in M0".to_string())?;
+        let response = json!({
+            "id": args.id,
+            "offset": offset,
+            "next_offset": end,
+            "eof": end >= bytes.len(),
+            "data": data
+        });
+        serde_json::to_vec(&response).map_err(|err| err.to_string())
+    }
 }
 
 impl ToolHost for EnvHost {
     fn call(&self, ctx: &ToolContext, input: &[u8]) -> Result<Vec<u8>, String> {
+        if ctx.tool == "artifact_read" {
+            if !ctx.allows(Capability::ArtifactRead) {
+                return Err("denied: artifact.read not granted".to_string());
+            }
+            return self.read_artifact(input);
+        }
+
         let envd_tool = match ctx.tool.as_str() {
             "exec" | "session_create" | "session_exec" | "session_close" => ctx.tool.as_str(),
             other => return Err(format!("denied: tool {other} is not allowed")),
@@ -78,6 +149,7 @@ impl ToolHost for EnvHost {
 struct RegisteredTool {
     context: ToolContext,
     runtime: WasmtimeRuntime,
+    manifest: ToolManifest,
 }
 
 fn main() -> Result<()> {
@@ -200,13 +272,20 @@ fn main() -> Result<()> {
     )?;
     emit(&sink, "file.write_large", large_write)?;
 
+    let object_store = Arc::new(MemoryObjectStore::new());
     let env_host = Arc::new(EnvHost {
         client: Mutex::new(client),
+        artifacts: object_store.clone(),
     });
     let host: Arc<dyn ToolHost> = env_host.clone();
 
     let tool_names: &[&str] = match cli.demo {
-        Demo::Session => &["session_create", "session_exec", "session_close"],
+        Demo::Session => &[
+            "session_create",
+            "session_exec",
+            "session_close",
+            "artifact_read",
+        ],
         Demo::Echo => &["echo"],
     };
     let registry = load_registry(&cli.tools_dir, &cli.wasm, host, tool_names)?;
@@ -220,17 +299,51 @@ fn main() -> Result<()> {
         .with_max_tokens(cli.max_context_tokens)
         .with_min_recent_observations(cli.min_recent_observations);
     let mut context = ContextManager::new(context_limits.clone());
-    context.push_pinned(Role::User, "run the M0 agent demo");
+    context.push_pinned(Role::User, cli.goal.clone());
     context.push_pinned(Role::System, format!("env_id={env_id}"));
-    let object_store = MemoryObjectStore::new();
 
-    let provider = ScriptedProvider::new("scripted", demo_responses(cli.demo));
+    let provider: Box<dyn LlmProvider> = match cli.provider {
+        ProviderKind::Scripted => {
+            Box::new(ScriptedProvider::new("scripted", demo_responses(cli.demo)))
+        }
+        ProviderKind::Openai => {
+            let base_url = cli
+                .llm_base_url
+                .clone()
+                .or_else(|| std::env::var("MSK_LLM_BASE_URL").ok())
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+            let model = cli
+                .llm_model
+                .clone()
+                .or_else(|| std::env::var("MSK_LLM_MODEL").ok())
+                .context("--llm-model or MSK_LLM_MODEL is required for --provider openai")?;
+            let api_key = cli
+                .llm_api_key
+                .clone()
+                .or_else(|| std::env::var("MSK_LLM_API_KEY").ok())
+                .context("--llm-api-key or MSK_LLM_API_KEY is required for --provider openai")?;
+            Box::new(
+                OpenAiProvider::new(OpenAiConfig {
+                    base_url,
+                    model,
+                    api_key,
+                })
+                .context("configure OpenAI provider")?,
+            )
+        }
+    };
     let mut response = provider
-        .complete(&llm_request(&context))
-        .context("scripted LLM")?;
+        .complete(&llm_request(&context, &registry))
+        .context("LLM call")?;
     let mut last_session: Option<String> = None;
+    let mut last_artifact: Option<String> = None;
+    let mut steps = 0usize;
 
     loop {
+        if steps >= cli.max_steps {
+            bail!("agent exceeded {} steps", cli.max_steps);
+        }
+        steps += 1;
         emit(
             &sink,
             "llm.response",
@@ -241,13 +354,21 @@ fn main() -> Result<()> {
             }),
         )?;
         context.push(Role::Assistant, response.text.clone());
+        if !response.text.is_empty() {
+            println!("llm: {}", response.text);
+        }
         if response.tool_calls.is_empty() {
             break;
         }
 
         for call in response.tool_calls {
             let mut args = call.args.clone();
-            substitute(&mut args, &env_id, last_session.as_deref())?;
+            substitute(
+                &mut args,
+                &env_id,
+                last_session.as_deref(),
+                last_artifact.as_deref(),
+            )?;
 
             let tool = registry
                 .get(&call.tool)
@@ -275,8 +396,9 @@ fn main() -> Result<()> {
             let data = extract_data(&value)?;
 
             let (observation, artifact) =
-                build_observation(&call.tool, &data, &context_limits, &object_store)?;
+                build_observation(&call.tool, &data, &context_limits, object_store.as_ref())?;
             if let Some(object) = &artifact {
+                last_artifact = Some(object.id.clone());
                 emit(
                     &sink,
                     "data.put",
@@ -342,7 +464,7 @@ fn main() -> Result<()> {
             }),
         )?;
 
-        match provider.complete(&llm_request(&context)) {
+        match provider.complete(&llm_request(&context, &registry)) {
             Ok(next) => response = next,
             Err(LlmError::Exhausted) => break,
             Err(err) => return Err(err.into()),
@@ -378,12 +500,27 @@ fn load_registry(
         };
         let runtime = WasmtimeRuntime::from_file(host.clone(), &wasm)
             .with_context(|| format!("load WASM {}", wasm.display()))?;
-        tools.insert((*name).to_string(), RegisteredTool { context, runtime });
+        tools.insert(
+            (*name).to_string(),
+            RegisteredTool {
+                context,
+                runtime,
+                manifest,
+            },
+        );
     }
     Ok(tools)
 }
 
-fn llm_request(context: &ContextManager) -> LlmRequest {
+fn llm_request(context: &ContextManager, registry: &HashMap<String, RegisteredTool>) -> LlmRequest {
+    let tools = registry
+        .values()
+        .map(|tool| ToolSchema {
+            name: tool.manifest.name.clone(),
+            description: tool.manifest.description.clone(),
+            parameters: tool.manifest.input_schema.clone(),
+        })
+        .collect();
     LlmRequest {
         messages: context
             .messages()
@@ -393,7 +530,7 @@ fn llm_request(context: &ContextManager) -> LlmRequest {
                 content: message.content.clone(),
             })
             .collect(),
-        tools: Vec::new(),
+        tools,
         max_tokens: Some(512),
     }
 }
@@ -488,9 +625,18 @@ fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
                     usage_tokens: 10,
                 },
                 LlmResponse {
-                    text: "close the session".into(),
+                    text: "read the artifact head".into(),
                     tool_calls: vec![ToolCall {
                         id: "c5".into(),
+                        tool: "artifact_read".into(),
+                        args: json!({"id": "$ARTIFACT", "offset": 0, "limit": 200}),
+                    }],
+                    usage_tokens: 10,
+                },
+                LlmResponse {
+                    text: "close the session".into(),
+                    tool_calls: vec![ToolCall {
+                        id: "c6".into(),
                         tool: "session_close".into(),
                         args: json!({"session_id": "$SESSION"}),
                     }],
@@ -506,7 +652,12 @@ fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
     }
 }
 
-fn substitute(value: &mut Value, env_id: &str, session: Option<&str>) -> Result<()> {
+fn substitute(
+    value: &mut Value,
+    env_id: &str,
+    session: Option<&str>,
+    artifact: Option<&str>,
+) -> Result<()> {
     match value {
         Value::String(text) => {
             if text == "$ENV" {
@@ -515,16 +666,20 @@ fn substitute(value: &mut Value, env_id: &str, session: Option<&str>) -> Result<
                 let session = session
                     .ok_or_else(|| anyhow::anyhow!("$SESSION used before session_create"))?;
                 *text = session.to_string();
+            } else if text == "$ARTIFACT" {
+                let artifact = artifact
+                    .ok_or_else(|| anyhow::anyhow!("$ARTIFACT used before an artifact existed"))?;
+                *text = artifact.to_string();
             }
         }
         Value::Array(items) => {
             for item in items {
-                substitute(item, env_id, session)?;
+                substitute(item, env_id, session, artifact)?;
             }
         }
         Value::Object(map) => {
             for item in map.values_mut() {
-                substitute(item, env_id, session)?;
+                substitute(item, env_id, session, artifact)?;
             }
         }
         _ => {}

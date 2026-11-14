@@ -1,0 +1,9 @@
+{
+  "name": "artifact_read",
+  "description": "Read a slice of a stored tool-output artifact by ObjectRef.",
+  "input_schema": {
+    "type": "object",
+    "required": ["id"]
+  },
+  "capabilities": ["artifact.read"]
+}

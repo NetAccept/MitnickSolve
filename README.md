@@ -24,6 +24,10 @@ M0 scaffold:
 - Context budgeting and artifacts: `msk-core::context` tracks tokens, pins key
   facts, and compacts old observations; outputs above 2 KiB are stored in
   `msk-data` by hash and replaced with a head/tail summary plus an ObjectRef.
+- Artifact reads: the `artifact_read` tool (capability `artifact.read`) retrieves
+  a slice of a stored output by ObjectRef.
+- OpenAI-compatible provider: `--provider openai` sends manifest-derived tool
+  schemas to `/chat/completions`; scripted mode remains the offline default.
 - Scripted LLM provider exercising LLM -> tool call -> WASM -> host bridge -> envd;
   `exec.session` is granted by the kernel and checked in `EnvHost`.
 - Real streaming providers, session/PTY, and service-mode envd are next.
@@ -63,6 +67,25 @@ cargo run -p msk-kernel --bin msk -- --envd target/debug/envd --root .msk --demo
 The context budget defaults to 100k tokens; pass `--max-context-tokens 32000`
 to exercise compaction. Large session output is stored as a `data.put` artifact
 and summarized in the transcript.
+
+Real provider (OpenAI-compatible, non-streaming):
+
+```sh
+export MSK_LLM_API_KEY=...
+export MSK_LLM_MODEL=...
+cargo run -p msk-kernel --bin msk -- --envd target/debug/envd \
+  --provider openai --goal "Create a session, run echo hello, and close it."
+```
+
+Use `--llm-base-url` or `MSK_LLM_BASE_URL` for compatible endpoints. A local
+mock is included for offline testing:
+
+```sh
+python bench/mock_llm.py 8765
+cargo run -p msk-kernel --bin msk -- --envd target/debug/envd \
+  --provider openai --llm-base-url http://127.0.0.1:8765/v1 \
+  --llm-model mock --llm-api-key test --demo echo
+```
 
 Benchmarks:
 

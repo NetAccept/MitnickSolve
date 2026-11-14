@@ -10,3 +10,4 @@ msk-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+ureq = { version = "3.5", features = ["json"] }
