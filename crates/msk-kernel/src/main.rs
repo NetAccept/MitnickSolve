@@ -12,8 +12,8 @@ use msk_data::{MemoryObjectStore, ObjectStore};
 use msk_events::{Event, EventSink, JsonlSink};
 use msk_kernel::policy;
 use msk_llm::{
-    LlmError, LlmProvider, LlmRequest, LlmResponse, Message, OpenAiConfig, OpenAiProvider,
-    ScriptedProvider, ToolSchema,
+    LlmDelta, LlmError, LlmProvider, LlmRequest, LlmResponse, Message, OpenAiConfig,
+    OpenAiProvider, OpenAiResponsesProvider, ScriptedProvider, ToolSchema,
 };
 use msk_mcp::EnvClient;
 use msk_wasm::{ToolContext, ToolHost, ToolManifest, WasmtimeRuntime};
@@ -30,6 +30,7 @@ enum Demo {
 enum ProviderKind {
     Scripted,
     Openai,
+    OpenaiResponses,
 }
 
 #[derive(Debug, Parser)]
@@ -67,6 +68,9 @@ struct Cli {
     /// Maximum agent turns before aborting.
     #[arg(long, default_value_t = 12)]
     max_steps: usize,
+    /// Stream text deltas from the provider when available.
+    #[arg(long)]
+    stream: bool,
     /// OpenAI-compatible base URL (defaults to MSK_LLM_BASE_URL or OpenAI).
     #[arg(long)]
     llm_base_url: Option<String>,
@@ -306,35 +310,20 @@ fn main() -> Result<()> {
         ProviderKind::Scripted => {
             Box::new(ScriptedProvider::new("scripted", demo_responses(cli.demo)))
         }
-        ProviderKind::Openai => {
-            let base_url = cli
-                .llm_base_url
-                .clone()
-                .or_else(|| std::env::var("MSK_LLM_BASE_URL").ok())
-                .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-            let model = cli
-                .llm_model
-                .clone()
-                .or_else(|| std::env::var("MSK_LLM_MODEL").ok())
-                .context("--llm-model or MSK_LLM_MODEL is required for --provider openai")?;
-            let api_key = cli
-                .llm_api_key
-                .clone()
-                .or_else(|| std::env::var("MSK_LLM_API_KEY").ok())
-                .context("--llm-api-key or MSK_LLM_API_KEY is required for --provider openai")?;
-            Box::new(
-                OpenAiProvider::new(OpenAiConfig {
-                    base_url,
-                    model,
-                    api_key,
-                })
-                .context("configure OpenAI provider")?,
-            )
-        }
+        ProviderKind::Openai => Box::new(
+            OpenAiProvider::new(openai_config(&cli)?).context("configure OpenAI provider")?,
+        ),
+        ProviderKind::OpenaiResponses => Box::new(
+            OpenAiResponsesProvider::new(openai_config(&cli)?)
+                .context("configure OpenAI Responses provider")?,
+        ),
     };
-    let mut response = provider
-        .complete(&llm_request(&context, &registry))
-        .context("LLM call")?;
+    let mut response = complete_or_stream(
+        provider.as_ref(),
+        &llm_request(&context, &registry),
+        cli.stream,
+    )
+    .context("LLM call")?;
     let mut last_session: Option<String> = None;
     let mut last_artifact: Option<String> = None;
     let mut steps = 0usize;
@@ -353,13 +342,14 @@ fn main() -> Result<()> {
                 "usage_tokens": response.usage_tokens
             }),
         )?;
-        context.push(Role::Assistant, response.text.clone());
-        if !response.text.is_empty() {
+        if !cli.stream && !response.text.is_empty() {
             println!("llm: {}", response.text);
         }
         if response.tool_calls.is_empty() {
+            context.push(Role::Assistant, response.text.clone());
             break;
         }
+        context.push_assistant_tool_calls(response.text.clone(), response.tool_calls.clone());
 
         for call in response.tool_calls {
             let mut args = call.args.clone();
@@ -425,7 +415,7 @@ fn main() -> Result<()> {
                 call.tool,
                 summarize_output(&observation, 200, 80)
             );
-            context.push_observation(&call.tool, observation);
+            context.push_tool_result(call.id.clone(), call.tool.clone(), observation);
 
             if call.tool == "session_create" {
                 last_session = data
@@ -464,7 +454,11 @@ fn main() -> Result<()> {
             }),
         )?;
 
-        match provider.complete(&llm_request(&context, &registry)) {
+        match complete_or_stream(
+            provider.as_ref(),
+            &llm_request(&context, &registry),
+            cli.stream,
+        ) {
             Ok(next) => response = next,
             Err(LlmError::Exhausted) => break,
             Err(err) => return Err(err.into()),
@@ -512,6 +506,49 @@ fn load_registry(
     Ok(tools)
 }
 
+fn complete_or_stream(
+    provider: &dyn LlmProvider,
+    request: &LlmRequest,
+    stream: bool,
+) -> Result<LlmResponse, LlmError> {
+    if !stream {
+        return provider.complete(request);
+    }
+    let mut printed = false;
+    let response = provider.stream(request, &mut |delta| {
+        let LlmDelta::Text(text) = delta;
+        print!("{text}");
+        printed = true;
+    })?;
+    if printed {
+        println!();
+    }
+    Ok(response)
+}
+
+fn openai_config(cli: &Cli) -> Result<OpenAiConfig> {
+    let base_url = cli
+        .llm_base_url
+        .clone()
+        .or_else(|| std::env::var("MSK_LLM_BASE_URL").ok())
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    let model = cli
+        .llm_model
+        .clone()
+        .or_else(|| std::env::var("MSK_LLM_MODEL").ok())
+        .context("--llm-model or MSK_LLM_MODEL is required for OpenAI providers")?;
+    let api_key = cli
+        .llm_api_key
+        .clone()
+        .or_else(|| std::env::var("MSK_LLM_API_KEY").ok())
+        .context("--llm-api-key or MSK_LLM_API_KEY is required for OpenAI providers")?;
+    Ok(OpenAiConfig {
+        base_url,
+        model,
+        api_key,
+    })
+}
+
 fn llm_request(context: &ContextManager, registry: &HashMap<String, RegisteredTool>) -> LlmRequest {
     let tools = registry
         .values()
@@ -525,9 +562,21 @@ fn llm_request(context: &ContextManager, registry: &HashMap<String, RegisteredTo
         messages: context
             .messages()
             .iter()
-            .map(|message| Message {
-                role: message.role.as_llm_role().to_string(),
-                content: message.content.clone(),
+            .map(|message| {
+                if let Some(call_id) = &message.tool_call_id {
+                    Message::tool_result(
+                        call_id.clone(),
+                        message.tool_name.clone().unwrap_or_default(),
+                        message.content.clone(),
+                    )
+                } else if !message.tool_calls.is_empty() {
+                    Message::assistant_tool_calls(
+                        message.content.clone(),
+                        message.tool_calls.clone(),
+                    )
+                } else {
+                    Message::text(message.role.as_llm_role(), message.content.clone())
+                }
             })
             .collect(),
         tools,

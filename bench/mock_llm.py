@@ -14,10 +14,70 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
-        _ = self.rfile.read(length)
+        raw = self.rfile.read(length)
+        try:
+            request = json.loads(raw or b"{}")
+        except json.JSONDecodeError:
+            request = {}
         Handler.calls += 1
+        if request.get("stream") and not self.path.endswith("/responses"):
+            self.send_chat_stream()
+            return
+        if self.path.endswith("/responses"):
+            payload = self.responses_payload()
+        else:
+            payload = self.chat_payload()
+
+        data = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_chat_stream(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
         if Handler.calls == 1:
-            payload = {
+            events = [
+                {"choices": [{"delta": {"content": "mock "}}]},
+                {"choices": [{"delta": {"content": "stream"}}]},
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "function": {
+                                            "name": "echo",
+                                            "arguments": json.dumps(
+                                                {"message": "hello from sse"}
+                                            ),
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {"choices": [], "usage": {"total_tokens": 7}},
+            ]
+        else:
+            events = [
+                {"choices": [{"delta": {"content": "sse complete"}}]},
+                {"choices": [], "usage": {"total_tokens": 5}},
+            ]
+        for event in events:
+            self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+        self.wfile.write(b"data: [DONE]\n\n")
+
+    def chat_payload(self):
+        if Handler.calls == 1:
+            return {
                 "choices": [
                     {
                         "message": {
@@ -39,20 +99,38 @@ class Handler(BaseHTTPRequestHandler):
                 ],
                 "usage": {"total_tokens": 7},
             }
-        else:
-            payload = {
-                "choices": [
-                    {"message": {"content": "mock complete", "tool_calls": []}}
-                ],
-                "usage": {"total_tokens": 5},
-            }
+        return {
+            "choices": [
+                {"message": {"content": "mock complete", "tool_calls": []}}
+            ],
+            "usage": {"total_tokens": 5},
+        }
 
-        data = json.dumps(payload).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+    def responses_payload(self):
+        if Handler.calls == 1:
+            return {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "echo",
+                        "arguments": json.dumps({"message": "hello from responses"}),
+                        "call_id": "call_1",
+                    }
+                ],
+                "usage": {"total_tokens": 7},
+            }
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "responses mock complete"}
+                    ],
+                }
+            ],
+            "usage": {"total_tokens": 5},
+        }
 
     def log_message(self, *_args):
         pass

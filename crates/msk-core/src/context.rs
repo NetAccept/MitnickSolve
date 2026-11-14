@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use crate::ToolCall;
+
 #[derive(Debug, Clone)]
 pub struct ContextLimits {
     pub max_tokens: usize,
@@ -80,6 +82,9 @@ pub struct ContextMessage {
     pub content: String,
     pub pinned: bool,
     pub observation: bool,
+    pub tool_call_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +113,9 @@ impl ContextManager {
             content: content.into(),
             pinned: false,
             observation: false,
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
         });
     }
 
@@ -117,6 +125,9 @@ impl ContextManager {
             content: content.into(),
             pinned: true,
             observation: false,
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
         });
     }
 
@@ -126,6 +137,42 @@ impl ContextManager {
             content: format!("observation {tool}: {}", content.into()),
             pinned: false,
             observation: true,
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+        });
+    }
+
+    pub fn push_assistant_tool_calls(
+        &mut self,
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+    ) {
+        self.messages.push(ContextMessage {
+            role: Role::Assistant,
+            content: content.into(),
+            pinned: false,
+            observation: false,
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls,
+        });
+    }
+
+    pub fn push_tool_result(
+        &mut self,
+        call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        content: impl Into<String>,
+    ) {
+        self.messages.push(ContextMessage {
+            role: Role::Observation,
+            content: content.into(),
+            pinned: false,
+            observation: true,
+            tool_call_id: Some(call_id.into()),
+            tool_name: Some(tool_name.into()),
+            tool_calls: Vec::new(),
         });
     }
 
@@ -155,7 +202,12 @@ impl ContextManager {
             .messages
             .iter()
             .enumerate()
-            .filter(|(_, message)| message.observation && !message.pinned)
+            .filter(|(_, message)| {
+                // Native tool results stay paired with their assistant tool
+                // call; removing one without the other produces invalid
+                // provider requests. Large outputs are already summarized.
+                message.observation && !message.pinned && message.tool_call_id.is_none()
+            })
             .map(|(index, _)| index)
             .collect();
         if candidates.len() <= self.limits.min_recent_observations {

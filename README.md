@@ -27,7 +27,11 @@ M0 scaffold:
 - Artifact reads: the `artifact_read` tool (capability `artifact.read`) retrieves
   a slice of a stored output by ObjectRef.
 - OpenAI-compatible provider: `--provider openai` sends manifest-derived tool
-  schemas to `/chat/completions`; scripted mode remains the offline default.
+  schemas to `/chat/completions`; `--provider openai-responses` uses the native
+  Responses API function_call/function_call_output items. Scripted remains the
+  offline default.
+- Chat Completions SSE streaming: `--stream` prints text deltas as they arrive;
+  Responses currently falls back to the provider's non-streaming `complete`.
 - Scripted LLM provider exercising LLM -> tool call -> WASM -> host bridge -> envd;
   `exec.session` is granted by the kernel and checked in `EnvHost`.
 - Real streaming providers, session/PTY, and service-mode envd are next.
@@ -74,16 +78,20 @@ Real provider (OpenAI-compatible, non-streaming):
 export MSK_LLM_API_KEY=...
 export MSK_LLM_MODEL=...
 cargo run -p msk-kernel --bin msk -- --envd target/debug/envd \
-  --provider openai --goal "Create a session, run echo hello, and close it."
+  --provider openai --stream --goal "Create a session, run echo hello, and close it."
 ```
 
-Use `--llm-base-url` or `MSK_LLM_BASE_URL` for compatible endpoints. A local
-mock is included for offline testing:
+Use `--provider openai-responses` for the Responses API, and
+`--llm-base-url` or `MSK_LLM_BASE_URL` for compatible endpoints. A local mock is
+included for offline testing:
 
 ```sh
 python bench/mock_llm.py 8765
 cargo run -p msk-kernel --bin msk -- --envd target/debug/envd \
-  --provider openai --llm-base-url http://127.0.0.1:8765/v1 \
+  --provider openai --stream --llm-base-url http://127.0.0.1:8765/v1 \
+  --llm-model mock --llm-api-key test --demo echo
+cargo run -p msk-kernel --bin msk -- --envd target/debug/envd \
+  --provider openai-responses --llm-base-url http://127.0.0.1:8765/v1 \
   --llm-model mock --llm-api-key test --demo echo
 ```
 
