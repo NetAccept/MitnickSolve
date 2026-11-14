@@ -44,8 +44,9 @@ M0 scaffold:
   Windows named pipe; `mskctl` and `msk-tui --connect` can list/create/cancel
   tasks and stream events. A per-root token file gates local clients.
 - Daemon-managed PTY terminal: `t` in the daemon TUI opens an interactive
-  ConPTY/Unix PTY proxied by the daemon; `Ctrl+Q` detaches. `mskctl terminal-*`
-  exposes the same path for scripting.
+  ConPTY/Unix PTY proxied by the daemon over a binary MSKD data plane with
+  credit-based backpressure; `Ctrl+Q` detaches. `mskctl terminal-*` exposes the
+  control-plane path for scripting.
 - Scripted LLM provider exercising LLM -> tool call -> WASM -> host bridge -> envd;
   `exec.session` is granted by the kernel and checked in `EnvHost`.
 - Real streaming providers, session/PTY, and service-mode envd are next.
@@ -157,7 +158,11 @@ target/debug/mskctl --root .msk terminal-write --session ses_... --line "echo hi
 target/debug/mskctl --root .msk terminal-read --session ses_... --timeout-ms 300
 target/debug/mskctl --root .msk terminal-resize --session ses_... --cols 120 --rows 40
 target/debug/mskctl --root .msk terminal-close --session ses_...
+target/debug/mskctl --root .msk terminal-stream --line "echo hi" --timeout-ms 2000
 ```
+
+`terminal-stream` uses the binary data plane (MSKD frames, credit, resize,
+close); the control-plane `terminal-*` commands are convenient for scripting.
 
 ## Layout
 

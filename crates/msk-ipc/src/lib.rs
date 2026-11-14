@@ -14,6 +14,8 @@ use std::time::Duration;
 pub use interprocess::TryClone;
 use serde::{Deserialize, Serialize};
 
+pub mod data;
+
 pub const JSONRPC_VERSION: &str = "2.0";
 pub const IPC_PROTOCOL_VERSION: u32 = 1;
 
@@ -145,6 +147,64 @@ pub mod local {
 
     pub fn connect(root: &Path) -> io::Result<Stream> {
         Stream::connect(socket_name(root)?)
+    }
+
+    pub fn data_socket_name(root: &Path) -> io::Result<Name<'static>> {
+        #[cfg(windows)]
+        {
+            let key = stable_hash(&root.to_string_lossy());
+            let name = format!("msk-kernel-data-{key:016x}");
+            Ok(name.to_ns_name::<GenericNamespaced>()?.into_owned())
+        }
+        #[cfg(unix)]
+        {
+            let path = root.join("kernel.data");
+            Ok(path
+                .to_string_lossy()
+                .as_ref()
+                .to_fs_name::<GenericFilePath>()?
+                .into_owned())
+        }
+    }
+
+    pub fn data_listener(root: &Path) -> io::Result<LocalSocketListener> {
+        let listener = ListenerOptions::new()
+            .name(data_socket_name(root)?)
+            .try_overwrite(true)
+            .create_sync()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let socket = root.join("kernel.data");
+            if socket.exists() {
+                let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+        Ok(listener)
+    }
+
+    pub fn data_connect(root: &Path) -> io::Result<Stream> {
+        Stream::connect(data_socket_name(root)?)
+    }
+
+    pub fn data_incoming(
+        listener: &LocalSocketListener,
+    ) -> impl Iterator<Item = io::Result<Stream>> + '_ {
+        listener.incoming()
+    }
+
+    pub fn data_display_name(root: &Path) -> String {
+        #[cfg(windows)]
+        {
+            format!(
+                "msk-kernel-data-{:016x}",
+                stable_hash(&root.to_string_lossy())
+            )
+        }
+        #[cfg(unix)]
+        {
+            root.join("kernel.data").display().to_string()
+        }
     }
 
     pub fn incoming(

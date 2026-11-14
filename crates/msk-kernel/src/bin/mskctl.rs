@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -5,6 +6,7 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use clap::{Parser, Subcommand};
+use msk_ipc::data::{DataClient, DataEvent};
 use msk_ipc::{Client, methods};
 use serde_json::json;
 
@@ -81,6 +83,18 @@ enum Command {
     TerminalClose {
         #[arg(long)]
         session: String,
+    },
+    /// Open a terminal over the binary data plane, optionally write a line,
+    /// and print output until the timeout.
+    TerminalStream {
+        #[arg(long, default_value_t = 100)]
+        cols: u16,
+        #[arg(long, default_value_t = 30)]
+        rows: u16,
+        #[arg(long)]
+        line: Option<String>,
+        #[arg(long, default_value_t = 2000)]
+        timeout_ms: u64,
     },
 }
 
@@ -178,6 +192,40 @@ fn main() -> Result<()> {
         Command::TerminalClose { session } => {
             let result = client.request(methods::TERMINAL_CLOSE, json!({"session_id": session}))?;
             println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::TerminalStream {
+            cols,
+            rows,
+            line,
+            timeout_ms,
+        } => {
+            let data = DataClient::connect(client.root()).context("connect data plane")?;
+            let opened = data.open_terminal(cols, rows)?;
+            println!("terminal {}", opened.session_id);
+            if let Some(line) = line {
+                data.send_data(format!("{line}\r").as_bytes())?;
+            }
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match data.next_event_timeout(remaining.min(Duration::from_millis(100))) {
+                    Some(DataEvent::Data(bytes)) => {
+                        print!("{}", String::from_utf8_lossy(&bytes));
+                        let _ = std::io::stdout().flush();
+                        let _ = data.credit(bytes.len());
+                    }
+                    Some(DataEvent::Exit) | Some(DataEvent::Closed) => break,
+                    Some(DataEvent::Error(message)) => {
+                        eprintln!("terminal error: {message}");
+                        break;
+                    }
+                    None => {}
+                }
+            }
+            let _ = data.close();
         }
     }
     Ok(())

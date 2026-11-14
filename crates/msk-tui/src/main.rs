@@ -4,8 +4,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use clap::Parser;
 use crossterm::event::{
     self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -15,6 +13,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use msk_events::{Event, read_events};
+use msk_ipc::data::{DataClient, DataEvent};
 use msk_ipc::{Client, methods};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -418,6 +417,7 @@ struct DaemonApp {
     selected_task: usize,
     events: Vec<(String, Event)>,
     terminal: Option<TerminalView>,
+    terminal_data: Option<DataClient>,
     terminal_focus: bool,
     follow: bool,
     show_help: bool,
@@ -439,6 +439,7 @@ impl DaemonApp {
             selected_task: 0,
             events: Vec::new(),
             terminal: None,
+            terminal_data: None,
             terminal_focus: false,
             follow: true,
             show_help: false,
@@ -507,34 +508,40 @@ impl DaemonApp {
             self.events.drain(0..excess);
         }
 
-        if let Some(session_id) = self
-            .terminal
-            .as_ref()
-            .map(|terminal| terminal.session_id.clone())
-        {
-            match self.client.request(
-                methods::TERMINAL_READ,
-                json!({"session_id": session_id, "max_bytes": 65536, "timeout_ms": 0}),
-            ) {
-                Ok(result) => {
-                    if let Some(encoded) = result.get("data_base64").and_then(Value::as_str) {
-                        if let Ok(bytes) = STANDARD.decode(encoded) {
-                            let text = sanitize_terminal(&bytes);
-                            if let Some(terminal) = self.terminal.as_mut() {
-                                terminal.output.push_str(&text);
-                                if terminal.output.len() > 1_000_000 {
-                                    let excess = terminal.output.len() - 1_000_000;
-                                    terminal.output.drain(..excess);
-                                }
+        if let Some(data) = self.terminal_data.take() {
+            let mut closed = false;
+            let mut credits = 0usize;
+            while let Some(event) = data.try_event() {
+                match event {
+                    DataEvent::Data(bytes) => {
+                        let text = sanitize_terminal(&bytes);
+                        if let Some(terminal) = self.terminal.as_mut() {
+                            terminal.output.push_str(&text);
+                            if terminal.output.len() > 1_000_000 {
+                                let excess = terminal.output.len() - 1_000_000;
+                                terminal.output.drain(..excess);
                             }
                         }
+                        credits += bytes.len();
+                    }
+                    DataEvent::Exit | DataEvent::Closed => {
+                        self.status = "terminal exited".into();
+                        closed = true;
+                        break;
+                    }
+                    DataEvent::Error(message) => {
+                        self.status = format!("terminal error: {message}");
                     }
                 }
-                Err(err) => {
-                    self.status = format!("terminal read failed: {err}");
-                    self.terminal = None;
-                    self.terminal_focus = false;
-                }
+            }
+            if credits > 0 {
+                let _ = data.credit(credits);
+            }
+            if closed {
+                self.terminal = None;
+                self.terminal_focus = false;
+            } else {
+                self.terminal_data = Some(data);
             }
         }
 
@@ -582,16 +589,8 @@ impl DaemonApp {
                 return false;
             }
             if let Some(bytes) = terminal_key_bytes(key) {
-                if let Some(session_id) = self
-                    .terminal
-                    .as_ref()
-                    .map(|terminal| terminal.session_id.clone())
-                {
-                    let encoded = STANDARD.encode(bytes);
-                    if let Err(err) = self.client.request(
-                        methods::TERMINAL_WRITE,
-                        json!({"session_id": session_id, "data_base64": encoded}),
-                    ) {
+                if let Some(data) = self.terminal_data.as_ref() {
+                    if let Err(err) = data.send_data(&bytes) {
                         self.status = format!("terminal write failed: {err}");
                     }
                 }
@@ -680,21 +679,24 @@ impl DaemonApp {
             self.status = format!("terminal {} focused; Ctrl+Q detaches", terminal.session_id);
             return;
         }
-        match self
-            .client
-            .request(methods::TERMINAL_OPEN, json!({"cols": 100, "rows": 30}))
-        {
-            Ok(result) => {
-                if let Some(session_id) = result.get("session_id").and_then(Value::as_str) {
-                    self.terminal = Some(TerminalView {
-                        session_id: session_id.to_string(),
-                        output: String::new(),
-                        cols: 100,
-                        rows: 30,
-                    });
-                    self.terminal_focus = true;
-                    self.status = "terminal opened; Ctrl+Q detaches".into();
-                }
+        let data = match DataClient::connect(&self.root) {
+            Ok(data) => data,
+            Err(err) => {
+                self.status = format!("terminal connect failed: {err}");
+                return;
+            }
+        };
+        match data.open_terminal(100, 30) {
+            Ok(opened) => {
+                self.terminal = Some(TerminalView {
+                    session_id: opened.session_id,
+                    output: String::new(),
+                    cols: opened.cols,
+                    rows: opened.rows,
+                });
+                self.terminal_data = Some(data);
+                self.terminal_focus = true;
+                self.status = "terminal opened; Ctrl+Q detaches".into();
             }
             Err(err) => self.status = format!("terminal open failed: {err}"),
         }
@@ -702,12 +704,10 @@ impl DaemonApp {
 
     fn close_terminal(&mut self) {
         self.terminal_focus = false;
-        if let Some(terminal) = self.terminal.take() {
-            let _ = self.client.request(
-                methods::TERMINAL_CLOSE,
-                json!({"session_id": terminal.session_id}),
-            );
+        if let Some(data) = self.terminal_data.take() {
+            let _ = data.close();
         }
+        self.terminal = None;
     }
 
     fn draw(&self, frame: &mut ratatui::Frame) {

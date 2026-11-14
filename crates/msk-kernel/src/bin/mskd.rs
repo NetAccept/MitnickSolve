@@ -3,14 +3,17 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use clap::Parser;
 use msk_events::Event;
+use msk_ipc::data::{DATA_MAX_FRAME, DataFrame, DataKind, write_frame};
 use msk_ipc::local::{self, Stream};
 use msk_ipc::{RpcNotification, RpcRequest, RpcResponse, TryClone, methods};
 use msk_mcp::EnvClient;
@@ -106,6 +109,7 @@ struct Daemon {
     inner: Mutex<Inner>,
     subscribers: Mutex<Vec<Subscriber>>,
     terminal: Mutex<Option<TerminalSession>>,
+    data_active: AtomicBool,
     next_task: AtomicU64,
     next_sub: AtomicU64,
 }
@@ -134,7 +138,9 @@ fn main() -> Result<()> {
     let token = Uuid::new_v4().to_string();
     msk_ipc::write_token(&root, &token)?;
     let listener = local::listener(&root)?;
+    let data_listener = local::data_listener(&root)?;
     println!("mskd listening at {}", local::display_name(&root));
+    println!("mskd data at {}", local::data_display_name(&root));
     println!("token file: {}", msk_ipc::token_path(&root).display());
     println!("agent: {}", agent_bin.display());
 
@@ -147,8 +153,26 @@ fn main() -> Result<()> {
         inner: Mutex::new(Inner::default()),
         subscribers: Mutex::new(Vec::new()),
         terminal: Mutex::new(None),
+        data_active: AtomicBool::new(false),
         next_task: AtomicU64::new(1),
         next_sub: AtomicU64::new(1),
+    });
+
+    let data_daemon = daemon.clone();
+    thread::spawn(move || {
+        for stream in local::data_incoming(&data_listener) {
+            match stream {
+                Ok(stream) => {
+                    let daemon = data_daemon.clone();
+                    thread::spawn(move || {
+                        if let Err(err) = handle_data_client(stream, daemon) {
+                            eprintln!("mskd data client: {err:#}");
+                        }
+                    });
+                }
+                Err(err) => eprintln!("mskd data accept: {err}"),
+            }
+        }
     });
 
     for stream in local::incoming(&listener) {
@@ -790,6 +814,225 @@ fn mcp_data(result: &Value) -> Result<Value> {
         bail!("tool not ok: {structured}");
     }
     Ok(structured.get("data").cloned().unwrap_or(Value::Null))
+}
+
+fn handle_data_client(stream: Stream, daemon: Arc<Daemon>) -> Result<()> {
+    let reader_stream = stream.try_clone()?;
+    let writer = Arc::new(Mutex::new(stream));
+    let mut reader = BufReader::new(reader_stream);
+
+    let hello =
+        DataFrame::decode(&mut reader, DATA_MAX_FRAME)?.context("expected data HELLO frame")?;
+    if hello.kind != DataKind::Hello {
+        bail!("expected HELLO, got {:?}", hello.kind);
+    }
+    let hello_value = hello.json_value()?;
+    let token = hello_value
+        .get("token")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if token != daemon.token {
+        send_data_error(&writer, "unauthorized");
+        return Ok(());
+    }
+    let ack = DataFrame::json(
+        DataKind::HelloAck,
+        0,
+        &json!({
+            "protocol": 1,
+            "max_frame": DATA_MAX_FRAME,
+            "credits_initial": 262144
+        }),
+    )?;
+    {
+        let mut writer = writer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("data writer poisoned"))?;
+        write_frame(&mut *writer, &ack)?;
+    }
+
+    let credit = Arc::new(Mutex::new(262_144u64));
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut session_id: Option<String> = None;
+
+    while let Some(frame) = DataFrame::decode(&mut reader, DATA_MAX_FRAME)? {
+        match frame.kind {
+            DataKind::Open => {
+                if session_id.is_some() {
+                    send_data_error(&writer, "stream already open");
+                    continue;
+                }
+                if daemon.data_active.swap(true, Ordering::SeqCst) {
+                    send_data_error(&writer, "another terminal data stream is active");
+                    continue;
+                }
+                let open = frame.json_value()?;
+                let cols = open.get("cols").and_then(Value::as_u64).unwrap_or(100) as u16;
+                let rows = open.get("rows").and_then(Value::as_u64).unwrap_or(30) as u16;
+                let opened = daemon.terminal_open(&json!({"cols": cols, "rows": rows}))?;
+                let sid = opened
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .context("terminal session_id")?
+                    .to_string();
+                let ack = DataFrame::json(
+                    DataKind::OpenAck,
+                    1,
+                    &json!({
+                        "session_id": sid,
+                        "cols": cols,
+                        "rows": rows,
+                        "credits_initial": 262144
+                    }),
+                )?;
+                {
+                    let mut writer = writer
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("data writer poisoned"))?;
+                    write_frame(&mut *writer, &ack)?;
+                }
+                session_id = Some(sid.clone());
+                let pump_daemon = daemon.clone();
+                let pump_writer = writer.clone();
+                let pump_credit = credit.clone();
+                let pump_stop = stop.clone();
+                thread::spawn(move || {
+                    pump_terminal(pump_daemon, pump_writer, pump_credit, pump_stop, sid)
+                });
+            }
+            DataKind::Data => {
+                let Some(sid) = session_id.as_ref() else {
+                    send_data_error(&writer, "stream not open");
+                    continue;
+                };
+                let encoded = STANDARD.encode(&frame.payload);
+                if let Err(err) =
+                    daemon.terminal_write(&json!({"session_id": sid, "data_base64": encoded}))
+                {
+                    send_data_error(&writer, &err.to_string());
+                }
+            }
+            DataKind::Resize => {
+                let Some(sid) = session_id.as_ref() else {
+                    send_data_error(&writer, "stream not open");
+                    continue;
+                };
+                let value = frame.json_value()?;
+                let cols = value.get("cols").and_then(Value::as_u64).unwrap_or(100);
+                let rows = value.get("rows").and_then(Value::as_u64).unwrap_or(30);
+                if let Err(err) =
+                    daemon.terminal_resize(&json!({"session_id": sid, "cols": cols, "rows": rows}))
+                {
+                    send_data_error(&writer, &err.to_string());
+                }
+            }
+            DataKind::Credit => {
+                if frame.payload.len() == 8 {
+                    let amount = u64::from_be_bytes(frame.payload[..8].try_into().unwrap());
+                    if let Ok(mut credit) = credit.lock() {
+                        *credit = credit.saturating_add(amount);
+                    }
+                }
+            }
+            DataKind::Close => {
+                stop.store(true, Ordering::SeqCst);
+                daemon.data_active.store(false, Ordering::SeqCst);
+                if let Some(sid) = session_id.take() {
+                    let _ = daemon.terminal_close(&json!({"session_id": sid}));
+                }
+                let close =
+                    DataFrame::json(DataKind::Close, 1, &json!({"reason": "server_close"}))?;
+                if let Ok(mut writer) = writer.lock() {
+                    let _ = write_frame(&mut *writer, &close);
+                }
+                return Ok(());
+            }
+            DataKind::Ping => {
+                let pong = DataFrame::new(DataKind::Pong, 0, Vec::new());
+                if let Ok(mut writer) = writer.lock() {
+                    let _ = write_frame(&mut *writer, &pong);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    stop.store(true, Ordering::SeqCst);
+    daemon.data_active.store(false, Ordering::SeqCst);
+    if let Some(sid) = session_id {
+        let _ = daemon.terminal_close(&json!({"session_id": sid}));
+    }
+    Ok(())
+}
+
+fn pump_terminal(
+    daemon: Arc<Daemon>,
+    writer: Arc<Mutex<Stream>>,
+    credit: Arc<Mutex<u64>>,
+    stop: Arc<AtomicBool>,
+    session_id: String,
+) {
+    while !stop.load(Ordering::SeqCst) {
+        let available = match credit.lock() {
+            Ok(credit) => *credit,
+            Err(_) => break,
+        };
+        if available == 0 {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        let max_bytes = available.min(64 * 1024);
+        let result = daemon.terminal_read(&json!({
+            "session_id": session_id.clone(),
+            "max_bytes": max_bytes,
+            "timeout_ms": 20
+        }));
+        match result {
+            Ok(value) => {
+                let encoded = value
+                    .get("data_base64")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let bytes = STANDARD.decode(encoded).unwrap_or_default();
+                if !bytes.is_empty() {
+                    let frame = DataFrame::new(DataKind::Data, 1, bytes.clone());
+                    let written = writer
+                        .lock()
+                        .map(|mut writer| write_frame(&mut *writer, &frame));
+                    if !matches!(written, Ok(Ok(()))) {
+                        break;
+                    }
+                    if let Ok(mut credit) = credit.lock() {
+                        *credit = credit.saturating_sub(bytes.len() as u64);
+                    }
+                }
+                if value.get("eof").and_then(Value::as_bool).unwrap_or(false) {
+                    let frame = DataFrame::new(DataKind::Exit, 1, Vec::new());
+                    if let Ok(mut writer) = writer.lock() {
+                        let _ = write_frame(&mut *writer, &frame);
+                    }
+                    break;
+                }
+            }
+            Err(err) => {
+                send_data_error(&writer, &err.to_string());
+                break;
+            }
+        }
+    }
+}
+
+fn send_data_error(writer: &Arc<Mutex<Stream>>, message: &str) {
+    let frame = DataFrame::json(
+        DataKind::Error,
+        0,
+        &json!({"code": 1, "name": "ERROR", "message": message}),
+    );
+    if let Ok(frame) = frame {
+        if let Ok(mut writer) = writer.lock() {
+            let _ = write_frame(&mut *writer, &frame);
+        }
+    }
 }
 
 fn now_ms() -> u128 {
