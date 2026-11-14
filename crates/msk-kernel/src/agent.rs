@@ -3,15 +3,17 @@
 //! turn ends that turn, not the session.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use msk_core::context::{ContextLimits, ContextManager, Role};
+use msk_core::context::{ContextLimits, ContextManager, ContextMessage, Role};
 use msk_core::{PolicyDecision, ToolCall};
 use msk_data::ObjectStore;
 use msk_events::{Event, EventSink};
 use msk_llm::{LlmDelta, LlmProvider};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::runtime::{
@@ -79,6 +81,13 @@ pub struct ApprovalRequest {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub schema_version: u32,
+    pub turns: u64,
+    pub messages: Vec<ContextMessage>,
+}
+
 /// Blocking approval channel. The session calls this from the turn thread; the
 /// implementation may wait for IPC, a terminal prompt, or a timeout. Returning
 /// false denies the call and the model receives an error observation.
@@ -99,6 +108,8 @@ pub struct SessionOptions {
     pub task: Option<String>,
     pub cancel: CancelToken,
     pub approvals: Option<Box<dyn ApprovalHandler>>,
+    pub checkpoint: Option<PathBuf>,
+    pub initial_turns: u64,
 }
 
 pub struct Session {
@@ -114,6 +125,7 @@ pub struct Session {
     task: Option<String>,
     cancel: CancelToken,
     approvals: Option<Box<dyn ApprovalHandler>>,
+    checkpoint: Option<PathBuf>,
     next_approval: u64,
     last_session: Option<String>,
     last_artifact: Option<String>,
@@ -135,10 +147,11 @@ impl Session {
             task: options.task,
             cancel: options.cancel,
             approvals: options.approvals,
+            checkpoint: options.checkpoint,
             next_approval: 0,
             last_session: None,
             last_artifact: None,
-            turns: 0,
+            turns: options.initial_turns,
         }
     }
 
@@ -161,7 +174,13 @@ impl Session {
     /// Runs one user turn to completion. Tool failures are returned to the
     /// model as observations; provider failures and step exhaustion end only
     /// this turn, so the caller can keep the session alive.
-    pub fn run_turn<F: FnMut(&str)>(&mut self, user: &str, mut on_text: F) -> TurnOutcome {
+    pub fn run_turn<F: FnMut(&str)>(&mut self, user: &str, on_text: F) -> TurnOutcome {
+        let outcome = self.run_turn_inner(user, on_text);
+        self.write_checkpoint();
+        outcome
+    }
+
+    fn run_turn_inner<F: FnMut(&str)>(&mut self, user: &str, mut on_text: F) -> TurnOutcome {
         self.turns += 1;
         self.emit("turn.start", json!({"turn": self.turns, "user": user}));
         self.context.push(Role::User, user.to_string());
@@ -463,6 +482,44 @@ impl Session {
             eprintln!("event sink error: {err}");
         }
     }
+
+    fn write_checkpoint(&self) {
+        let Some(path) = &self.checkpoint else {
+            return;
+        };
+        let checkpoint = Checkpoint {
+            schema_version: 1,
+            turns: self.turns,
+            messages: self.context.messages().to_vec(),
+        };
+        let bytes = match serde_json::to_vec_pretty(&checkpoint) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                eprintln!("checkpoint serialize error: {err}");
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        if let Err(err) = std::fs::write(&temporary, &bytes) {
+            eprintln!("checkpoint write error: {err}");
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600));
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Err(err) = std::fs::rename(&temporary, path) {
+            eprintln!("checkpoint rename error: {err}");
+        }
+    }
 }
 
 fn approval_reason(tool: &str) -> String {
@@ -552,6 +609,8 @@ mod tests {
             task: None,
             cancel: CancelToken::new(),
             approvals,
+            checkpoint: None,
+            initial_turns: 0,
         })
     }
 
@@ -694,6 +753,8 @@ mod tests {
             task: None,
             cancel: CancelToken::new(),
             approvals: None,
+            checkpoint: None,
+            initial_turns: 0,
         });
         let mut first = String::new();
         assert_eq!(
@@ -718,6 +779,50 @@ mod tests {
             2
         );
         assert_eq!(session.context().messages().len(), 5);
+    }
+
+    #[test]
+    fn checkpoint_roundtrip_preserves_context() {
+        let path = std::env::temp_dir().join(format!(
+            "msk-checkpoint-{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let limits = ContextLimits::default();
+        let mut context = ContextManager::new(limits.clone());
+        context.push_pinned(Role::System, "system");
+        let mut session = Session::new(SessionOptions {
+            env_id: "test".into(),
+            registry: HashMap::new(),
+            provider: Box::new(msk_llm::EchoProvider::new("echo")),
+            context,
+            limits: limits.clone(),
+            objects: Arc::new(MemoryObjectStore::new()),
+            sink: Arc::new(NullSink),
+            max_steps: 4,
+            stream: false,
+            task: None,
+            cancel: CancelToken::new(),
+            approvals: None,
+            checkpoint: Some(path.clone()),
+            initial_turns: 0,
+        });
+        assert_eq!(
+            session.run_turn("alpha", |_| {}),
+            TurnOutcome::AwaitingInput
+        );
+        assert_eq!(session.run_turn("beta", |_| {}), TurnOutcome::AwaitingInput);
+
+        let bytes = std::fs::read(&path).unwrap();
+        let checkpoint: Checkpoint = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(checkpoint.schema_version, 1);
+        assert_eq!(checkpoint.turns, 2);
+        assert_eq!(checkpoint.messages.len(), 5);
+        let restored = ContextManager::restore(limits, checkpoint.messages);
+        assert_eq!(restored.messages().len(), 5);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -812,6 +917,8 @@ mod tests {
             task: None,
             cancel: cancel.clone(),
             approvals: None,
+            checkpoint: None,
+            initial_turns: 0,
         })
     }
 

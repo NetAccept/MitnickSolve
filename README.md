@@ -85,6 +85,11 @@ M0 scaffold plus the P1 session/turn slice:
 - Conversational daemon TUI: task list, transcript, message editor, streamed
   assistant text, cooperative interrupt, and a live event pane. `n` creates an
   interactive task; `Enter`/`i` writes, `s` interrupts, `t` opens the PTY.
+- Native context checkpoints: every session turn writes
+  `<root>/checkpoint.json` (or `--checkpoint`) with the full message list,
+  including native tool call/result pairs. `--resume-checkpoint` restores it
+  under a fresh env and marks old env/session IDs stale; turn numbering
+  continues. Unix checkpoint files are written 0600.
 - Event integrity and replay: `msk-replay` validates `schema_version`, seq
   order, duplicate IDs, and parent links, then prints a transcript or filtered
   JSONL. `msk --session --resume <events.jsonl>` pins a capped transcript into
@@ -220,10 +225,14 @@ provider echoes the current user turn, so this path is usable without a model:
 target/debug/msk --envd target/debug/envd --root .msk/session --session
 target/debug/msk --envd target/debug/envd --root .msk/session --session \
   --resume .msk/tasks/task-.../events.jsonl
+target/debug/msk --envd target/debug/envd --root .msk/session --session \
+  --resume-checkpoint .msk/old-task/checkpoint.json
 ```
 
 The resumed transcript is pinned as context; old envd environment and session
 IDs are explicitly marked stale, so the model should create a new session.
+`--resume-checkpoint` restores the native context (including tool call/result
+pairs) and continues turn numbering; `--checkpoint` changes the write path.
 
 Use `--provider openai` (or `openai-responses`) with the usual model environment
 variables for a real conversation. `--goal` is only used by the one-shot demo;

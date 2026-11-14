@@ -10,6 +10,8 @@
 use std::collections::HashSet;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::ToolCall;
 
 #[derive(Debug, Clone)]
@@ -45,7 +47,8 @@ impl ContextLimits {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     System,
     User,
@@ -80,7 +83,7 @@ impl fmt::Display for Role {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextMessage {
     pub role: Role,
     pub content: String,
@@ -103,6 +106,15 @@ impl ContextManager {
         Self {
             limits,
             messages: Vec::new(),
+            compactions: 0,
+        }
+    }
+
+    /// Restores a serialized message list (checkpoint) under new limits.
+    pub fn restore(limits: ContextLimits, messages: Vec<ContextMessage>) -> Self {
+        Self {
+            limits,
+            messages,
             compactions: 0,
         }
     }

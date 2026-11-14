@@ -96,6 +96,12 @@ struct Cli {
     /// Replay this event log into the new session's pinned context.
     #[arg(long)]
     resume: Option<PathBuf>,
+    /// Write a native context checkpoint here (defaults to <root>/checkpoint.json).
+    #[arg(long)]
+    checkpoint: Option<PathBuf>,
+    /// Restore a native context checkpoint (including tool call/result pairs).
+    #[arg(long)]
+    resume_checkpoint: Option<PathBuf>,
     /// Approximate token budget for the agent context.
     #[arg(long, default_value_t = 100_000)]
     max_context_tokens: usize,
@@ -861,14 +867,46 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
     let limits = ContextLimits::default()
         .with_max_tokens(cli.max_context_tokens)
         .with_min_recent_observations(cli.min_recent_observations);
-    let mut context = ContextManager::new(limits.clone());
-    context.push_pinned(
-        Role::System,
-        "You are MitnickSolve, a CTF agent. Use the provided tools for all machine access. \
-         Prefer persistent sessions for multi-command work. Tool output over 2 KiB is stored \
-         as an artifact; use artifact_read to inspect it. Keep responses concise.",
-    );
-    context.push_pinned(Role::System, format!("env_id={env_id}"));
+    let (mut context, initial_turns) = if let Some(path) = &cli.resume_checkpoint {
+        let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        let checkpoint: agent::Checkpoint =
+            serde_json::from_slice(&bytes).context("parse checkpoint")?;
+        if checkpoint.schema_version != 1 {
+            bail!(
+                "unsupported checkpoint schema {}",
+                checkpoint.schema_version
+            );
+        }
+        let turns = checkpoint.turns;
+        let messages = checkpoint.messages.len();
+        let mut context = ContextManager::restore(limits.clone(), checkpoint.messages);
+        context.push_pinned(
+            Role::System,
+            "Resumed from a context checkpoint. Environment and session IDs in the restored \
+             transcript are stale; create a new session before running commands.",
+        );
+        context.push_pinned(Role::System, format!("env_id={env_id}"));
+        emit(
+            sink.as_ref(),
+            "session.checkpoint_resume",
+            json!({
+                "path": path.display().to_string(),
+                "turns": turns,
+                "messages": messages
+            }),
+        )?;
+        (context, turns)
+    } else {
+        let mut context = ContextManager::new(limits.clone());
+        context.push_pinned(
+            Role::System,
+            "You are MitnickSolve, a CTF agent. Use the provided tools for all machine access. \
+             Prefer persistent sessions for multi-command work. Tool output over 2 KiB is stored \
+             as an artifact; use artifact_read to inspect it. Keep responses concise.",
+        );
+        context.push_pinned(Role::System, format!("env_id={env_id}"));
+        (context, 0)
+    };
     if let Some(path) = &cli.resume {
         let events =
             msk_events::read_events(path).with_context(|| format!("read {}", path.display()))?;
@@ -900,6 +938,10 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
     } else {
         None
     };
+    let checkpoint_path = cli
+        .checkpoint
+        .clone()
+        .unwrap_or_else(|| cli.root.join("checkpoint.json"));
     let mut session = Session::new(SessionOptions {
         env_id,
         registry,
@@ -913,7 +955,17 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         task: cli.task_id.clone(),
         cancel: agent::CancelToken::new(),
         approvals,
+        checkpoint: Some(checkpoint_path.clone()),
+        initial_turns,
     });
+    emit(
+        sink.as_ref(),
+        "session.checkpoint",
+        json!({
+            "path": checkpoint_path.display().to_string(),
+            "initial_turns": initial_turns
+        }),
+    )?;
 
     if cli.headless {
         let stdio = cli.stdio_json;
