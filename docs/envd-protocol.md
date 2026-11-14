@@ -81,7 +81,7 @@
   - `wss`：`/data`，WebSocket 二进制消息，每条消息一个完整帧；经 HTTP 反向代理时使用。
 - 文件：小数据（默认 ≤ 1 MiB）内联 MCP；大数据走数据面；`file_link` 为外部客户端提供能力 URL。
 
-> **实现状态（0.2）**：控制面 `POST /mcp` 与独立 TCP/TLS 数据监听已实现；尚未提供 `/data` 的 HTTP Upgrade/WSS，也尚未把控制与数据合并为单连接多路复用。数据面接受 `CREDIT` 帧但未据此限流。连接断开后 session 继续运行，但当前数据视图不保留重连游标；详见 [`tools/envd/README.md`](../tools/envd/README.md)。
+> **实现状态（0.2）**：控制面 `POST /mcp` 与独立 TCP/TLS 数据监听已实现。数据面输出使用绝对字节 `seq`、有界 replay log（默认 4 MiB，可按 session 配置）、输出 CREDIT（初始 64 KiB、DATA 上限 64 KiB、4 MiB cap）和 `OPEN since_seq` 重连；越界返回 `GAP`/`STALE`。尚未实现输入 CREDIT、`SEEK`、`/data` HTTP Upgrade/WSS、单连接多路复用和 Rust 原生数据客户端；详见 [`tools/envd/README.md`](../tools/envd/README.md)。
 
 ---
 

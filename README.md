@@ -15,7 +15,9 @@ M0 scaffold plus the P1 session/turn slice:
   Embedded stdio remains the default.
 - Embedded `envd` over stdio frames (Go; `go-pty` for cross-platform PTY) and
   service mode: MCP JSON-RPC over HTTP(S) plus an MSDP TCP/TLS data plane, both
-  behind a bearer token.
+  behind a bearer token. The data plane uses absolute byte offsets, a bounded
+  replay log, output CREDIT backpressure, and `OPEN since_seq` reconnect with
+  explicit GAP/STALE errors.
 - One end-to-end demo: kernel -> embedded envd -> `env_create` -> `write_file` ->
   `read_file` -> `exec` -> JSONL events.
 - wasmtime-backed WASM tool runtime: fresh store per call, fuel limit, 64 MiB

@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	gopty "github.com/aymanbagabas/go-pty"
@@ -38,6 +39,12 @@ type Session struct {
 	pending   []byte
 	markerSeq uint64
 	closed    bool
+	replay    *outputLog
+	// dataViews counts attached binary data-plane views. While nonzero,
+	// readLoop mirrors output into the log but does not feed the control-plane
+	// chunks, so a data view owns the stream. Do not mix session_read with a
+	// data view.
+	dataViews atomic.Int32
 }
 
 func (s *Server) toolSessionCreate(raw json.RawMessage) toolResult {
@@ -47,6 +54,8 @@ func (s *Server) toolSessionCreate(raw json.RawMessage) toolResult {
 		Pty   bool   `json:"pty"`
 		Cols  uint16 `json:"cols"`
 		Rows  uint16 `json:"rows"`
+		// OutputBufferBytes is the replay log capacity (64 KiB..64 MiB).
+		OutputBufferBytes int `json:"output_buffer_bytes"`
 	}
 	if err := json.Unmarshal(raw, &args); err != nil {
 		return errResult(codeInvalidArgument, "INVALID_ARGUMENT", err.Error())
@@ -70,10 +79,22 @@ func (s *Server) toolSessionCreate(raw json.RawMessage) toolResult {
 		rows = 40
 	}
 
+	capacity := args.OutputBufferBytes
+	if capacity <= 0 {
+		capacity = 4 << 20
+	}
+	if capacity < 64<<10 {
+		capacity = 64 << 10
+	}
+	if capacity > 64<<20 {
+		capacity = 64 << 20
+	}
+
 	sess := &Session{
 		ID:     newID("ses"),
 		EnvID:  env.ID,
 		chunks: make(chan []byte, 256),
+		replay: newOutputLog(capacity),
 	}
 
 	if args.Pty {
@@ -190,6 +211,10 @@ func (s *Server) toolSessionExec(raw json.RawMessage) toolResult {
 		return errResult(codeUnsupported, "UNSUPPORTED",
 			"PTY sessions use session_write/session_read/resize, not session_exec")
 	}
+	if sess.dataViews.Load() > 0 {
+		return errResult(codeFailedPrecondition, "FAILED_PRECONDITION",
+			"session has an attached data view; use the data plane")
+	}
 
 	marker := fmt.Sprintf("__MSK_DONE_%d_%s__", sess.markerSeq, randomToken())
 	sess.markerSeq++
@@ -300,6 +325,10 @@ func (s *Server) toolSessionRead(raw json.RawMessage) toolResult {
 	defer sess.mu.Unlock()
 	if sess.closed {
 		return errResult(codeFailedPrecondition, "FAILED_PRECONDITION", "session is closed")
+	}
+	if sess.dataViews.Load() > 0 {
+		return errResult(codeFailedPrecondition, "FAILED_PRECONDITION",
+			"session has an attached data view; read from the data plane")
 	}
 
 	eof := false
@@ -444,14 +473,20 @@ func (s *Server) getSession(id string) (*Session, error) {
 }
 
 func (sess *Session) readLoop(reader io.Reader) {
-	defer close(sess.chunks)
+	defer func() {
+		close(sess.chunks)
+		sess.replay.finish()
+	}()
 	buffer := make([]byte, 4096)
 	for {
 		n, err := reader.Read(buffer)
 		if n > 0 {
 			chunk := make([]byte, n)
 			copy(chunk, buffer[:n])
-			sess.chunks <- chunk
+			sess.replay.append(chunk)
+			if sess.dataViews.Load() == 0 {
+				sess.chunks <- chunk
+			}
 		}
 		if err != nil {
 			return
@@ -539,6 +574,7 @@ func (sess *Session) closeLocked() {
 		return
 	}
 	sess.closed = true
+	sess.replay.finish()
 	if sess.pty != nil {
 		_ = sess.pty.Close()
 	}

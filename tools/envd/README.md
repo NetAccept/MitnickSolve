@@ -66,11 +66,16 @@ TLS:
 ```
 
 The data plane accepts one MSDP connection per session view:
-`HELLO` (token) -> `HELLO_ACK` -> `OPEN {"session_id": "ses_..."}` ->
-`OPEN_ACK` -> `DATA` both ways; `RESIZE`, `PING`/`PONG`, `CLOSE`, and `EXIT`
-are supported. Credit frames are accepted but the service data plane currently
-sends immediately. A data connection owns the session's output; do not also
-poll `session_read` for that session while a data view is attached.
+`HELLO` (token) -> `HELLO_ACK` -> `OPEN {"session_id": "ses_...",
+"since_seq": N}` -> `OPEN_ACK` -> `DATA` both ways; `RESIZE`, `PING`/`PONG`,
+`CLOSE`, and `EXIT` are supported. Output is byte-addressed by absolute `seq`
+and kept in a bounded replay log (`session_create.output_buffer_bytes`, default
+4 MiB). The writer enforces output CREDIT (initial 64 KiB, 64 KiB DATA frames,
+4 MiB cap) and sends `GAP` (code 13) or `STALE` (code 14) when `since_seq` is
+outside the retained window. A data connection owns the session's output while
+attached; after detach, new output also feeds control-plane `session_read`, and
+the replay log remains available for a reconnect. Input credit, `SEEK`, and
+WebSocket transport are not implemented yet.
 
 ## Notes
 

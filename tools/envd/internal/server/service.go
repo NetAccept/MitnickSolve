@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -196,6 +197,69 @@ func (s *Server) runData(ctx context.Context, addr, token string, tlsConfig *tls
 
 var errDataClosed = errors.New("data connection closed by client")
 
+type viewCredit struct {
+	mu     sync.Mutex
+	credit int64
+	max    int64
+	notify chan struct{}
+}
+
+func newViewCredit(initial, maximum int64) *viewCredit {
+	if maximum <= 0 {
+		maximum = 4 << 20
+	}
+	return &viewCredit{
+		credit: initial,
+		max:    maximum,
+		notify: make(chan struct{}),
+	}
+}
+
+func (c *viewCredit) grant(delta int64) {
+	if delta <= 0 {
+		return
+	}
+	c.mu.Lock()
+	c.credit += delta
+	if c.credit > c.max {
+		c.credit = c.max
+	}
+	close(c.notify)
+	c.notify = make(chan struct{})
+	c.mu.Unlock()
+}
+
+func (c *viewCredit) take(want int64) int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.credit <= 0 || want <= 0 {
+		return 0
+	}
+	if want > c.credit {
+		want = c.credit
+	}
+	c.credit -= want
+	return want
+}
+
+func (c *viewCredit) refund(amount int64) {
+	if amount <= 0 {
+		return
+	}
+	c.mu.Lock()
+	c.credit += amount
+	if c.credit > c.max {
+		c.credit = c.max
+	}
+	c.mu.Unlock()
+}
+
+func (c *viewCredit) wait() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.notify
+}
+
 func (s *Server) handleDataConn(conn net.Conn, token string) {
 	defer conn.Close()
 	maxFrame := s.opts.MaxFrame
@@ -250,9 +314,11 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 		return
 	}
 	var openPayload struct {
-		SessionID string `json:"session_id"`
-		Cols      uint16 `json:"cols"`
-		Rows      uint16 `json:"rows"`
+		SessionID string  `json:"session_id"`
+		Cols      uint16  `json:"cols"`
+		Rows      uint16  `json:"rows"`
+		SinceSeq  *uint64 `json:"since_seq"`
+		Takeover  bool    `json:"takeover"`
 	}
 	if err := json.Unmarshal(open.Payload, &openPayload); err != nil || openPayload.SessionID == "" {
 		_ = writeServiceFrame(conn, maxFrame, protocol.KindError, 0, map[string]any{
@@ -268,6 +334,29 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 		return
 	}
 
+	first, last, finished, _ := session.replay.bounds()
+	cursor := last
+	if openPayload.SinceSeq != nil {
+		cursor = *openPayload.SinceSeq
+		if cursor < first || cursor > last {
+			code := 13
+			name := "GAP"
+			message := "cursor is outside the retained output window"
+			if cursor > last {
+				code = 14
+				name = "STALE"
+				message = "cursor is ahead of the session output"
+			}
+			_ = writeServiceFrame(conn, maxFrame, protocol.KindError, 0, map[string]any{
+				"code": code, "name": name, "message": message,
+				"first_seq": first, "last_seq": last,
+			})
+			return
+		}
+	} else if finished {
+		cursor = first
+	}
+
 	session.mu.Lock()
 	if session.closed {
 		session.mu.Unlock()
@@ -276,39 +365,44 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 		})
 		return
 	}
-	pending := append([]byte(nil), session.pending...)
-	session.pending = session.pending[:0]
 	if openPayload.Cols > 0 && openPayload.Rows > 0 && session.pty != nil {
 		_ = session.pty.Resize(int(openPayload.Cols), int(openPayload.Rows))
 	}
 	session.mu.Unlock()
+	session.dataViews.Add(1)
+	defer session.dataViews.Add(-1)
 	_ = conn.SetDeadline(time.Time{})
 
 	var writeMu sync.Mutex
-	writeFrame := func(kind protocol.Kind, payload []byte) error {
+	writeFrame := func(kind protocol.Kind, seq uint64, payload []byte) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		return protocol.WriteFrame(conn, protocol.Frame{Kind: kind, Payload: payload}, maxFrame)
+		return protocol.WriteFrame(conn, protocol.Frame{Kind: kind, Seq: seq, Payload: payload}, maxFrame)
 	}
 	writeJSON := func(kind protocol.Kind, value any) error {
 		payload, err := json.Marshal(value)
 		if err != nil {
 			return err
 		}
-		return writeFrame(kind, payload)
+		return writeFrame(kind, 0, payload)
 	}
+	sendError := func(code int, name, message string) {
+		_ = writeJSON(protocol.KindError, map[string]any{
+			"code": code, "name": name, "message": message,
+		})
+	}
+	credit := newViewCredit(65536, 4<<20)
 	if err := writeJSON(protocol.KindOpenAck, map[string]any{
-		"session_id": openPayload.SessionID,
-		"cols":       openPayload.Cols,
-		"rows":       openPayload.Rows,
-		"pending":    len(pending),
+		"session_id":      openPayload.SessionID,
+		"cols":            openPayload.Cols,
+		"rows":            openPayload.Rows,
+		"first_seq":       first,
+		"last_seq":        last,
+		"since_seq":       cursor,
+		"credits_initial": 65536,
+		"takeover":        openPayload.Takeover,
 	}); err != nil {
 		return
-	}
-	if len(pending) > 0 {
-		if err := writeFrame(protocol.KindData, pending); err != nil {
-			return
-		}
 	}
 
 	clientErr := make(chan error, 1)
@@ -321,6 +415,10 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 			}
 			switch frame.Kind {
 			case protocol.KindData:
+				if len(frame.Payload) > 1<<20 {
+					clientErr <- fmt.Errorf("input exceeds 1 MiB")
+					return
+				}
 				session.mu.Lock()
 				err := session.writeRaw(frame.Payload)
 				session.mu.Unlock()
@@ -328,6 +426,12 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 					clientErr <- err
 					return
 				}
+			case protocol.KindCredit:
+				if len(frame.Payload) != 8 {
+					clientErr <- fmt.Errorf("CREDIT payload must be 8 bytes")
+					return
+				}
+				credit.grant(int64(binary.BigEndian.Uint64(frame.Payload)))
 			case protocol.KindResize:
 				var resize struct {
 					Cols uint16 `json:"cols"`
@@ -343,15 +447,15 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 				}
 				session.mu.Unlock()
 			case protocol.KindPing:
-				if err := writeFrame(protocol.KindPong, nil); err != nil {
+				if err := writeFrame(protocol.KindPong, 0, nil); err != nil {
 					clientErr <- err
 					return
 				}
-			case protocol.KindCredit:
-				// The service data plane currently sends immediately; credit
-				// frames are accepted for protocol compatibility.
 			case protocol.KindClose:
 				clientErr <- errDataClosed
+				return
+			case protocol.KindSeek:
+				clientErr <- fmt.Errorf("SEEK is not supported; reconnect and OPEN with since_seq")
 				return
 			default:
 				clientErr <- fmt.Errorf("unsupported frame %s", frame.Kind)
@@ -361,24 +465,70 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 	}()
 
 	for {
-		select {
-		case chunk, ok := <-session.chunks:
-			if !ok {
-				_ = writeJSON(protocol.KindExit, map[string]any{"exit_code": 0})
-				return
-			}
-			if err := writeFrame(protocol.KindData, chunk); err != nil {
-				return
-			}
-		case err := <-clientErr:
-			if errors.Is(err, errDataClosed) || errors.Is(err, io.EOF) {
-				return
-			}
-			_ = writeJSON(protocol.KindError, map[string]any{
-				"code": 13, "name": "INTERNAL", "message": err.Error(),
-			})
+		first, last, finished, logNotify := session.replay.bounds()
+		if cursor < first {
+			sendError(13, "GAP", "output was trimmed before the view could read it")
 			return
 		}
+		if cursor >= last {
+			if finished {
+				_ = writeJSON(protocol.KindExit, map[string]any{"exit_code": 0, "last_seq": last})
+				return
+			}
+			select {
+			case <-logNotify:
+			case <-credit.wait():
+			case err := <-clientErr:
+				if errors.Is(err, errDataClosed) || errors.Is(err, io.EOF) {
+					return
+				}
+				sendError(13, "INTERNAL", err.Error())
+				return
+			}
+			continue
+		}
+		want := int64(last - cursor)
+		if want > 64<<10 {
+			want = 64 << 10
+		}
+		granted := credit.take(want)
+		if granted == 0 {
+			select {
+			case <-credit.wait():
+			case <-logNotify:
+			case err := <-clientErr:
+				if errors.Is(err, errDataClosed) || errors.Is(err, io.EOF) {
+					return
+				}
+				sendError(13, "INTERNAL", err.Error())
+				return
+			}
+			continue
+		}
+		data, gap, _, _ := session.replay.read(cursor, int(granted))
+		if gap {
+			sendError(13, "GAP", "output was trimmed before the view could read it")
+			return
+		}
+		if len(data) == 0 {
+			credit.refund(granted)
+			select {
+			case <-logNotify:
+			case <-credit.wait():
+			case err := <-clientErr:
+				if errors.Is(err, errDataClosed) || errors.Is(err, io.EOF) {
+					return
+				}
+				sendError(13, "INTERNAL", err.Error())
+				return
+			}
+			continue
+		}
+		if err := writeFrame(protocol.KindData, cursor, data); err != nil {
+			return
+		}
+		cursor += uint64(len(data))
+		credit.refund(granted - int64(len(data)))
 	}
 }
 
