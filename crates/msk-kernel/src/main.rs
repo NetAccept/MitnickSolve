@@ -47,6 +47,7 @@ enum ProviderKind {
     /// execute against the selected envd, so use it for regression runs.
     Replay,
     Openai,
+    #[value(alias = "responses")]
     OpenaiResponses,
     Component,
 }
@@ -83,6 +84,9 @@ struct Cli {
     /// Fallback module for tools without a matching <tool>.wat.
     #[arg(long, default_value = "tools/wasm/exec.wat")]
     wasm: PathBuf,
+    /// Optional platform-specific wasmtime precompiled-module cache.
+    #[arg(long)]
+    wasm_cache: Option<PathBuf>,
     /// Event log used by --provider replay.
     #[arg(long)]
     replay_events: Option<PathBuf>,
@@ -164,6 +168,9 @@ struct Cli {
     /// API key (prefer MSK_LLM_API_KEY over the command line).
     #[arg(long)]
     llm_api_key: Option<String>,
+    /// Reasoning effort for OpenAI-compatible models: minimal, low, medium, high.
+    #[arg(long, value_parser = ["minimal", "low", "medium", "high"])]
+    llm_effort: Option<String>,
 }
 
 /// Wraps the JSONL sink so every event emitted by this process carries the
@@ -623,6 +630,24 @@ fn connect_backend(
     })
 }
 fn main() -> Result<()> {
+    if std::env::args_os().len() == 1 {
+        let exe = std::env::current_exe().context("current executable")?;
+        let tui = exe.with_file_name(if cfg!(windows) {
+            "msk-tui.exe"
+        } else {
+            "msk-tui"
+        });
+        if tui.exists() {
+            let status = std::process::Command::new(&tui)
+                .status()
+                .with_context(|| format!("launch {}", tui.display()))?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        bail!(
+            "msk-tui not found next to msk; run `cargo build --bins` to build the interactive app"
+        );
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(false)
@@ -726,7 +751,13 @@ fn main() -> Result<()> {
         Demo::Echo => &["echo"],
         Demo::Ctf => &["flag_add", "flag_list"],
     };
-    let registry = load_registry(&cli.tools_dir, &cli.wasm, host, tool_names)?;
+    let registry = load_registry(
+        &cli.tools_dir,
+        &cli.wasm,
+        host,
+        tool_names,
+        cli.wasm_cache.as_deref(),
+    )?;
     emit(
         sink.as_ref(),
         "tool.registry",
@@ -991,6 +1022,7 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         host,
         &tool_names,
         &registry_policy,
+        cli.wasm_cache.as_deref(),
     )?;
     emit(
         sink.as_ref(),
@@ -1334,10 +1366,16 @@ fn openai_config(cli: &Cli) -> Result<OpenAiConfig> {
         .clone()
         .or_else(|| std::env::var("MSK_LLM_API_KEY").ok())
         .context("--llm-api-key or MSK_LLM_API_KEY is required for OpenAI providers")?;
+    let effort = cli
+        .llm_effort
+        .clone()
+        .or_else(|| std::env::var("MSK_LLM_EFFORT").ok())
+        .filter(|effort| !effort.is_empty() && effort != "default");
     Ok(OpenAiConfig {
         base_url,
         model,
         api_key,
+        effort,
     })
 }
 
@@ -1366,9 +1404,9 @@ fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
                 "MSK_DEMO=42; echo $MSK_DEMO"
             };
             let large_command = if cfg!(windows) {
-                "type large.txt"
+                "for /L %i in (1,1,500) do @echo line %i"
             } else {
-                "cat large.txt"
+                "i=0; while [ $i -lt 500 ]; do echo \"line $i\"; i=$((i+1)); done"
             };
             vec![
                 LlmResponse {

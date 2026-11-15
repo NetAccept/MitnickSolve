@@ -488,6 +488,7 @@ pub fn load_registry(
     fallback_wasm: &Path,
     host: Arc<dyn ToolHost>,
     names: &[&str],
+    wasm_cache: Option<&Path>,
 ) -> Result<HashMap<String, RegisteredTool>> {
     load_registry_with_policy(
         tools_dir,
@@ -495,6 +496,7 @@ pub fn load_registry(
         host,
         names,
         &policy::default_policy(),
+        wasm_cache,
     )
 }
 
@@ -504,6 +506,7 @@ pub fn load_registry_with_policy(
     host: Arc<dyn ToolHost>,
     names: &[&str],
     policy: &PolicyTable,
+    wasm_cache: Option<&Path>,
 ) -> Result<HashMap<String, RegisteredTool>> {
     let mut tools = HashMap::new();
     for name in names {
@@ -520,7 +523,7 @@ pub fn load_registry_with_policy(
         } else {
             fallback_wasm.to_path_buf()
         };
-        let runtime = WasmtimeRuntime::from_file(host.clone(), &wasm)
+        let runtime = WasmtimeRuntime::from_file_with_cache(host.clone(), &wasm, wasm_cache)
             .with_context(|| format!("load WASM {}", wasm.display()))?;
         tools.insert(
             (*name).to_string(),

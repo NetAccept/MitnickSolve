@@ -191,6 +191,9 @@ pub struct OpenAiConfig {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
+    /// Optional reasoning effort for models that support it (`minimal`, `low`,
+    /// `medium`, `high`).
+    pub effort: Option<String>,
 }
 
 pub struct OpenAiProvider {
@@ -211,6 +214,13 @@ fn validate_openai_config(config: &OpenAiConfig) -> Result<(), LlmError> {
     }
     if config.model.trim().is_empty() {
         return Err(LlmError::Config("model is empty".into()));
+    }
+    if let Some(effort) = &config.effort
+        && !matches!(effort.as_str(), "minimal" | "low" | "medium" | "high")
+    {
+        return Err(LlmError::Config(format!(
+            "unknown reasoning effort: {effort}"
+        )));
     }
     if config.api_key.trim().is_empty() {
         return Err(LlmError::Config("api_key is empty".into()));
@@ -244,7 +254,7 @@ impl LlmProvider for OpenAiResponsesProvider {
 
     fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
         let url = format!("{}/responses", self.config.base_url.trim_end_matches('/'));
-        let body = responses_request(&self.config.model, request);
+        let body = responses_request(&self.config.model, self.config.effort.as_deref(), request);
         let mut response = self
             .agent
             .post(&url)
@@ -291,7 +301,7 @@ impl LlmProvider for OpenAiProvider {
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
         );
-        let body = openai_request(&self.config.model, request);
+        let body = openai_request(&self.config.model, self.config.effort.as_deref(), request);
         let mut response = self
             .agent
             .post(&url)
@@ -325,7 +335,7 @@ impl LlmProvider for OpenAiProvider {
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
         );
-        let mut body = openai_request(&self.config.model, request);
+        let mut body = openai_request(&self.config.model, self.config.effort.as_deref(), request);
         body["stream"] = json!(true);
         body["stream_options"] = json!({"include_usage": true});
 
@@ -502,7 +512,7 @@ where
     Ok(())
 }
 
-fn openai_request(model: &str, request: &LlmRequest) -> Value {
+fn openai_request(model: &str, effort: Option<&str>, request: &LlmRequest) -> Value {
     let messages: Vec<Value> = request.messages.iter().map(chat_message).collect();
     let tools: Vec<Value> = request
         .tools
@@ -530,6 +540,9 @@ fn openai_request(model: &str, request: &LlmRequest) -> Value {
     }
     if let Some(max_tokens) = request.max_tokens {
         body["max_tokens"] = json!(max_tokens);
+    }
+    if let Some(effort) = effort {
+        body["reasoning_effort"] = json!(effort);
     }
     body
 }
@@ -591,7 +604,7 @@ pub fn parse_openai_response(value: &Value) -> Result<LlmResponse, LlmError> {
     })
 }
 
-fn responses_request(model: &str, request: &LlmRequest) -> Value {
+fn responses_request(model: &str, effort: Option<&str>, request: &LlmRequest) -> Value {
     let mut instructions = Vec::new();
     let mut input = Vec::new();
     for message in &request.messages {
@@ -650,6 +663,9 @@ fn responses_request(model: &str, request: &LlmRequest) -> Value {
     }
     if let Some(max_tokens) = request.max_tokens {
         body["max_output_tokens"] = json!(max_tokens);
+    }
+    if let Some(effort) = effort {
+        body["reasoning"] = json!({"effort": effort});
     }
     body
 }
@@ -786,9 +802,11 @@ mod tests {
             }],
             max_tokens: Some(10),
         };
-        let body = openai_request("test-model", &request);
+        let body = openai_request("test-model", None, &request);
         assert_eq!(body["model"], "test-model");
         assert_eq!(body["tools"][0]["function"]["name"], "echo");
+        let body = openai_request("test-model", Some("high"), &request);
+        assert_eq!(body["reasoning_effort"], "high");
     }
 
     #[test]
@@ -840,7 +858,9 @@ mod tests {
             }],
             max_tokens: Some(64),
         };
-        let body = responses_request("test-model", &request);
+        let body = responses_request("test-model", None, &request);
+        let body_with_effort = responses_request("test-model", Some("low"), &request);
+        assert_eq!(body_with_effort["reasoning"]["effort"], "low");
         assert_eq!(body["instructions"], "sys");
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][1]["type"], "function_call");

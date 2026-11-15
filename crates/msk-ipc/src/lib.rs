@@ -420,6 +420,7 @@ pub mod methods {
     pub const TASK_STATE: &str = "task.state";
     pub const TASK_LIST: &str = "task.list";
     pub const TASK_RESULT: &str = "task.result";
+    pub const TASK_HISTORY: &str = "task.history";
     pub const BLACKBOARD_GET: &str = "blackboard.get";
     pub const BLACKBOARD_SET: &str = "blackboard.set";
     pub const BLACKBOARD_LIST: &str = "blackboard.list";

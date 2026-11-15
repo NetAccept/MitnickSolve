@@ -65,6 +65,9 @@ struct Cli {
     /// Directory containing tool manifests and WAT modules.
     #[arg(long, default_value = "tools/wasm")]
     tools_dir: PathBuf,
+    /// Optional platform-specific wasmtime precompiled-module cache.
+    #[arg(long)]
+    wasm_cache: Option<PathBuf>,
     /// Agent binary; defaults to `msk` next to this daemon.
     #[arg(long)]
     agent_bin: Option<PathBuf>,
@@ -96,6 +99,9 @@ struct Task {
     goal: String,
     demo: String,
     provider: String,
+    model: Option<String>,
+    effort: Option<String>,
+    base_url: Option<String>,
     interactive: bool,
     stream: bool,
     approvals: String,
@@ -122,6 +128,9 @@ impl Task {
             "goal": self.goal,
             "demo": self.demo,
             "provider": self.provider,
+            "model": self.model,
+            "effort": self.effort,
+            "base_url": self.base_url,
             "interactive": self.interactive,
             "stream": self.stream,
             "approvals": self.approvals,
@@ -343,6 +352,7 @@ struct Daemon {
     component_trust: Option<PathBuf>,
     component_host: Option<PathBuf>,
     tools_dir: PathBuf,
+    wasm_cache: Option<PathBuf>,
     agent_bin: PathBuf,
     token: String,
     inner: Mutex<Inner>,
@@ -466,6 +476,7 @@ fn main() -> Result<()> {
         component_trust,
         component_host,
         tools_dir,
+        wasm_cache: cli.wasm_cache.clone(),
         agent_bin,
         token,
         inner: Mutex::new(Inner::default()),
@@ -594,7 +605,13 @@ impl Daemon {
                         json!({
                             "protocol": msk_ipc::IPC_PROTOCOL_VERSION,
                             "server": "mskd",
-                            "capabilities": ["tasks", "events", "sessions", "approvals", "terminal"]
+                            "capabilities": ["tasks", "events", "sessions", "approvals", "terminal"],
+                            "llm": {
+                                "api_key": std::env::var("MSK_LLM_API_KEY").is_ok(),
+                                "model": std::env::var("MSK_LLM_MODEL").ok(),
+                                "base_url": std::env::var("MSK_LLM_BASE_URL").ok(),
+                                "effort": std::env::var("MSK_LLM_EFFORT").ok()
+                            }
                         }),
                     ),
                     None,
@@ -616,6 +633,32 @@ impl Daemon {
                     .and_then(Value::as_str)
                     .unwrap_or("scripted")
                     .to_string();
+                let model = params
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                let effort = params
+                    .get("effort")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty() && *value != "default")
+                    .map(str::to_string);
+                if let Some(effort) = &effort
+                    && !matches!(effort.as_str(), "minimal" | "low" | "medium" | "high")
+                {
+                    return (
+                        RpcResponse::err(id, -32602, format!("unknown effort: {effort}")),
+                        None,
+                    );
+                }
+                let base_url = params
+                    .get("base_url")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
                 let interactive = params
                     .get("interactive")
                     .and_then(Value::as_bool)
@@ -666,6 +709,9 @@ impl Daemon {
                     goal,
                     demo,
                     provider,
+                    model,
+                    effort,
+                    base_url,
                     interactive,
                     stream,
                     approvals,
@@ -723,6 +769,10 @@ impl Daemon {
                     None => (RpcResponse::err(id, -32002, "task not found"), None),
                 }
             }
+            methods::TASK_HISTORY => match self.task_history(&params) {
+                Ok(value) => (RpcResponse::ok(id, value), None),
+                Err(err) => (RpcResponse::err(id, -32002, err.to_string()), None),
+            },
             methods::TASK_RESULT => {
                 let task_id = params
                     .get("task_id")
@@ -852,6 +902,9 @@ impl Daemon {
         goal: String,
         demo: String,
         provider: String,
+        model: Option<String>,
+        effort: Option<String>,
+        base_url: Option<String>,
         interactive: bool,
         stream: bool,
         approvals: String,
@@ -882,6 +935,9 @@ impl Daemon {
             goal,
             demo,
             provider,
+            model,
+            effort,
+            base_url,
             interactive,
             stream,
             approvals,
@@ -948,6 +1004,9 @@ impl Daemon {
             goal,
             demo,
             provider,
+            model,
+            effort,
+            base_url,
             interactive,
             stream,
             approvals,
@@ -969,6 +1028,9 @@ impl Daemon {
                     task.goal.clone(),
                     task.demo.clone(),
                     task.provider.clone(),
+                    task.model.clone(),
+                    task.effort.clone(),
+                    task.base_url.clone(),
                     task.interactive,
                     task.stream,
                     task.approvals.clone(),
@@ -1052,9 +1114,21 @@ impl Daemon {
             .arg("--tools-dir")
             .arg(&self.tools_dir)
             .arg("--wasm")
-            .arg(self.tools_dir.join("exec.wat"))
-            .arg("--provider")
-            .arg(&provider)
+            .arg(self.tools_dir.join("exec.wat"));
+        if let Some(cache) = &self.wasm_cache {
+            command.arg("--wasm-cache").arg(cache);
+        }
+        command.arg("--provider").arg(&provider);
+        if let Some(model) = &model {
+            command.arg("--llm-model").arg(model);
+        }
+        if let Some(effort) = &effort {
+            command.arg("--llm-effort").arg(effort);
+        }
+        if let Some(base_url) = &base_url {
+            command.arg("--llm-base-url").arg(base_url);
+        }
+        command
             .arg("--approvals")
             .arg(&approvals)
             .arg("--control-root")
@@ -1407,6 +1481,39 @@ impl Daemon {
         .unwrap_or(Value::Null);
         self.broadcast(notification, task_id);
         Ok(snapshot)
+    }
+
+    fn task_history(&self, params: &Value) -> Result<Value> {
+        let task_id = params
+            .get("task_id")
+            .and_then(Value::as_str)
+            .context("task_id")?;
+        let limit = params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(1000)
+            .clamp(1, 5000) as usize;
+        let (snapshot, dir) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("task map poisoned"))?;
+            let task = inner
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            (task.snapshot(), task.dir.clone())
+        };
+        let mut events = msk_events::read_events(dir.join("events.jsonl")).unwrap_or_default();
+        let truncated = events.len() > limit;
+        if truncated {
+            events.drain(0..events.len() - limit);
+        }
+        Ok(json!({
+            "task": snapshot,
+            "history": events,
+            "truncated": truncated
+        }))
     }
 
     fn task_result(&self, task_id: &str) -> Result<Value> {

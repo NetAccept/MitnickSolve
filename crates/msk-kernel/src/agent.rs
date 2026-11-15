@@ -3,7 +3,7 @@
 //! turn ends that turn, not the session.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -522,7 +522,7 @@ impl Session {
         {
             let _ = std::fs::remove_file(path);
         }
-        if let Err(err) = std::fs::rename(&temporary, path) {
+        if let Err(err) = rename_checkpoint(&temporary, path) {
             eprintln!("checkpoint rename error: {err}");
         }
     }
@@ -535,6 +535,27 @@ fn approval_reason(tool: &str) -> String {
         "write_file" => "write a file in the environment workspace".to_string(),
         "spawn_agent" => "spawn a subagent with delegated tool access".to_string(),
         _ => "tool requires approval".to_string(),
+    }
+}
+
+fn rename_checkpoint(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut last = None;
+        for _ in 0..10 {
+            match std::fs::rename(from, to) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    last = Some(error);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| std::io::Error::other("checkpoint rename failed")))
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
     }
 }
 

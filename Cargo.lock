@@ -1428,6 +1428,7 @@ dependencies = [
  "msk-events",
  "msk-ipc",
  "ratatui",
+ "serde",
  "serde_json",
  "unicode-width 0.1.14",
  "vt100",
@@ -1440,6 +1441,7 @@ dependencies = [
  "msk-core",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "wasmtime",
 ]

@@ -117,6 +117,7 @@ jobs:
       - name: Build kernel
         run: |
           cargo build -p msk-kernel --bins
+          cargo build -p msk-tui
           cargo build -p msk-web
           cargo build -p msk-eval
       - name: Build component fixture
@@ -234,6 +235,10 @@ jobs:
           [ "$(curl -fsS -H 'Authorization: Bearer web-ci-token' \
             http://127.0.0.1:17820/api/tasks/"$web_task" | jq -r .task.state)" = done ]
           target/debug/msk-eval --root .msk/ci --suite evals/core.json
+          target/debug/msk-tui --root .msk/ci --snapshot --provider scripted \
+            | grep -q "MitnickSolve"
+          target/debug/msk-tui --root .msk/ci --snapshot --setup --setup-step effort \
+            --provider openai | grep -q "Reasoning effort"
       - name: TLS service and data plane smoke
         run: |
           set -euo pipefail

@@ -34,6 +34,15 @@ enum Command {
         demo: String,
         #[arg(long, default_value = "scripted")]
         provider: String,
+        /// Model name for OpenAI-compatible providers.
+        #[arg(long)]
+        model: Option<String>,
+        /// Reasoning effort: minimal, low, medium, high.
+        #[arg(long, value_parser = ["minimal", "low", "medium", "high"])]
+        effort: Option<String>,
+        /// OpenAI-compatible base URL.
+        #[arg(long)]
+        base_url: Option<String>,
         /// Keep the agent session alive and accept task.message calls.
         #[arg(long)]
         interactive: bool,
@@ -184,6 +193,9 @@ fn main() -> Result<()> {
             goal,
             demo,
             provider,
+            model,
+            effort,
+            base_url,
             interactive,
             stream,
             headless,
@@ -200,6 +212,15 @@ fn main() -> Result<()> {
                 "stream": stream,
                 "headless": headless
             });
+            if let Some(model) = model {
+                params["model"] = json!(model);
+            }
+            if let Some(effort) = effort {
+                params["effort"] = json!(effort);
+            }
+            if let Some(base_url) = base_url {
+                params["base_url"] = json!(base_url);
+            }
             if let Some(approvals) = approvals {
                 params["approvals"] = json!(approvals);
             }

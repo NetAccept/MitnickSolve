@@ -2,12 +2,14 @@ use std::cell::Cell;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Stdout, stdout};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use crossterm::event::{
-    self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event as CrosstermEvent, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -23,17 +25,195 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use unicode_width::UnicodeWidthStr;
+
+mod setup;
 
 const MAX_EVENTS: usize = 5000;
 const MAX_DETAIL_LINES: usize = 400;
 const MAX_CHAT_LINES: usize = 4000;
 
+const PROVIDERS: &[(&str, &str)] = &[
+    (
+        "scripted-demo",
+        "offline canned tool session, no model or key",
+    ),
+    ("openai", "OpenAI-compatible Chat Completions"),
+    ("openai-responses", "OpenAI Responses API function calls"),
+    (
+        "component",
+        "signed llm.provider component configured on mskd",
+    ),
+];
+
+const MODELS: &[&str] = &["gpt-5", "gpt-5-mini", "o3", "o4-mini", "custom…"];
+const EFFORTS: &[(&str, &str)] = &[
+    ("default", "let the provider decide"),
+    ("minimal", "fastest / least reasoning"),
+    ("low", "light reasoning"),
+    ("medium", "balanced"),
+    ("high", "deep reasoning"),
+];
+
+fn default_provider() -> String {
+    "scripted-demo".into()
+}
+
+fn default_effort() -> String {
+    "default".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TuiConfig {
+    #[serde(default = "default_provider")]
+    provider: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default = "default_effort")]
+    effort: String,
+    #[serde(default)]
+    base_url: String,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_provider(),
+            model: String::new(),
+            effort: default_effort(),
+            base_url: String::new(),
+        }
+    }
+}
+
+impl TuiConfig {
+    fn load(root: &Path) -> Self {
+        std::fs::read_to_string(root.join("tui-config.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, root: &Path) -> Result<()> {
+        std::fs::create_dir_all(root)?;
+        let path = root.join("tui-config.json");
+        let temporary = path.with_extension("tmp");
+        std::fs::write(&temporary, serde_json::to_vec_pretty(self)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600));
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+        std::fs::rename(&temporary, &path)?;
+        Ok(())
+    }
+}
+
+fn provider_index(provider: &str) -> usize {
+    PROVIDERS
+        .iter()
+        .position(|(name, _)| *name == provider)
+        .unwrap_or(0)
+}
+
+fn model_index(model: &str) -> usize {
+    MODELS
+        .iter()
+        .position(|name| *name == model)
+        .unwrap_or(MODELS.len() - 1)
+}
+
+fn effort_index(effort: &str) -> usize {
+    EFFORTS
+        .iter()
+        .position(|(name, _)| *name == effort)
+        .unwrap_or(0)
+}
+
+fn requires_key(provider: &str) -> bool {
+    matches!(provider, "openai" | "openai-responses")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupStep {
+    Provider,
+    Model,
+    CustomModel,
+    Effort,
+    BaseUrl,
+}
+
+#[derive(Debug, Clone)]
+struct SetupState {
+    step: SetupStep,
+    provider: usize,
+    model: usize,
+    effort: usize,
+    model_input: String,
+    base_url: String,
+    input_cursor: usize,
+}
+
+impl SetupState {
+    fn from_app(app: &DaemonApp) -> Self {
+        let model = if app.model.is_empty() {
+            app.daemon_llm_model
+                .clone()
+                .or_else(|| std::env::var("MSK_LLM_MODEL").ok())
+                .unwrap_or_default()
+        } else {
+            app.model.clone()
+        };
+        let base_url = if app.base_url.is_empty() {
+            std::env::var("MSK_LLM_BASE_URL").unwrap_or_default()
+        } else {
+            app.base_url.clone()
+        };
+        let provider = if app.provider.is_empty() {
+            default_provider()
+        } else {
+            app.provider.clone()
+        };
+        let model_index = model_index(&model);
+        Self {
+            step: SetupStep::Provider,
+            provider: provider_index(&provider),
+            model: model_index,
+            effort: effort_index(&app.effort),
+            model_input: if model_index == MODELS.len() - 1 {
+                model
+            } else {
+                String::new()
+            },
+            base_url,
+            input_cursor: 0,
+        }
+    }
+
+    fn selected_provider(&self) -> &str {
+        PROVIDERS[self.provider.min(PROVIDERS.len() - 1)].0
+    }
+
+    fn selected_model(&self) -> String {
+        if self.model >= MODELS.len() - 1 {
+            self.model_input.trim().to_string()
+        } else {
+            MODELS[self.model].to_string()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatRole {
     User,
     Assistant,
+    Tool,
     System,
 }
 
@@ -83,16 +263,38 @@ fn finish_streaming(chat: &mut [ChatLine], task_id: &str) {
 }
 
 #[derive(Debug, Parser)]
+#[command(version, about = "MitnickSolve interactive CTF agent")]
 struct Cli {
-    /// Path to the JSONL event log produced by the kernel.
-    #[arg(long, default_value = ".msk/events.jsonl")]
-    events: PathBuf,
-    /// Connect to a running mskd daemon instead of reading a log file.
+    /// Read a JSONL event log instead of opening the conversational daemon.
     #[arg(long)]
+    events: Option<PathBuf>,
+    /// Daemon state directory. Defaults to .msk and auto-starts mskd if needed.
+    #[arg(long, conflicts_with = "events")]
     connect: Option<PathBuf>,
+    /// Daemon state directory used when --connect is not given.
+    #[arg(long, default_value = ".msk")]
+    root: PathBuf,
+    /// Do not spawn mskd when no daemon is listening.
+    #[arg(long)]
+    no_autostart: bool,
+    /// Provider for tasks created from this TUI (default: $MSK_PROVIDER or scripted).
+    #[arg(long)]
+    provider: Option<String>,
     /// Refresh interval in milliseconds.
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = 100)]
     refresh_ms: u64,
+    /// Render one daemon frame to stdout and exit (no alternate screen).
+    #[arg(long)]
+    snapshot: bool,
+    /// Open the provider/model/effort setup wizard on launch.
+    #[arg(long)]
+    setup: bool,
+    /// Diagnostic: open the setup wizard at provider, model, effort, or base.
+    #[arg(long, value_parser = ["provider", "model", "effort", "base"])]
+    setup_step: Option<String>,
+    /// Print environment/daemon diagnostics and exit.
+    #[arg(long)]
+    doctor: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -440,18 +642,33 @@ impl App {
             let area = centered_rect(64, 56, frame.area());
             frame.render_widget(Clear, area);
             let help = Paragraph::new(
-                "MitnickSolve event inspector\n\n\
-                 q          quit\n\
-                 j / k      move selection\n\
-                 g / G      first / last event\n\
-                 tab        cycle filter\n\
-                 1..5       all / llm / tools / artifacts / context\n\
-                 /          search; enter applies, esc clears\n\
-                 f          follow new events\n\
-                 r          reload from disk\n\
-                 ?          toggle this help\n\n\
-                 Events are read incrementally from the JSONL log.\n\
-                 Artifacts are referenced by ObjectRef in data.put events.",
+                "MitnickSolve conversational workbench
+
+                 Enter / i  write a message, or describe a new challenge
+                 Enter      send / start the task
+                 Esc        leave the editor without sending
+                 ← / →      move the input cursor
+                 Ctrl+U     clear the input
+                 PgUp/PgDn  scroll the conversation
+                 v          toggle the raw event inspector
+                 End        jump to the newest message
+                 j / k      previous / next task
+                 g / G      first / last task
+                 n          start a new task
+                 s          interrupt the running turn
+                 x          cancel the selected task
+                 t          open/focus the PTY terminal
+                 Ctrl+Q     detach from terminal focus
+                 y / n      approve / deny a pending request
+                 ?          toggle this help
+                 q          quit
+
+                 Slash commands in the editor:
+                 /new [goal]  /provider NAME  /terminal  /approvals
+                 /interrupt  /cancel  /clear  /status  /help  /quit
+
+                 Providers: scripted, scripted-demo, openai, responses, component.
+                 ◆ marks an interactive task; tool calls appear inline in the conversation.",
             )
             .block(Block::default().borders(Borders::ALL).title("help"))
             .wrap(Wrap { trim: false });
@@ -512,14 +729,67 @@ struct DaemonApp {
     status: String,
     refresh_ms: u64,
     last_refresh: Instant,
+    provider: String,
+    model: String,
+    effort: String,
+    base_url: String,
+    daemon_llm_key: bool,
+    daemon_llm_model: Option<String>,
+    setup: Option<SetupState>,
+    new_task: bool,
+    quit_requested: bool,
+    pending_initial: Option<(String, String)>,
+    scroll_from_bottom: u16,
+    auto_scroll: bool,
+    transcript_loaded: Option<String>,
+    input_history: Vec<String>,
+    history_index: Option<usize>,
+    show_events: bool,
 }
 
 impl DaemonApp {
-    fn connect(root: PathBuf, refresh_ms: u64) -> Result<Self> {
+    fn connect(root: PathBuf, refresh_ms: u64, provider: Option<String>) -> Result<Self> {
         let mut client =
             Client::connect(&root).with_context(|| format!("connect {}", root.display()))?;
-        client.hello().context("kernel.hello")?;
+        let hello = client.hello().context("kernel.hello")?;
+        let daemon_llm_key = hello
+            .get("llm")
+            .and_then(|llm| llm.get("api_key"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let daemon_llm_model = hello
+            .get("llm")
+            .and_then(|llm| llm.get("model"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let daemon_llm_effort = hello
+            .get("llm")
+            .and_then(|llm| llm.get("effort"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
         client.subscribe(None)?;
+        let configured = root.join("tui-config.json").exists();
+        let mut config = TuiConfig::load(&root);
+        if let Some(provider) = provider {
+            config.provider = provider;
+        } else if !configured
+            && std::env::var("MSK_LLM_MODEL").is_ok()
+            && std::env::var("MSK_LLM_API_KEY").is_ok()
+        {
+            config.provider = "openai".into();
+        }
+        if config.model.is_empty() {
+            config.model = std::env::var("MSK_LLM_MODEL")
+                .ok()
+                .or_else(|| daemon_llm_model.clone())
+                .unwrap_or_default();
+        }
+        if config.effort.is_empty() {
+            config.effort = daemon_llm_effort.clone().unwrap_or_else(default_effort);
+        }
+        if config.base_url.is_empty() {
+            config.base_url = std::env::var("MSK_LLM_BASE_URL").unwrap_or_default();
+        }
         let mut app = Self {
             client,
             root,
@@ -540,8 +810,32 @@ impl DaemonApp {
             status: "connected".into(),
             refresh_ms,
             last_refresh: Instant::now(),
+            provider: config.provider,
+            model: config.model,
+            effort: config.effort,
+            base_url: config.base_url,
+            daemon_llm_key,
+            daemon_llm_model,
+            setup: None,
+            new_task: false,
+            quit_requested: false,
+            pending_initial: None,
+            scroll_from_bottom: 0,
+            auto_scroll: true,
+            transcript_loaded: None,
+            input_history: Vec::new(),
+            history_index: None,
+            show_events: false,
         };
         app.reload_tasks()?;
+        let _ = app.reload_approvals();
+        if let Some(task_id) = app.selected_task_id() {
+            app.load_transcript(&task_id);
+        } else {
+            app.new_task = true;
+            app.composing = true;
+            app.status = "describe a challenge to start".into();
+        }
         Ok(app)
     }
 
@@ -564,6 +858,16 @@ impl DaemonApp {
         Ok(())
     }
 
+    fn reload_approvals(&mut self) -> Result<()> {
+        let result = self.client.request(methods::APPROVAL_LIST, json!({}))?;
+        self.approvals = result
+            .get("approvals")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(())
+    }
+
     fn refresh(&mut self) -> Result<()> {
         while let Some(value) = self.client.try_notification() {
             match value.get("method").and_then(Value::as_str) {
@@ -576,6 +880,52 @@ impl DaemonApp {
                         .to_string();
                     if let Some(event) = params.get("event") {
                         if let Ok(event) = serde_json::from_value::<Event>(event.clone()) {
+                            let selected =
+                                self.selected_task_id().as_deref() == Some(task_id.as_str());
+                            if selected {
+                                match event.kind.as_str() {
+                                    "tool.call" => {
+                                        let tool = event
+                                            .data
+                                            .get("tool")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("tool");
+                                        let args =
+                                            event.data.get("args").cloned().unwrap_or(Value::Null);
+                                        self.chat.push(ChatLine {
+                                            task_id: task_id.clone(),
+                                            role: ChatRole::Tool,
+                                            text: format!("▸ {tool} {}", compact_json(&args, 180)),
+                                            streaming: false,
+                                        });
+                                    }
+                                    "tool.result" => {
+                                        let tool = event
+                                            .data
+                                            .get("tool")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("tool");
+                                        let ok = !event
+                                            .data
+                                            .get("is_error")
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false);
+                                        let mut text =
+                                            format!("{} {tool}", if ok { "✓" } else { "✗" });
+                                        if let Some(summary) = observation_summary(&event.data) {
+                                            text.push_str(&format!("  {summary}"));
+                                        }
+                                        self.chat.push(ChatLine {
+                                            task_id: task_id.clone(),
+                                            role: ChatRole::Tool,
+                                            text,
+                                            streaming: false,
+                                        });
+                                    }
+                                    _ => {}
+                                }
+                                self.trim_chat();
+                            }
                             self.events.push((task_id, event));
                         }
                     }
@@ -601,6 +951,27 @@ impl DaemonApp {
                             self.approvals.retain(|approval| {
                                 approval.get("task_id").and_then(Value::as_str) != Some(task_id)
                             });
+                            if self.selected_task_id().as_deref() == Some(task_id) {
+                                let task_id = task_id.to_string();
+                                self.load_transcript(&task_id);
+                            }
+                        }
+                        if state == "waiting_input"
+                            && let Some((pending_task, text)) = self.pending_initial.clone()
+                            && pending_task == task_id
+                        {
+                            match self.client.request(
+                                methods::TASK_MESSAGE,
+                                json!({"task_id": task_id, "text": text}),
+                            ) {
+                                Ok(_) => {
+                                    self.pending_initial = None;
+                                    self.status = "initial prompt sent".into();
+                                }
+                                Err(err) => {
+                                    self.status = format!("initial prompt failed: {err}");
+                                }
+                            }
                         }
                     }
                 }
@@ -683,12 +1054,15 @@ impl DaemonApp {
                             format!("[{status}] {message}")
                         };
                         self.chat.push(ChatLine {
-                            task_id,
+                            task_id: task_id.clone(),
                             role: ChatRole::System,
                             text,
                             streaming: false,
                         });
                         self.trim_chat();
+                    }
+                    if self.selected_task_id().as_deref() == Some(task_id.as_str()) {
+                        self.load_transcript(&task_id);
                     }
                 }
                 _ => {}
@@ -750,9 +1124,198 @@ impl DaemonApp {
             if let Err(err) = self.reload_tasks() {
                 self.status = format!("refresh failed: {err}");
             }
+            if let Err(err) = self.reload_approvals() {
+                self.status = format!("approval refresh failed: {err}");
+            }
             self.last_refresh = Instant::now();
         }
+        self.flush_pending_initial();
         Ok(())
+    }
+
+    fn append_history_event(&mut self, task_id: &str, event: &Event) {
+        let data = &event.data;
+        match event.kind.as_str() {
+            "turn.start" => {
+                if let Some(user) = data.get("user").and_then(Value::as_str) {
+                    self.chat.push(ChatLine {
+                        task_id: task_id.to_string(),
+                        role: ChatRole::User,
+                        text: user.to_string(),
+                        streaming: false,
+                    });
+                }
+            }
+            "llm.response" => {
+                if let Some(text) = data.get("text").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    self.chat.push(ChatLine {
+                        task_id: task_id.to_string(),
+                        role: ChatRole::Assistant,
+                        text: text.to_string(),
+                        streaming: false,
+                    });
+                }
+            }
+            "tool.call" => {
+                let tool = data.get("tool").and_then(Value::as_str).unwrap_or("tool");
+                let args = data.get("args").cloned().unwrap_or(Value::Null);
+                self.chat.push(ChatLine {
+                    task_id: task_id.to_string(),
+                    role: ChatRole::Tool,
+                    text: format!("▸ {tool} {}", compact_json(&args, 180)),
+                    streaming: false,
+                });
+            }
+            "tool.result" => {
+                let tool = data.get("tool").and_then(Value::as_str).unwrap_or("tool");
+                let failed = data
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let mut text = format!("{} {tool}", if failed { "✗" } else { "✓" });
+                if let Some(artifact) = data.get("artifact").and_then(Value::as_str) {
+                    text.push_str(&format!("  artifact {artifact}"));
+                } else if let Some(summary) = observation_summary(data) {
+                    text.push_str(&format!("  {summary}"));
+                }
+                self.chat.push(ChatLine {
+                    task_id: task_id.to_string(),
+                    role: ChatRole::Tool,
+                    text,
+                    streaming: false,
+                });
+            }
+            "turn.end" => {
+                let status = data.get("status").and_then(Value::as_str).unwrap_or("done");
+                self.chat.push(ChatLine {
+                    task_id: task_id.to_string(),
+                    role: ChatRole::System,
+                    text: format!("turn end: {status}"),
+                    streaming: false,
+                });
+            }
+            "approval.request" => {
+                let tool = data.get("tool").and_then(Value::as_str).unwrap_or("tool");
+                self.chat.push(ChatLine {
+                    task_id: task_id.to_string(),
+                    role: ChatRole::System,
+                    text: format!("approval requested: {tool}"),
+                    streaming: false,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn load_transcript(&mut self, task_id: &str) {
+        let result = match self
+            .client
+            .request(methods::TASK_HISTORY, json!({"task_id": task_id}))
+        {
+            Ok(result) => result,
+            Err(_) => match self
+                .client
+                .request(methods::TASK_RESULT, json!({"task_id": task_id}))
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    self.status = format!("load transcript failed: {err}");
+                    return;
+                }
+            },
+        };
+        self.chat.retain(|line| line.task_id != task_id);
+        if let Some(history) = result.get("history").and_then(Value::as_array) {
+            for event in history {
+                if let Ok(event) = serde_json::from_value::<Event>(event.clone()) {
+                    self.append_history_event(task_id, &event);
+                }
+            }
+            self.trim_chat();
+            self.transcript_loaded = Some(task_id.to_string());
+            self.auto_scroll = true;
+            self.scroll_from_bottom = 0;
+            return;
+        }
+        let transcript = result
+            .get("transcript")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        for raw in transcript.lines() {
+            let raw = raw.trim_end();
+            if raw.trim().is_empty() {
+                continue;
+            }
+            let (role, text) = if raw.starts_with("[turn") {
+                if let Some((_, text)) = raw.split_once("] user: ") {
+                    (ChatRole::User, text.to_string())
+                } else {
+                    (ChatRole::System, raw.to_string())
+                }
+            } else if let Some(text) = raw.strip_prefix("assistant: ") {
+                (ChatRole::Assistant, text.to_string())
+            } else if raw.starts_with("tool ") {
+                (ChatRole::Tool, raw.to_string())
+            } else {
+                (ChatRole::System, raw.to_string())
+            };
+            self.chat.push(ChatLine {
+                task_id: task_id.to_string(),
+                role,
+                text,
+                streaming: false,
+            });
+        }
+        self.trim_chat();
+        self.transcript_loaded = Some(task_id.to_string());
+        self.auto_scroll = true;
+        self.scroll_from_bottom = 0;
+    }
+
+    fn select_task(&mut self, delta: isize) {
+        if self.tasks.is_empty() {
+            return;
+        }
+        let len = self.tasks.len() as isize;
+        self.select_task_to((self.selected_task as isize + delta).clamp(0, len - 1) as usize);
+    }
+
+    fn select_task_to(&mut self, index: usize) {
+        if self.tasks.is_empty() {
+            return;
+        }
+        self.selected_task = index.min(self.tasks.len() - 1);
+        self.new_task = false;
+        if let Some(task_id) = self.selected_task_id() {
+            self.load_transcript(&task_id);
+        }
+    }
+
+    fn flush_pending_initial(&mut self) {
+        let Some((task_id, text)) = self.pending_initial.clone() else {
+            return;
+        };
+        let waiting = self.tasks.iter().any(|task| {
+            task.get("task_id").and_then(Value::as_str) == Some(task_id.as_str())
+                && task.get("state").and_then(Value::as_str) == Some("waiting_input")
+        });
+        if !waiting {
+            return;
+        }
+        match self.client.request(
+            methods::TASK_MESSAGE,
+            json!({"task_id": task_id, "text": text}),
+        ) {
+            Ok(_) => {
+                self.pending_initial = None;
+                self.status = "initial prompt sent".into();
+            }
+            Err(err) => {
+                self.status = format!("initial prompt failed: {err}");
+            }
+        }
     }
 
     fn selected_task_id(&self) -> Option<String> {
@@ -789,33 +1352,188 @@ impl DaemonApp {
     }
 
     fn enter_compose(&mut self) {
-        if self.selected_task_id().is_none() {
-            self.status = "no task selected".into();
-            return;
-        }
         self.composing = true;
-        self.status = "message: Enter sends, Esc leaves the editor".into();
+        if self.selected_task_id().is_none() {
+            self.new_task = true;
+            self.status = "new task: describe the challenge, Enter starts it".into();
+        } else {
+            self.status = "message: Enter sends, Esc leaves the editor".into();
+        }
     }
 
     fn send_message(&mut self) {
+        let text = self.input.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        if text.starts_with('/') {
+            self.run_command(&text);
+            return;
+        }
+        if self.new_task || self.selected_task_id().is_none() {
+            self.start_new_task(&text);
+            return;
+        }
         let Some(task_id) = self.selected_task_id() else {
             self.status = "no task selected".into();
             return;
         };
-        if self.input.trim().is_empty() {
-            return;
-        }
-        let text = self.input.clone();
         match self.client.request(
             methods::TASK_MESSAGE,
             json!({"task_id": task_id, "text": text}),
         ) {
             Ok(_) => {
+                self.remember_history(&text);
                 self.input.clear();
                 self.input_cursor = 0;
                 self.status = "message sent".into();
             }
             Err(err) => self.status = format!("send failed: {err}"),
+        }
+    }
+
+    fn run_command(&mut self, text: &str) {
+        let mut parts = text.trim().splitn(2, char::is_whitespace);
+        let command = parts.next().unwrap_or_default();
+        let argument = parts.next().unwrap_or_default().trim();
+        self.input.clear();
+        self.input_cursor = 0;
+        match command {
+            "/help" => {
+                self.show_help = true;
+                self.status = "help".into();
+            }
+            "/setup" => self.open_setup(),
+            "/demo" => {
+                self.provider = "scripted-demo".into();
+                self.create_task_with_goal("run the offline tool demo", true);
+            }
+            "/new" => {
+                if argument.is_empty() {
+                    self.new_task = true;
+                    self.composing = true;
+                    self.status = "new task: describe the challenge".into();
+                } else {
+                    self.start_new_task(argument);
+                }
+            }
+            "/quit" | "/exit" => {
+                self.quit_requested = true;
+            }
+            "/cancel" => self.cancel_task(),
+            "/interrupt" => self.interrupt_task(),
+            "/terminal" => self.toggle_terminal(),
+            "/approvals" => {
+                self.status = if self.approvals.is_empty() {
+                    "no pending approvals".into()
+                } else {
+                    format!("{} pending approval(s)", self.approvals.len())
+                };
+            }
+            "/provider" => {
+                let canonical = match argument {
+                    "responses" => "openai-responses",
+                    value => value,
+                };
+                if matches!(
+                    canonical,
+                    "scripted" | "scripted-demo" | "openai" | "openai-responses" | "component"
+                ) {
+                    self.provider = canonical.to_string();
+                    self.status = format!("next task provider: {}", self.provider);
+                } else {
+                    self.status =
+                        "usage: /provider scripted|scripted-demo|openai|openai-responses|component"
+                            .into();
+                }
+            }
+            "/clear" => {
+                if let Some(task_id) = self.selected_task_id() {
+                    self.chat.retain(|line| line.task_id != task_id);
+                }
+                self.status = "conversation cleared".into();
+            }
+            "/status" => {
+                self.status = format!(
+                    "root {} · provider {} · task {} · {}",
+                    self.root.display(),
+                    self.provider,
+                    self.selected_task_id().as_deref().unwrap_or("-"),
+                    self.selected_state()
+                );
+            }
+            other => {
+                self.status = format!("unknown command {other}; try /help");
+            }
+        }
+    }
+
+    fn start_new_task(&mut self, goal: &str) {
+        self.create_task_with_goal(goal, true);
+    }
+
+    fn create_task_with_goal(&mut self, goal: &str, send_initial: bool) {
+        if requires_key(&self.provider) {
+            if !self.daemon_llm_key {
+                self.status =
+                    "provider needs MSK_LLM_API_KEY in mskd; export it, restart mskd, or press p"
+                        .into();
+                return;
+            }
+            if self.model.trim().is_empty() && self.daemon_llm_model.is_none() {
+                self.status = "provider needs a model; press p to choose one".into();
+                self.open_setup();
+                return;
+            }
+        }
+        let result = self.client.request(methods::TASK_CREATE, {
+            let mut params = json!({
+                "goal": goal,
+                "demo": "session",
+                "provider": self.provider,
+                "interactive": true,
+                "stream": true,
+                "approvals": "ask"
+            });
+            if !self.model.trim().is_empty() {
+                params["model"] = json!(self.model.trim());
+            }
+            if self.effort != "default" && !self.effort.is_empty() {
+                params["effort"] = json!(self.effort);
+            }
+            if !self.base_url.trim().is_empty() {
+                params["base_url"] = json!(self.base_url.trim());
+            }
+            params
+        });
+        match result {
+            Ok(snapshot) => {
+                let task_id = snapshot
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.new_task = false;
+                if send_initial {
+                    self.remember_history(goal);
+                }
+                self.input.clear();
+                self.input_cursor = 0;
+                self.pending_initial = if send_initial && !task_id.is_empty() {
+                    Some((task_id.clone(), goal.to_string()))
+                } else {
+                    None
+                };
+                self.status = format!("created {task_id} with {}", self.provider);
+                if let Err(err) = self.reload_tasks() {
+                    self.status = format!("reload failed: {err}");
+                }
+                self.selected_task = self.tasks.len().saturating_sub(1);
+                if !task_id.is_empty() {
+                    self.load_transcript(&task_id);
+                }
+            }
+            Err(err) => self.status = format!("create failed: {err}"),
         }
     }
 
@@ -872,6 +1590,73 @@ impl DaemonApp {
         }
     }
 
+    fn remember_history(&mut self, text: &str) {
+        if text.is_empty() || text.starts_with('/') {
+            return;
+        }
+        if self.input_history.last().map(String::as_str) != Some(text) {
+            self.input_history.push(text.to_string());
+            if self.input_history.len() > 100 {
+                self.input_history.remove(0);
+            }
+        }
+        self.history_index = None;
+    }
+
+    fn history_previous(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let index = match self.history_index {
+            Some(index) => index.saturating_sub(1),
+            None => self.input_history.len() - 1,
+        };
+        self.history_index = Some(index);
+        self.input = self.input_history[index].clone();
+        self.input_cursor = self.input.len();
+    }
+
+    fn history_next(&mut self) {
+        let Some(index) = self.history_index else {
+            return;
+        };
+        if index + 1 >= self.input_history.len() {
+            self.history_index = None;
+            self.input.clear();
+            self.input_cursor = 0;
+            return;
+        }
+        let index = index + 1;
+        self.history_index = Some(index);
+        self.input = self.input_history[index].clone();
+        self.input_cursor = self.input.len();
+    }
+
+    fn handle_paste(&mut self, text: &str) {
+        if self.terminal_focus {
+            if let Some(data) = self.terminal_data.as_ref() {
+                if let Err(err) = data.send_data(text.as_bytes()) {
+                    self.status = format!("terminal paste failed: {err}");
+                }
+            }
+            return;
+        }
+        if !self.approvals.is_empty() {
+            return;
+        }
+        if !self.composing {
+            self.composing = true;
+            if self.selected_task_id().is_none() {
+                self.new_task = true;
+            }
+        }
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.input.insert_str(self.input_cursor, &normalized);
+        self.input_cursor += normalized.len();
+        self.history_index = None;
+        self.status = "pasted".into();
+    }
+
     fn compose_key(&mut self, key: KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -885,6 +1670,25 @@ impl DaemonApp {
                     self.input.clear();
                     self.input_cursor = 0;
                 }
+                KeyCode::Char('a') => self.input_cursor = 0,
+                KeyCode::Char('e') => self.input_cursor = self.input.len(),
+                KeyCode::Char('k') => {
+                    self.input.truncate(self.input_cursor);
+                }
+                KeyCode::Char('w') => {
+                    let before = &self.input[..self.input_cursor];
+                    let trimmed = before.trim_end();
+                    let cut = trimmed
+                        .rfind(char::is_whitespace)
+                        .map(|index| index + 1)
+                        .unwrap_or(0);
+                    self.input.replace_range(cut..self.input_cursor, "");
+                    self.input_cursor = cut;
+                }
+                KeyCode::Char('j') => {
+                    self.input.insert(self.input_cursor, '\n');
+                    self.input_cursor += 1;
+                }
                 _ => {}
             }
             return false;
@@ -892,9 +1696,25 @@ impl DaemonApp {
         match key.code {
             KeyCode::Esc => {
                 self.composing = false;
-                self.status = "editor closed".into();
+                if self.new_task {
+                    self.new_task = false;
+                    self.input.clear();
+                    self.input_cursor = 0;
+                    self.status = "new task cancelled".into();
+                } else {
+                    self.status = "editor closed".into();
+                }
+            }
+            KeyCode::Enter
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    || key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.input.insert(self.input_cursor, '\n');
+                self.input_cursor += 1;
             }
             KeyCode::Enter => self.send_message(),
+            KeyCode::Up => self.history_previous(),
+            KeyCode::Down => self.history_next(),
             KeyCode::Backspace => {
                 if let Some((index, _)) = self.input[..self.input_cursor].char_indices().last() {
                     self.input.remove(index);
@@ -930,6 +1750,9 @@ impl DaemonApp {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if self.setup.is_some() {
+            return self.setup_key(key);
+        }
         if self.terminal_focus {
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
                 self.terminal_focus = false;
@@ -948,8 +1771,9 @@ impl DaemonApp {
 
         if !self.approvals.is_empty() {
             match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => self.respond_approval(true),
+                KeyCode::Char('y') => self.respond_approval(true),
                 KeyCode::Char('n') | KeyCode::Esc => self.respond_approval(false),
+                KeyCode::Char('?') => self.show_help = !self.show_help,
                 _ => {}
             }
             return false;
@@ -959,6 +1783,19 @@ impl DaemonApp {
             return self.compose_key(key);
         }
 
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            if self.selected_state() == "running" {
+                self.interrupt_task();
+            } else {
+                self.status = "press q to quit, or Enter to write".into();
+            }
+            return false;
+        }
+        if key.code == KeyCode::Esc && self.selected_state() == "running" {
+            self.interrupt_task();
+            return false;
+        }
+
         match key.code {
             KeyCode::Char('q') => {
                 self.close_terminal();
@@ -966,25 +1803,55 @@ impl DaemonApp {
             }
             KeyCode::Enter | KeyCode::Char('i') => self.enter_compose(),
             KeyCode::Char('?') => self.show_help = !self.show_help,
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !self.tasks.is_empty() {
-                    self.selected_task = (self.selected_task + 1).min(self.tasks.len() - 1);
+            KeyCode::Char('j') | KeyCode::Down => self.select_task(1),
+            KeyCode::Char('k') | KeyCode::Up => self.select_task(-1),
+            KeyCode::Char('g') => self.select_task_to(0),
+            KeyCode::Char('G') => {
+                let last = self.tasks.len().saturating_sub(1);
+                self.select_task_to(last);
+            }
+            KeyCode::PageUp => {
+                self.auto_scroll = false;
+                self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(10);
+            }
+            KeyCode::PageDown => {
+                self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(10);
+                if self.scroll_from_bottom == 0 {
+                    self.auto_scroll = true;
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.selected_task = self.selected_task.saturating_sub(1);
-            }
-            KeyCode::Char('g') => self.selected_task = 0,
-            KeyCode::Char('G') => {
-                self.selected_task = self.tasks.len().saturating_sub(1);
+            KeyCode::End => {
+                self.auto_scroll = true;
+                self.scroll_from_bottom = 0;
             }
             KeyCode::Char('f') => self.follow = !self.follow,
+            KeyCode::Char('v') => {
+                self.show_events = !self.show_events;
+                self.status = if self.show_events {
+                    "event inspector on".into()
+                } else {
+                    "event inspector off".into()
+                };
+            }
             KeyCode::Char('r') => {
                 if let Err(err) = self.reload_tasks() {
                     self.status = format!("reload failed: {err}");
                 }
             }
-            KeyCode::Char('n') => self.create_task(),
+            KeyCode::Char('n') => {
+                self.new_task = true;
+                self.composing = true;
+                self.input.clear();
+                self.input_cursor = 0;
+                self.status = "new task: describe the challenge, Enter starts it".into();
+            }
+            KeyCode::Char('p') => self.open_setup(),
+            KeyCode::Char('/') => {
+                self.composing = true;
+                self.input = "/".into();
+                self.input_cursor = 1;
+                self.status = "command: /new /provider /terminal /approvals /help".into();
+            }
             KeyCode::Char('x') => self.cancel_task(),
             KeyCode::Char('s') => self.interrupt_task(),
             KeyCode::Char('a') => {
@@ -1001,35 +1868,6 @@ impl DaemonApp {
             _ => {}
         }
         false
-    }
-
-    fn create_task(&mut self) {
-        let result = self.client.request(
-            methods::TASK_CREATE,
-            json!({
-                "goal": "Interactive session",
-                "demo": "session",
-                "provider": "scripted",
-                "interactive": true,
-                "stream": true
-            }),
-        );
-        match result {
-            Ok(snapshot) => {
-                self.status = format!(
-                    "created {}",
-                    snapshot
-                        .get("task_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("?")
-                );
-                if let Err(err) = self.reload_tasks() {
-                    self.status = format!("reload failed: {err}");
-                }
-                self.selected_task = self.tasks.len().saturating_sub(1);
-            }
-            Err(err) => self.status = format!("create failed: {err}"),
-        }
     }
 
     fn cancel_task(&mut self) {
@@ -1092,22 +1930,29 @@ impl DaemonApp {
     }
 
     fn draw(&self, frame: &mut ratatui::Frame) {
+        let task_height = (self.tasks.len().min(5) as u16 + 2).max(3);
         let areas = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
-                Constraint::Length(7),
+                Constraint::Length(task_height),
                 Constraint::Min(1),
-                Constraint::Length(3),
+                Constraint::Length(5),
                 Constraint::Length(1),
             ])
             .split(frame.area());
 
         let header = Paragraph::new(format!(
-            "mskd  {}  tasks {}  follow {}\n{}",
+            "MitnickSolve  {}  ·  {} / {} / effort {}  ·  {} task(s)\n{}",
             self.root.display(),
+            self.provider,
+            if self.model.is_empty() {
+                "-"
+            } else {
+                &self.model
+            },
+            self.effort,
             self.tasks.len(),
-            if self.follow { "on" } else { "off" },
             self.status
         ))
         .block(Block::default().borders(Borders::ALL).title("session"));
@@ -1173,10 +2018,15 @@ impl DaemonApp {
             return;
         }
 
-        let panes = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
-            .split(areas[2]);
+        let (conversation_area, event_area) = if self.show_events {
+            let panes = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
+                .split(areas[2]);
+            (panes[0], Some(panes[1]))
+        } else {
+            (areas[2], None)
+        };
 
         let task_id = self.selected_task_id();
         let mut transcript: Vec<Line> = Vec::new();
@@ -1188,6 +2038,7 @@ impl DaemonApp {
             let (label, style) = match line.role {
                 ChatRole::User => ("you: ", Style::default().fg(Color::Cyan)),
                 ChatRole::Assistant => ("agent: ", Style::default().fg(Color::White)),
+                ChatRole::Tool => ("tool: ", Style::default().fg(Color::Yellow)),
                 ChatRole::System => (
                     "",
                     Style::default()
@@ -1215,10 +2066,34 @@ impl DaemonApp {
             transcript.push(Line::from(""));
         }
         if transcript.is_empty() {
+            let hint = if self.tasks.is_empty() {
+                "Welcome. Describe the challenge below and press Enter to start a task."
+            } else {
+                "No messages yet. Press Enter or i to write the first turn."
+            };
             transcript.push(Line::from(Span::styled(
-                "No transcript in this TUI session. Press Enter or i to send a message.",
+                hint,
                 Style::default().fg(Color::DarkGray),
             )));
+            transcript.push(Line::from(""));
+            transcript.push(Line::from(Span::styled(
+                "Examples:  inspect ./challenge and find the flag  ·  run the binary and explain the exploit",
+                Style::default().fg(Color::DarkGray),
+            )));
+            transcript.push(Line::from(Span::styled(
+                "Commands:  /new  /provider openai  /terminal  /approvals  /help",
+                Style::default().fg(Color::DarkGray),
+            )));
+            transcript.push(Line::from(Span::styled(
+                "Press p to choose provider, model and effort; /setup does the same.",
+                Style::default().fg(Color::DarkGray),
+            )));
+            if self.provider == "scripted-demo" {
+                transcript.push(Line::from(Span::styled(
+                    "Offline demo provider: replies are canned. Use /provider openai for a real model.",
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
         }
         let transcript_title = match (&task_id, self.selected_state()) {
             (Some(id), state) => format!("conversation — {id} [{state}]"),
@@ -1227,63 +2102,89 @@ impl DaemonApp {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(transcript_title);
-        let inner = block.inner(panes[0]);
-        frame.render_widget(block, panes[0]);
+        let inner = block.inner(conversation_area);
+        frame.render_widget(block, conversation_area);
         let paragraph = Paragraph::new(Text::from(transcript)).wrap(Wrap { trim: false });
         if inner.width > 0 && inner.height > 0 {
             let line_count = paragraph.line_count(inner.width);
-            let scroll = line_count.saturating_sub(inner.height as usize);
+            let max_scroll = line_count.saturating_sub(inner.height as usize);
+            let scroll = if self.auto_scroll {
+                max_scroll
+            } else {
+                max_scroll.saturating_sub(self.scroll_from_bottom as usize)
+            };
             frame.render_widget(
                 paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
                 inner,
             );
         }
 
-        let visible = self.selected_events();
-        let event_items: Vec<ListItem> = visible
-            .iter()
-            .rev()
-            .take(400)
-            .map(|index| {
-                let (_, event) = &self.events[*index];
-                ListItem::new(format!(
-                    "{}  {:<18} {}",
-                    short_time(&event.ts),
-                    event.kind,
-                    summarize(event, 60)
-                ))
-            })
-            .collect();
-        let event_list =
-            List::new(event_items).block(Block::default().borders(Borders::ALL).title("events"));
-        frame.render_widget(event_list, panes[1]);
+        if let Some(event_area) = event_area {
+            let visible = self.selected_events();
+            let event_items: Vec<ListItem> = visible
+                .iter()
+                .rev()
+                .take(400)
+                .map(|index| {
+                    let (_, event) = &self.events[*index];
+                    ListItem::new(format!(
+                        "{}  {:<18} {}",
+                        short_time(&event.ts),
+                        event.kind,
+                        summarize(event, 60)
+                    ))
+                })
+                .collect();
+            let event_list = List::new(event_items)
+                .block(Block::default().borders(Borders::ALL).title("events"));
+            frame.render_widget(event_list, event_area);
+        }
 
-        let input_title = match (&task_id, self.selected_state()) {
-            (Some(id), state) => format!("message to {id} [{state}]"),
-            (None, _) => "message".to_string(),
+        let input_title = if self.new_task || task_id.is_none() {
+            format!("new task — provider {}", self.provider)
+        } else {
+            match (&task_id, self.selected_state()) {
+                (Some(id), state) => format!("message to {id} [{state}]"),
+                (None, _) => "message".to_string(),
+            }
         };
         let input_block = Block::default().borders(Borders::ALL).title(input_title);
         let input_inner = input_block.inner(areas[3]);
         frame.render_widget(input_block, areas[3]);
         if self.composing {
-            let cursor_chars = self.input[..self.input_cursor].chars().count();
-            let available = input_inner.width.saturating_sub(2).max(1) as usize;
-            let start = cursor_chars.saturating_sub(available.saturating_sub(1));
-            let visible: String = self.input.chars().skip(start).collect();
-            let display = format!("> {visible}");
-            frame.render_widget(Paragraph::new(display), input_inner);
+            let before = &self.input[..self.input_cursor];
+            let row = before.matches('\n').count();
+            let line_start = before.rfind('\n').map(|index| index + 1).unwrap_or(0);
+            let cursor_cols = UnicodeWidthStr::width(&self.input[line_start..self.input_cursor]);
+            let lines: Vec<&str> = self.input.split('\n').collect();
+            let visible_rows = input_inner.height.max(1) as usize;
+            let start_line = row.saturating_sub(visible_rows.saturating_sub(1));
+            let display = lines
+                .iter()
+                .skip(start_line)
+                .take(visible_rows)
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n");
+            let display = if display.is_empty() {
+                "Describe the challenge…".to_string()
+            } else {
+                display
+            };
+            frame.render_widget(Paragraph::new(format!("> {display}")), input_inner);
             if input_inner.width > 2 && input_inner.height > 0 {
-                let x = input_inner.x + 2 + (cursor_chars - start) as u16;
+                let x = input_inner.x + 2 + (cursor_cols as u16);
+                let y = input_inner.y + (row - start_line) as u16;
                 frame.set_cursor_position((
                     x.min(input_inner.right().saturating_sub(1)),
-                    input_inner.y,
+                    y.min(input_inner.bottom().saturating_sub(1)),
                 ));
             }
         } else {
-            let hint = if task_id.is_some() {
-                "press Enter or i to write"
+            let hint = if self.new_task || task_id.is_none() {
+                "Describe the challenge…  (Enter starts a task, / commands)"
             } else {
-                "select or create a task"
+                "press Enter or i to write  ·  / commands"
             };
             frame.render_widget(
                 Paragraph::new(format!("> {hint}")).style(Style::default().fg(Color::DarkGray)),
@@ -1294,9 +2195,15 @@ impl DaemonApp {
         let footer = if !self.approvals.is_empty() {
             "APPROVAL PENDING: y approve  n deny"
         } else if self.composing {
-            "Enter send  Esc close editor  ←/→ move  Ctrl+U clear  Ctrl+C cancel"
+            if self.new_task || task_id.is_none() {
+                "Enter start task  Esc cancel  Shift+Enter newline  / commands"
+            } else {
+                "Enter send  Shift+Enter newline  Esc close editor  Ctrl+U clear  / commands"
+            }
+        } else if self.selected_state() == "running" {
+            "running · Esc interrupt · Enter/i message · / commands · PgUp/PgDn scroll · ? help · q quit"
         } else {
-            "Enter/i message  s interrupt  n new  x cancel  a approvals  t terminal  j/k task  r reload  q quit  ? help"
+            "Enter/i message  n new  / commands  PgUp/PgDn scroll  v events  j/k task  s interrupt  t terminal  ? help  q quit"
         };
         frame.render_widget(Paragraph::new(footer), areas[4]);
 
@@ -1331,6 +2238,10 @@ impl DaemonApp {
             frame.render_widget(help, area);
         }
 
+        if self.setup.is_some() {
+            self.draw_setup(frame);
+        }
+
         if let Some(pending) = self.approvals.first() {
             let task_id = pending
                 .get("task_id")
@@ -1350,11 +2261,10 @@ impl DaemonApp {
                 "tool: {tool}\nreason: {reason}\n\nargs:\n{args}\n\n[y] approve   [n] deny"
             );
             let paragraph = Paragraph::new(text)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!("approval required — {task_id} #{id}")),
-                )
+                .block(Block::default().borders(Borders::ALL).title(format!(
+                    "approval required — {task_id} #{id}  (1/{})",
+                    self.approvals.len()
+                )))
                 .wrap(Wrap { trim: false });
             frame.render_widget(paragraph, area);
         }
@@ -1365,49 +2275,305 @@ fn run_daemon(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     root: PathBuf,
     refresh_ms: u64,
+    provider: Option<String>,
+    setup: bool,
+    setup_step: Option<String>,
 ) -> Result<()> {
-    let mut app = DaemonApp::connect(root, refresh_ms)?;
+    let mut app = DaemonApp::connect(root, refresh_ms, provider)?;
+    if setup {
+        app.open_setup();
+        open_setup_step(&mut app, setup_step.as_deref());
+    }
     loop {
         app.refresh()?;
+        if app.quit_requested {
+            return Ok(());
+        }
         terminal.draw(|frame| app.draw(frame))?;
         let poll_ms = if app.terminal_focus {
             50
         } else {
             app.refresh_ms
         };
-        if event::poll(Duration::from_millis(poll_ms))?
-            && let CrosstermEvent::Key(key) = event::read()?
-            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-            && app.handle_key(key)
-        {
-            return Ok(());
+        if event::poll(Duration::from_millis(poll_ms))? {
+            match event::read()? {
+                CrosstermEvent::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    if app.handle_key(key) {
+                        return Ok(());
+                    }
+                }
+                CrosstermEvent::Paste(text) => app.handle_paste(&text),
+                _ => {}
+            }
         }
     }
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let provider = cli
+        .provider
+        .clone()
+        .or_else(|| std::env::var("MSK_PROVIDER").ok());
+
+    if cli.doctor {
+        return doctor(&cli, &provider);
+    }
+    let daemon_root = if cli.events.is_none() {
+        let root = cli.connect.clone().unwrap_or_else(|| cli.root.clone());
+        let root = msk_ipc::normalize_root(&root);
+        ensure_daemon(&root, cli.no_autostart || cli.connect.is_some())?;
+        Some(root)
+    } else {
+        None
+    };
+
+    if cli.snapshot {
+        let root = daemon_root.as_ref().context("--snapshot needs a daemon")?;
+        return snapshot_daemon(root, provider, cli.setup, cli.setup_step.clone());
+    }
 
     enable_raw_mode()?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen)?;
+    execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = if let Some(root) = cli.connect.clone() {
-        run_daemon(&mut terminal, root, cli.refresh_ms)
-    } else {
-        run(&mut terminal, cli)
+    let result = match (cli.events.clone(), daemon_root) {
+        (Some(events), _) => run_log(&mut terminal, events, cli.refresh_ms),
+        (None, Some(root)) => run_daemon(
+            &mut terminal,
+            root,
+            cli.refresh_ms,
+            provider,
+            cli.setup,
+            cli.setup_step.clone(),
+        ),
+        (None, None) => unreachable!("daemon root is set when no event log is given"),
     };
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     result
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cli: Cli) -> Result<()> {
-    let mut app = App::new(cli.events);
+fn snapshot_daemon(
+    root: &Path,
+    provider: Option<String>,
+    setup: bool,
+    setup_step: Option<String>,
+) -> Result<()> {
+    let mut app = DaemonApp::connect(root.to_path_buf(), 100, provider)?;
+    let _ = app.refresh();
+    if setup {
+        app.open_setup();
+        open_setup_step(&mut app, setup_step.as_deref());
+    }
+    app.auto_scroll = false;
+    app.scroll_from_bottom = 10_000;
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.draw(|frame| app.draw(frame))?;
+    let buffer = terminal.backend().buffer();
+    for y in 0..buffer.area.height {
+        let mut line = String::new();
+        for x in 0..buffer.area.width {
+            line.push_str(buffer[(x, y)].symbol());
+        }
+        println!("{}", line.trim_end());
+    }
+    Ok(())
+}
+
+fn doctor(cli: &Cli, provider: &Option<String>) -> Result<()> {
+    let root = cli.connect.clone().unwrap_or_else(|| cli.root.clone());
+    let root = msk_ipc::normalize_root(&root);
+    println!("root: {}", root.display());
+    println!(
+        "daemon: {}",
+        if daemon_reachable(&root) {
+            "reachable"
+        } else {
+            "not running"
+        }
+    );
+    let config = TuiConfig::load(&root);
+    let provider = provider.clone().unwrap_or(config.provider);
+    println!("provider: {provider}");
+    let envd = std::env::var("MSK_ENVD")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            sibling_binary(if cfg!(windows) { "envd.exe" } else { "envd" }).or_else(|| {
+                sibling_binary(if cfg!(windows) {
+                    "msk-envd.exe"
+                } else {
+                    "msk-envd"
+                })
+            })
+        });
+    println!(
+        "envd: {}",
+        envd.as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "not found (set MSK_ENVD)".into())
+    );
+    let tools = tools_dir();
+    println!(
+        "tools: {} ({})",
+        tools.display(),
+        if tools.exists() { "ok" } else { "missing" }
+    );
+    let model = if config.model.is_empty() {
+        std::env::var("MSK_LLM_MODEL").unwrap_or_else(|_| "-".into())
+    } else {
+        config.model.clone()
+    };
+    let effort = if config.effort.is_empty() {
+        "default".to_string()
+    } else {
+        config.effort.clone()
+    };
+    let base = if config.base_url.is_empty() {
+        std::env::var("MSK_LLM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into())
+    } else {
+        config.base_url.clone()
+    };
+    let key = std::env::var("MSK_LLM_API_KEY").is_ok();
+    println!(
+        "llm: model={model} effort={effort} base={base} key={}",
+        if key { "set" } else { "missing" }
+    );
+    if provider == "openai" || provider == "openai-responses" {
+        if model == "-" || !key {
+            println!(
+                "hint: export MSK_LLM_MODEL, MSK_LLM_API_KEY, and optionally MSK_LLM_BASE_URL"
+            );
+        }
+    } else {
+        println!("hint: offline provider is ready; use /demo for a tool demo");
+    }
+    Ok(())
+}
+
+fn tools_dir() -> PathBuf {
+    if let Ok(path) = std::env::var("MSK_TOOLS_DIR") {
+        return PathBuf::from(path);
+    }
+    let relative = PathBuf::from("tools/wasm");
+    if relative.exists() {
+        return relative;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors().skip(1).take(4) {
+            let candidate = ancestor.join("tools/wasm");
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    relative
+}
+
+fn open_setup_step(app: &mut DaemonApp, step: Option<&str>) {
+    let Some(step) = step else {
+        return;
+    };
+    let Some(setup) = app.setup.as_mut() else {
+        return;
+    };
+    setup.step = match step {
+        "provider" => SetupStep::Provider,
+        "model" => SetupStep::Model,
+        "effort" => SetupStep::Effort,
+        _ => SetupStep::BaseUrl,
+    };
+}
+
+fn sibling_binary(name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let candidate = exe.with_file_name(name);
+    candidate.exists().then_some(candidate)
+}
+
+fn ensure_daemon(root: &Path, no_autostart: bool) -> Result<()> {
+    if daemon_reachable(root) {
+        return Ok(());
+    }
+    if no_autostart {
+        bail!(
+            "no mskd is listening at {}; start mskd or omit --no-autostart",
+            root.display()
+        );
+    }
+    let daemon = sibling_binary(if cfg!(windows) { "mskd.exe" } else { "mskd" })
+        .context("mskd is not next to msk-tui; run `cargo build --bins`")?;
+    let envd = sibling_binary(if cfg!(windows) { "envd.exe" } else { "envd" })
+        .or_else(|| {
+            sibling_binary(if cfg!(windows) {
+                "msk-envd.exe"
+            } else {
+                "msk-envd"
+            })
+        })
+        .context("envd is not next to msk-tui; build tools/envd first")?;
+    if !root.exists() {
+        std::fs::create_dir_all(root)
+            .with_context(|| format!("create daemon root {}", root.display()))?;
+    }
+    let log_path = root.join("mskd.log");
+    let log = File::create(&log_path).with_context(|| format!("create {}", log_path.display()))?;
+    let errlog = log.try_clone()?;
+    let mut child = Command::new(&daemon)
+        .arg("--root")
+        .arg(root)
+        .arg("--envd")
+        .arg(&envd)
+        .arg("--tools-dir")
+        .arg(tools_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(errlog))
+        .spawn()
+        .with_context(|| format!("start {}", daemon.display()))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if daemon_reachable(root) {
+            return Ok(());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            bail!(
+                "mskd exited during startup ({status}); see {}",
+                log_path.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    bail!(
+        "mskd did not become ready within 10s; see {}",
+        log_path.display()
+    )
+}
+
+fn daemon_reachable(root: &Path) -> bool {
+    Client::connect(root)
+        .and_then(|mut client| client.hello())
+        .is_ok()
+}
+
+fn run_log(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    events: PathBuf,
+    refresh_ms: u64,
+) -> Result<()> {
+    let mut app = App::new(events);
     // Load any existing events before the first draw.
     let _ = app.refresh();
 
@@ -1415,7 +2581,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, cli: Cli) -> Result<()
         app.refresh()?;
         terminal.draw(|frame| app.draw(frame))?;
 
-        if event::poll(Duration::from_millis(cli.refresh_ms))?
+        if event::poll(Duration::from_millis(refresh_ms))?
             && let CrosstermEvent::Key(key) = event::read()?
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             && app.handle_key(key)
@@ -1625,6 +2791,24 @@ fn detail_text(event: &Event) -> String {
     lines.join("\n")
 }
 
+fn observation_summary(data: &Value) -> Option<String> {
+    let observation = data.get("observation")?;
+    if let Some(text) = observation.as_str() {
+        if let Ok(value) = serde_json::from_str::<Value>(text) {
+            return Some(compact_json(&value, 120));
+        }
+        return Some(truncate(text, 120));
+    }
+    Some(compact_json(observation, 120))
+}
+
+fn compact_json(value: &Value, max_chars: usize) -> String {
+    truncate(
+        &serde_json::to_string(value).unwrap_or_else(|_| "null".into()),
+        max_chars,
+    )
+}
+
 fn truncate(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         value.to_string()
@@ -1730,7 +2914,8 @@ mod tests {
         let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
             return;
         };
-        let mut app = DaemonApp::connect(PathBuf::from(root), 100).unwrap();
+        let mut app =
+            DaemonApp::connect(PathBuf::from(root), 100, Some("scripted".into())).unwrap();
         let created = app
             .client
             .request(
@@ -1800,12 +2985,64 @@ mod tests {
 
     #[test]
     #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn daemon_setup_saves_model_and_effort() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app = DaemonApp::connect(PathBuf::from(root), 100, Some("openai".into())).unwrap();
+        app.model.clear();
+        app.effort = "default".into();
+        app.open_setup();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_key(enter); // provider -> model
+        app.handle_key(enter); // custom model -> text input
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for character in "gpt-5".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(enter); // model -> effort
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(enter); // effort -> base URL
+        app.handle_key(enter); // save
+        assert!(app.setup.is_none());
+        assert_eq!(app.model, "gpt-5");
+        assert_eq!(app.effort, "minimal");
+        assert!(app.root.join("tui-config.json").exists());
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn daemon_setup_modal_draws() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app =
+            DaemonApp::connect(PathBuf::from(root), 100, Some("scripted-demo".into())).unwrap();
+        app.open_setup();
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(content.contains("setup"));
+        assert!(content.contains("scripted-demo"));
+        assert!(content.contains("MSK_LLM_API_KEY"));
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
     fn daemon_chat_draws_transcript() {
         let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
             return;
         };
-        let mut app = DaemonApp::connect(PathBuf::from(root), 100).unwrap();
-        app.create_task();
+        let mut app =
+            DaemonApp::connect(PathBuf::from(root), 100, Some("scripted".into())).unwrap();
+        app.create_task_with_goal("Interactive session", false);
         for _ in 0..100 {
             let _ = app.refresh();
             let _ = app.reload_tasks();

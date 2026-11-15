@@ -148,6 +148,33 @@ M0 scaffold plus the P1 session/turn slice:
   `exec.session` is granted by the kernel and checked in `EnvHost`.
 - Service-mode envd, persistence/replay, and multi-agent are next.
 
+## Quick start
+
+```sh
+cargo build --bins
+(cd tools/envd && go build -o ../../target/debug/envd ./cmd/envd)
+target/debug/msk
+```
+
+`msk` with no arguments opens the interactive terminal app and starts a local
+`mskd` if needed. With no API key it uses the offline `scripted-demo` provider;
+type a message and press Enter to create a task, or `/demo` for the canned tool
+demo. Press `p` (or `/setup`) to choose provider, model and reasoning effort;
+`/provider openai` is the quick switch. See [`docs/tui.md`](docs/tui.md) for
+keys, slash commands, approvals, history, diagnostics, and troubleshooting.
+
+For a guided mock-model demo:
+
+```powershell
+./scripts/demo.ps1        # Windows
+```
+```sh
+./scripts/demo.sh         # Linux/macOS
+```
+
+Both start a local OpenAI-compatible mock and open the TUI; type `exec`, press
+Enter, and approve with `y` to see a real tool round trip.
+
 ## Build
 
 ```sh
@@ -393,10 +420,13 @@ The demo writes events to `.msk/events.jsonl`. Inspect them with the TUI:
 cargo run -p msk-tui -- --events .msk/events.jsonl
 ```
 
-TUI keys: `q` quit, `j`/`k` move, `g`/`G` top/bottom, `tab` cycle filters,
-`1..5` all/llm/tools/artifacts/context, `/` search, `f` follow, `r` reload,
-`?` help. The viewer reads the JSONL log incrementally and shows the selected
-event's full payload, including `data.put` artifact metadata.
+Event-viewer keys: `q` quit, `j`/`k` move, `g`/`G` top/bottom, `tab` cycle
+filters, `1..5` all/llm/tools/artifacts/context, `/` search, `f` follow, `r`
+reload, `?` help. The viewer reads the JSONL log incrementally and shows the
+selected event's full payload, including `data.put` artifact metadata.
+
+For the conversational app, see [`docs/tui.md`](docs/tui.md). `msk` with no
+arguments opens it directly and starts `mskd` when needed.
 
 ## Daemon mode
 
@@ -409,6 +439,9 @@ target/debug/mskctl --root .msk create --goal "Create a shell, run echo hi, and 
 target/debug/mskctl --root .msk watch --timeout-ms 5000
 target/debug/msk-tui --connect .msk
 ```
+
+`msk-tui` without `--connect` uses `.msk` and auto-starts `mskd`; this is what
+`msk` with no arguments does. The daemon remains running after the TUI exits.
 
 `mskd` writes a per-root token to `.msk/ipc.token`; `mskctl` and the TUI read it
 automatically. On Unix the socket and token are mode 0600; Windows named pipes
@@ -523,6 +556,27 @@ checks:
 The process exits non-zero if any case fails, so it can gate CI. Real-model
 evaluation can point cases at the daemon's configured `openai`/`responses`
 provider instead of `scripted-demo`.
+
+## Precompiled WASM cache
+
+WASM tools are compiled from WAT/WASM at startup. For repeated runs you can opt
+into wasmtime's platform-specific precompiled modules (`.cwasm`):
+
+```sh
+target/debug/msk --wasm-cache .msk/wasm-cache --envd ... --session
+target/debug/mskd --wasm-cache .msk/wasm-cache --envd ... --tools-dir tools/wasm
+```
+
+`MSK_WASM_CACHE` is the environment equivalent and is also honored inside tasks.
+The cache key is the source SHA-256 plus wasmtime's precompile-compatibility
+hash, so it is specific to this OS/CPU/wasmtime build. A missing, stale, or
+corrupt artifact falls back to compiling the source and is replaced. Cache
+files are not portable between platforms.
+
+The cache is a local trusted artifact: wasmtime deserialization assumes the file
+was produced by a compatible engine. Keep the directory private to the user
+running the kernel (files are written 0600 on Unix); do not point it at a
+shared or attacker-writable directory.
 
 ## Layout
 

@@ -282,7 +282,10 @@ fn create_task(app: &App, body: &[u8]) -> ApiResult {
         .get("provider")
         .and_then(Value::as_str)
         .unwrap_or("scripted");
-    if !matches!(provider, "scripted" | "openai" | "responses" | "component") {
+    if !matches!(
+        provider,
+        "scripted" | "scripted-demo" | "openai" | "responses" | "openai-responses" | "component"
+    ) {
         return Err((400, "unsupported provider".to_string()));
     }
     let interactive = body
@@ -306,6 +309,33 @@ fn create_task(app: &App, body: &[u8]) -> ApiResult {
         "headless": headless,
         "approvals": approvals
     });
+    if let Some(model) = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        params["model"] = json!(model);
+    }
+    if let Some(effort) = body
+        .get("effort")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !matches!(effort, "minimal" | "low" | "medium" | "high") {
+            return Err((400, "effort must be minimal, low, medium, or high".into()));
+        }
+        params["effort"] = json!(effort);
+    }
+    if let Some(base_url) = body
+        .get("base_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        params["base_url"] = json!(base_url);
+    }
     if let Some(tokens) = body.get("max_context_tokens").and_then(Value::as_u64) {
         if !(1_000..=10_000_000).contains(&tokens) {
             return Err((

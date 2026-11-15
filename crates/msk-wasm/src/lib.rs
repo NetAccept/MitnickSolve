@@ -6,11 +6,14 @@
 //! A guest may import `msk.tool_call` to reach the kernel's gated host bridge
 //! (M0: envd `exec`). Fresh stores, fuel, and a memory cap are applied per call.
 
-use std::path::Path;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use msk_core::Capability;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use wasmtime::{
     Caller, Config, Engine, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
 };
@@ -96,6 +99,40 @@ pub trait WasmToolRuntime: Send + Sync {
     ) -> Result<Vec<u8>, WasmError>;
 }
 
+fn cache_key(engine: &Engine, bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let source = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let mut hasher = DefaultHasher::new();
+    engine.precompile_compatibility_hash().hash(&mut hasher);
+    format!("{source}-{:016x}", hasher.finish())
+}
+
+fn write_cache(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temporary, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::fs::remove_file(path);
+    }
+    std::fs::rename(&temporary, path)
+}
+
 struct HostState {
     host: Arc<dyn ToolHost>,
     ctx: ToolContext,
@@ -111,9 +148,63 @@ pub struct WasmtimeRuntime {
 
 impl WasmtimeRuntime {
     pub fn from_file(host: Arc<dyn ToolHost>, path: impl AsRef<Path>) -> Result<Self, WasmError> {
+        let cache = std::env::var_os("MSK_WASM_CACHE").map(PathBuf::from);
+        Self::from_file_with_cache(host, path, cache.as_deref())
+    }
+
+    /// Loads a module, optionally using a platform-specific wasmtime
+    /// precompiled cache. The cache key covers the source bytes and wasmtime's
+    /// precompile compatibility hash; a stale or corrupted cache falls back to
+    /// compiling the source.
+    pub fn from_file_with_cache(
+        host: Arc<dyn ToolHost>,
+        path: impl AsRef<Path>,
+        cache_dir: Option<&Path>,
+    ) -> Result<Self, WasmError> {
         let bytes =
             std::fs::read(path.as_ref()).map_err(|err| WasmError::Engine(err.to_string()))?;
-        Self::from_bytes(host, &bytes)
+        let mut config = Config::new();
+        config.consume_fuel(true);
+        let engine = Engine::new(&config).map_err(|err| WasmError::Engine(err.to_string()))?;
+        let env_cache = std::env::var_os("MSK_WASM_CACHE").map(PathBuf::from);
+        let cache_dir = cache_dir.or(env_cache.as_deref());
+        if let Some(cache_dir) = cache_dir {
+            let key = cache_key(&engine, &bytes);
+            let cache_path = cache_dir.join(format!("{key}.cwasm"));
+            if let Ok(cached) = std::fs::read(&cache_path) {
+                // SAFETY: this path is inside the kernel-owned cache directory.
+                // wasmtime validates the artifact's engine compatibility; the
+                // filename includes the source hash and compatibility hash.
+                if let Ok(module) = unsafe { Module::deserialize(&engine, &cached) } {
+                    return Ok(Self {
+                        engine,
+                        module,
+                        host,
+                        fuel: DEFAULT_FUEL,
+                    });
+                }
+                let _ = std::fs::remove_file(&cache_path);
+            }
+            let module =
+                Module::new(&engine, &bytes).map_err(|err| WasmError::Engine(err.to_string()))?;
+            if let Ok(serialized) = module.serialize() {
+                let _ = write_cache(&cache_path, &serialized);
+            }
+            return Ok(Self {
+                engine,
+                module,
+                host,
+                fuel: DEFAULT_FUEL,
+            });
+        }
+        let module =
+            Module::new(&engine, &bytes).map_err(|err| WasmError::Engine(err.to_string()))?;
+        Ok(Self {
+            engine,
+            module,
+            host,
+            fuel: DEFAULT_FUEL,
+        })
     }
 
     pub fn from_wat(host: Arc<dyn ToolHost>, wat: &str) -> Result<Self, WasmError> {
@@ -379,6 +470,37 @@ mod tests {
             .unwrap()
             .with_fuel(10_000);
         assert!(runtime.run(b"").is_err());
+    }
+
+    #[test]
+    fn precompiled_cache_roundtrip_falls_back_after_corruption() {
+        let dir = std::env::temp_dir().join(format!(
+            "msk-wasm-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("echo.wat");
+        std::fs::write(&source, ECHO_WAT).unwrap();
+        let cache = dir.join("cache");
+        let first =
+            WasmtimeRuntime::from_file_with_cache(Arc::new(NoopHost), &source, Some(&cache))
+                .unwrap();
+        assert_eq!(first.run(b"cached").unwrap(), b"cached");
+        let cached = std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(cached.len(), 1);
+        std::fs::write(&cached[0], b"corrupt").unwrap();
+        let second =
+            WasmtimeRuntime::from_file_with_cache(Arc::new(NoopHost), &source, Some(&cache))
+                .unwrap();
+        assert_eq!(second.run(b"rebuilt").unwrap(), b"rebuilt");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
