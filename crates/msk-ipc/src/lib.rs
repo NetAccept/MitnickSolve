@@ -426,6 +426,7 @@ pub mod methods {
     pub const APPROVAL_LIST: &str = "approval.list";
     pub const APPROVAL_RESPOND: &str = "approval.respond";
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
+    pub const EVENTS_QUERY: &str = "events.query";
     pub const TERMINAL_OPEN: &str = "terminal.open";
     pub const TERMINAL_WRITE: &str = "terminal.write";
     pub const TERMINAL_READ: &str = "terminal.read";

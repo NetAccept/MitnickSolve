@@ -85,6 +85,9 @@ M0 scaffold plus the P1 session/turn slice:
 - Conversational daemon TUI: task list, transcript, message editor, streamed
   assistant text, cooperative interrupt, and a live event pane. `n` creates an
   interactive task; `Enter`/`i` writes, `s` interrupts, `t` opens the PTY.
+- SQLite event index: `msk-store` indexes events by id/task/kind/seq. Start
+  mskd with `--store <path>` and query via `mskctl events` or
+  `msk-replay --db <path>`; duplicate ids from log replay are ignored.
 - Native context checkpoints: every session turn writes
   `<root>/checkpoint.json` (or `--checkpoint`) with the full message list,
   including native tool call/result pairs. `--resume-checkpoint` restores it
@@ -301,6 +304,7 @@ Inspect and validate an event log without executing anything:
 target/debug/msk-replay --events .msk/events.jsonl --check
 target/debug/msk-replay --events .msk/events.jsonl --task task-... --max-chars 4000
 target/debug/msk-replay --events .msk/events.jsonl --from-seq 100 --format jsonl
+target/debug/msk-replay --db .msk/store.db --task task-... --check
 ```
 
 The demo writes events to `.msk/events.jsonl`. Inspect them with the TUI:
@@ -318,7 +322,8 @@ event's full payload, including `data.put` artifact metadata.
 
 ```sh
 cargo build --bins -p msk-kernel -p msk-tui
-target/debug/mskd --root .msk --envd target/debug/envd --tools-dir tools/wasm
+target/debug/mskd --root .msk --store .msk/store.db \
+  --envd target/debug/envd --tools-dir tools/wasm
 target/debug/mskctl --root .msk list
 target/debug/mskctl --root .msk create --goal "Create a shell, run echo hi, and close it."
 target/debug/mskctl --root .msk watch --timeout-ms 5000
@@ -344,9 +349,13 @@ target/debug/mskctl --root .msk deny --task task-... --id 2
 target/debug/mskctl --root .msk bb-set finding '{"port":8080}'
 target/debug/mskctl --root .msk bb-get finding
 target/debug/mskctl --root .msk bb-list
+target/debug/mskctl --root .msk events --task task-... --limit 50
 target/debug/mskctl --root .msk watch --task task-...
 target/debug/mskctl --root .msk state task-...
 ```
+
+`mskctl events` and `msk-replay --db .msk/store.db` query the SQLite index;
+`--check` works on indexed events too.
 
 `task.message` is accepted only when the task is `waiting_input`; while a turn
 is running it returns an error instead of interleaving messages. `turn.end`
@@ -392,6 +401,7 @@ close); the control-plane `terminal-*` commands are convenient for scripting.
 | `crates/msk-data` | Content-addressed artifact store |
 | `crates/msk-llm` | LLM provider port and scripted provider |
 | `crates/msk-mcp` | MCP client and embedded stdio frame transport |
+| `crates/msk-store` | SQLite event index (open Store port) |
 | `crates/msk-secret` | Secret store port, env and memory backends |
 | `crates/msk-wasm` | WASM tool runtime boundary (stub) |
 | `crates/msk-loader` | Signed core component manifest/loader boundary |

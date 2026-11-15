@@ -25,6 +25,9 @@ struct Cli {
     /// Kernel state directory containing the socket and token.
     #[arg(long, default_value = ".msk")]
     root: PathBuf,
+    /// SQLite event index (optional).
+    #[arg(long)]
+    store: Option<PathBuf>,
     /// Path to the envd binary (embedded mode).
     #[arg(long)]
     envd: Option<PathBuf>,
@@ -239,6 +242,7 @@ struct Inner {
 
 struct Daemon {
     root: PathBuf,
+    store: Option<Arc<msk_store::SqliteStore>>,
     envd: Option<PathBuf>,
     envd_url: Option<String>,
     envd_token: Option<String>,
@@ -324,8 +328,16 @@ fn main() -> Result<()> {
     }
 
     let blackboard_path = root.join("blackboard.json");
+    let store = match &cli.store {
+        Some(path) => Some(Arc::new(
+            msk_store::SqliteStore::open(msk_ipc::normalize_root(path))
+                .context("open event store")?,
+        )),
+        None => None,
+    };
     let daemon = Arc::new(Daemon {
         root,
+        store,
         envd,
         envd_url,
         envd_token,
@@ -647,6 +659,10 @@ impl Daemon {
                     Err(err) => (RpcResponse::err(id, -32002, err.to_string()), None),
                 }
             }
+            methods::EVENTS_QUERY => match self.event_query(&params) {
+                Ok(value) => (RpcResponse::ok(id, value), None),
+                Err(err) => (RpcResponse::err(id, -32000, err.to_string()), None),
+            },
             methods::EVENTS_SUBSCRIBE => {
                 let task = params
                     .get("task_id")
@@ -1419,7 +1435,34 @@ impl Daemon {
         offset
     }
 
+    fn event_query(&self, params: &Value) -> Result<Value> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("event store is not configured"))?;
+        let query = msk_store::EventQuery {
+            task: params
+                .get("task_id")
+                .or_else(|| params.get("task"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            kind: params
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            from_seq: params.get("from_seq").and_then(Value::as_u64),
+            limit: params.get("limit").and_then(Value::as_u64).unwrap_or(1000) as usize,
+        };
+        let events = store.query(&query)?;
+        Ok(json!({"events": events, "count": events.len()}))
+    }
+
     fn record_event(&self, task_id: &str, event: Event) {
+        if let Some(store) = &self.store {
+            if let Err(err) = store.append(&event) {
+                eprintln!("mskd event store: {err}");
+            }
+        }
         if let Ok(mut inner) = self.inner.lock() {
             if let Some(task) = inner.tasks.get_mut(task_id) {
                 task.events += 1;

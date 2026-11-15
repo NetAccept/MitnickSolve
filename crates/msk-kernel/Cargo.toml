@@ -37,6 +37,7 @@ msk-llm.workspace = true
 msk-loader.workspace = true
 msk-mcp.workspace = true
 msk-secret.workspace = true
+msk-store.workspace = true
 msk-wasm.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -77,7 +77,8 @@ jobs:
           set -euo pipefail
           rm -rf .msk/ci
           mkdir -p .msk/ci
-          target/debug/mskd --root .msk/ci --envd target/debug/envd \
+          target/debug/mskd --root .msk/ci --store .msk/ci/store.db \
+            --envd target/debug/envd \
             --tools-dir tools/wasm \
             --component-manifest .msk/component-fixture/manifest.json \
             --component-trust .msk/component-fixture/trust.json \
@@ -124,3 +125,5 @@ jobs:
           [ "$(target/debug/mskctl --root .msk/ci state "$component_task" | jq -r .state)" = done ]
           target/debug/mskctl --root .msk/ci result "$component_task" \
             | jq -r .transcript | grep -q "component hello"
+          target/debug/mskctl --root .msk/ci events --task "$task" --limit 5 \
+            | jq -e '.count > 0'

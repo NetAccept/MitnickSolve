@@ -9,6 +9,7 @@ members = [
     "crates/msk-llm",
     "crates/msk-mcp",
     "crates/msk-secret",
+    "crates/msk-store",
     "crates/msk-wasm",
     "crates/msk-loader",
     "crates/msk-kernel",
@@ -33,6 +34,7 @@ msk-llm = { path = "crates/msk-llm" }
 msk-loader = { path = "crates/msk-loader" }
 msk-mcp = { path = "crates/msk-mcp" }
 msk-secret = { path = "crates/msk-secret" }
+msk-store = { path = "crates/msk-store" }
 msk-wasm = { path = "crates/msk-wasm" }
 
 anyhow = "1"

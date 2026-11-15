@@ -17,6 +17,9 @@ struct Cli {
     /// Event log produced by the kernel or mskd task.
     #[arg(long, default_value = ".msk/events.jsonl")]
     events: PathBuf,
+    /// Read from the daemon's SQLite event index instead of the JSONL file.
+    #[arg(long)]
+    db: Option<PathBuf>,
     /// Only include events for this task ID.
     #[arg(long)]
     task: Option<String>,
@@ -32,12 +35,27 @@ struct Cli {
     /// Transcript cap in characters; 0 leaves it unlimited.
     #[arg(long, default_value_t = 12_000)]
     max_chars: usize,
+    /// Maximum events to read from --db.
+    #[arg(long, default_value_t = 10_000)]
+    limit: usize,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let events =
-        read_events(&cli.events).with_context(|| format!("read {}", cli.events.display()))?;
+    let events = if let Some(db) = &cli.db {
+        let store =
+            msk_store::SqliteStore::open(db).with_context(|| format!("open {}", db.display()))?;
+        store
+            .query(&msk_store::EventQuery {
+                task: cli.task.clone(),
+                from_seq: cli.from_seq,
+                limit: cli.limit,
+                ..Default::default()
+            })
+            .with_context(|| format!("query {}", db.display()))?
+    } else {
+        read_events(&cli.events).with_context(|| format!("read {}", cli.events.display()))?
+    };
 
     if cli.check {
         let issues = check_events(&events);

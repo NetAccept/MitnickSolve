@@ -88,6 +88,17 @@ enum Command {
     BbSet { key: String, value: String },
     /// Cancel a running task.
     Cancel { task: String },
+    /// Query the daemon's SQLite event index.
+    Events {
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        from_seq: Option<u64>,
+        #[arg(long, default_value_t = 100)]
+        limit: u64,
+    },
     /// Subscribe to events and print notifications.
     Watch {
         #[arg(long)]
@@ -238,6 +249,25 @@ fn main() -> Result<()> {
         }
         Command::Cancel { task } => {
             let result = client.request(methods::TASK_CANCEL, json!({"task_id": task}))?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::Events {
+            task,
+            kind,
+            from_seq,
+            limit,
+        } => {
+            let mut params = json!({"limit": limit});
+            if let Some(task) = task {
+                params["task_id"] = json!(task);
+            }
+            if let Some(kind) = kind {
+                params["kind"] = json!(kind);
+            }
+            if let Some(from_seq) = from_seq {
+                params["from_seq"] = json!(from_seq);
+            }
+            let result = client.request(methods::EVENTS_QUERY, params)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Watch { task, timeout_ms } => {
