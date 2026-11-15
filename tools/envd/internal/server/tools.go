@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -104,12 +105,24 @@ func (s *Server) callTool(name string, raw json.RawMessage) toolResult {
 }
 
 func (s *Server) toolAgentInfo() toolResult {
+	isolation := map[string]any{
+		"mode":                "none",
+		"launcher_configured": s.sandboxConfigured(),
+	}
+	if s.sandboxConfigured() {
+		isolation["launcher"] = filepath.Base(s.opts.Sandbox[0])
+	}
+	if s.isolatedAvailable() {
+		isolation["mode"] = "launcher"
+	}
 	return okResult("envd "+Version, map[string]any{
-		"version":      Version,
-		"profile":      "dev",
-		"transport":    "embedded-stdio",
-		"capabilities": s.capabilities(),
-		"max_frame":    s.opts.MaxFrame,
+		"version":         Version,
+		"default_profile": "dev",
+		"profiles":        s.profiles(),
+		"transport":       s.transport,
+		"isolation":       isolation,
+		"capabilities":    s.capabilities(),
+		"max_frame":       s.opts.MaxFrame,
 	})
 }
 
@@ -132,7 +145,25 @@ func (s *Server) toolEnvCreate(raw json.RawMessage) toolResult {
 	switch args.Profile {
 	case "":
 		args.Profile = "dev"
-	case "dev", "host", "isolated":
+	case "dev":
+	case "host":
+		if s.transport == "embedded-stdio" {
+			return errResult(codeFailedPrecondition, "FAILED_PRECONDITION",
+				"host profile requires service transport; embedded-stdio only supports dev")
+		}
+	case "isolated":
+		if s.transport == "embedded-stdio" {
+			return errResult(codeFailedPrecondition, "FAILED_PRECONDITION",
+				"isolated profile requires service transport and --sandbox-command")
+		}
+		if !s.sandboxConfigured() {
+			return errResult(codeFailedPrecondition, "FAILED_PRECONDITION",
+				"isolated profile requires envd --sandbox-command/--sandbox-arg")
+		}
+		if err := ValidateSandbox(s.opts.Sandbox, s.opts.Root); err != nil {
+			return errResult(codeFailedPrecondition, "FAILED_PRECONDITION",
+				"sandbox launcher is unusable: "+err.Error())
+		}
 	default:
 		return errResult(codeInvalidArgument, "INVALID_ARGUMENT", "unknown profile: "+args.Profile)
 	}
@@ -155,7 +186,17 @@ func (s *Server) toolEnvCreate(raw json.RawMessage) toolResult {
 		return errResult(codeInternal, "INTERNAL", err.Error())
 	}
 
-	env := &Env{ID: id, Name: args.Name, Workspace: workspace, Profile: args.Profile}
+	isolation := "none"
+	if args.Profile == "isolated" {
+		isolation = "launcher"
+	}
+	env := &Env{
+		ID:        id,
+		Name:      args.Name,
+		Workspace: workspace,
+		Profile:   args.Profile,
+		Isolation: isolation,
+	}
 	s.mu.Lock()
 	s.envs[id] = env
 	s.mu.Unlock()
@@ -196,10 +237,16 @@ func (s *Server) toolExec(raw json.RawMessage) toolResult {
 		cwd = full
 	}
 
+	launch, err := s.launch(env, args.Argv)
+	if err != nil {
+		return errResult(codeFailedPrecondition, "FAILED_PRECONDITION", err.Error())
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(args.TimeoutMS)*time.Millisecond)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, args.Argv[0], args.Argv[1:]...)
+	cmd := exec.CommandContext(ctx, launch[0], launch[1:]...)
 	cmd.Dir = cwd
+	cmd.Env = launchEnv()
+	cmd.WaitDelay = 5 * time.Second
 	stdout := &limitedBuffer{limit: args.MaxOutputBytes}
 	stderr := &limitedBuffer{limit: args.MaxOutputBytes}
 	cmd.Stdout = stdout
@@ -216,9 +263,15 @@ func (s *Server) toolExec(raw json.RawMessage) toolResult {
 	exitCode := 0
 	if err != nil {
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
+		var execErr *exec.Error
+		switch {
+		case errors.As(err, &exitErr):
 			exitCode = exitErr.ExitCode()
-		} else {
+		case env.Profile == "isolated" &&
+			(errors.As(err, &execErr) || errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission)):
+			return errResult(codeFailedPrecondition, "FAILED_PRECONDITION",
+				"sandbox launcher failed to start")
+		default:
 			return errResult(codeInternal, "INTERNAL", err.Error())
 		}
 	}

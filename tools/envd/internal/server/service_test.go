@@ -175,3 +175,33 @@ func TestServiceDataRejectsBadToken(t *testing.T) {
 		t.Fatalf("expected ERROR, got %s", frame.Kind)
 	}
 }
+
+func TestServiceHTTPIsolatedFailsClosed(t *testing.T) {
+	s := New(Options{Root: t.TempDir(), MaxFrame: protocol.EmbeddedMaxFrame})
+	s.transport = "service-http"
+	handler := serviceHandler{server: s, token: "secret"}
+	request := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"env_create","arguments":{"profile":"isolated"}}}`))
+	request.Header.Set("Authorization", "Bearer secret")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status: %d body=%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Result struct {
+			IsError    bool           `json:"isError"`
+			Structured map[string]any `json:"structuredContent"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.Result.IsError {
+		t.Fatalf("isolated without a launcher was accepted: %s", response.Body.String())
+	}
+	detail, _ := body.Result.Structured["error"].(map[string]any)
+	if detail["name"] != "FAILED_PRECONDITION" {
+		t.Fatalf("error = %#v", detail)
+	}
+}

@@ -3,7 +3,6 @@ package server
 import (
 	"encoding/json"
 	"fmt"
-	"runtime"
 )
 
 type rpcRequest struct {
@@ -44,7 +43,7 @@ func (s *Server) dispatch(req rpcRequest) (rpcResponse, bool) {
 						"protocol":      map[string]any{"min": 2, "max": 2},
 						"tools_version": "0.2",
 						"capabilities":  s.capabilities(),
-						"profiles":      []string{"dev", "host", "isolated"},
+						"profiles":      s.profiles(),
 					},
 				},
 			},
@@ -55,7 +54,7 @@ func (s *Server) dispatch(req rpcRequest) (rpcResponse, bool) {
 		return rpcResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
-			Result:  map[string]any{"tools": toolDefinitions()},
+			Result:  map[string]any{"tools": toolDefinitions(s.profiles())},
 		}, true
 	case "tools/call":
 		var params struct {
@@ -84,19 +83,24 @@ func (s *Server) dispatch(req rpcRequest) (rpcResponse, bool) {
 }
 
 func (s *Server) capabilities() []string {
-	caps := []string{"transport." + s.transport, "env.managed", "exec", "files"}
+	caps := []string{
+		"transport." + s.transport,
+		"env.managed",
+		"exec",
+		"files",
+		"session.pipe",
+		"session.pty",
+	}
 	if s.dataPlane {
 		caps = append(caps, "transport.tcp")
 	}
-	if runtime.GOOS == "windows" {
-		caps = append(caps, "signals.console", "fs.acl")
-	} else {
-		caps = append(caps, "signals.posix", "pty.posix")
+	if s.isolatedAvailable() {
+		caps = append(caps, "sandbox.launcher")
 	}
 	return caps
 }
 
-func toolDefinitions() []map[string]any {
+func toolDefinitions(profiles []string) []map[string]any {
 	stringProp := func() map[string]any { return map[string]any{"type": "string"} }
 	intProp := func() map[string]any { return map[string]any{"type": "integer"} }
 
@@ -108,11 +112,11 @@ func toolDefinitions() []map[string]any {
 		},
 		{
 			"name":        "env_create",
-			"description": "Create a managed workspace environment.",
+			"description": "Create a managed workspace environment. The isolated profile requires a deployment-configured sandbox launcher.",
 			"inputSchema": objectSchema(map[string]any{
 				"name":    stringProp(),
 				"kind":    map[string]any{"type": "string", "enum": []string{"managed"}},
-				"profile": map[string]any{"type": "string", "enum": []string{"dev", "host", "isolated"}},
+				"profile": map[string]any{"type": "string", "enum": profiles},
 				"root":    stringProp(),
 			}),
 		},

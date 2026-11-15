@@ -21,6 +21,11 @@ M0 scaffold plus the P1 session/turn slice:
   behind a bearer token. The data plane uses absolute byte offsets, a bounded
   replay log, input/output CREDIT backpressure, and `OPEN since_seq` reconnect with
   explicit GAP/STALE errors.
+- Execution profiles: `dev` (default, unisolated), `host` (explicit,
+  service-only, unisolated), and `isolated` (service-only; every exec/pipe/PTY
+  launch is wrapped by a deployment `--sandbox-command` and fails closed when it
+  is missing or unusable). `msk`/`mskd` select the profile with
+  `--envd-profile`.
 - One end-to-end demo: kernel -> embedded envd -> `env_create` -> `write_file` ->
   `read_file` -> `exec` -> JSONL events.
 - wasmtime-backed WASM tool runtime: fresh store per call, fuel limit, 64 MiB
@@ -189,6 +194,7 @@ For a TLS service, use an `https://` URL and add `--envd-data-tls` so the
 daemon terminal also speaks TLS 1.3 to the data plane. Both planes trust the
 Mozilla roots by default; `--envd-ca ca.pem` replaces them with a private CA
 bundle (which must include the issuer of the envd certificate):
+
 ```sh
 target/debug/msk --envd-url https://envd.internal:7800 --envd-token "$ENVD_TOKEN" \
   --envd-ca ca.pem --root .msk/remote --session
@@ -201,6 +207,30 @@ target/debug/mskd --root .msk --envd-url https://envd.internal:7800 \
 With `--envd-data-addr`, the daemon terminal uses the binary MSDP data plane
 (`DATA`/`CREDIT`/`RESIZE`); without it, terminal I/O falls back to control-plane
 `session_read`/`session_write`.
+
+### Execution profiles
+
+`msk` and `mskd` accept `--envd-profile dev|host|isolated`. `dev` is the
+default; `host` is an explicit unisolated service profile. `isolated` is
+available only with an envd `--service` that was started with a launcher:
+
+```sh
+envd --service --token "$ENVD_TOKEN" \
+  --sandbox-command /usr/bin/bwrap \
+  --sandbox-arg=--unshare-all --sandbox-arg=--die-with-parent \
+  --sandbox-arg=--ro-bind --sandbox-arg=/ --sandbox-arg=/ \
+  --sandbox-arg=--dev --sandbox-arg=/dev --sandbox-arg=--proc --sandbox-arg=/proc \
+  --sandbox-arg=--tmpfs --sandbox-arg=/tmp \
+  --sandbox-arg=--bind --sandbox-arg=/srv/ctf --sandbox-arg=/srv/ctf \
+  --sandbox-arg=--
+target/debug/msk --envd-url https://envd.internal:7800 --envd-token "$ENVD_TOKEN" \
+  --envd-profile isolated --session
+```
+
+Without a validated launcher, `env_create isolated` returns
+`FAILED_PRECONDITION`; envd never silently runs an isolated command directly.
+`--embedded` is dev-only. See [`tools/envd/README.md`](tools/envd/README.md) for
+the launcher contract and current limits.
 
 ## Run the M0 demo
 

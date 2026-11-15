@@ -383,9 +383,15 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0u8; 8192];
-            let read = stream.read(&mut request).unwrap();
-            let request = String::from_utf8_lossy(&request[..read]).to_string();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap() == 0 {
+                    break;
+                }
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8_lossy(&request).to_string();
             assert!(
                 request
                     .to_ascii_lowercase()
@@ -399,6 +405,8 @@ mod tests {
                 body
             );
             stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(100));
         });
 
         let mut client = ServiceClient::new(format!("http://{address}"), "secret");
@@ -459,6 +467,9 @@ mod tests {
             );
             stream.write_all(response.as_bytes()).unwrap();
             stream.flush().unwrap();
+            stream.conn.send_close_notify();
+            let _ = stream.flush();
+            thread::sleep(Duration::from_millis(100));
         });
 
         let mut client =

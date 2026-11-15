@@ -50,6 +50,9 @@ struct Cli {
     /// PEM CA bundle for the envd HTTPS control plane and data-plane TLS.
     #[arg(long)]
     envd_ca: Option<PathBuf>,
+    /// envd workspace profile for tasks and the terminal.
+    #[arg(long, default_value = "dev", value_parser = ["dev", "host", "isolated"])]
+    envd_profile: String,
     /// Signed llm.provider manifest forwarded to component-provider tasks.
     #[arg(long)]
     component_manifest: Option<PathBuf>,
@@ -335,6 +338,7 @@ struct Daemon {
     envd_data_tls: bool,
     envd_data_tls_name: Option<String>,
     envd_ca: Option<PathBuf>,
+    envd_profile: String,
     component_manifest: Option<PathBuf>,
     component_trust: Option<PathBuf>,
     component_host: Option<PathBuf>,
@@ -362,6 +366,12 @@ fn main() -> Result<()> {
     }
     if envd.is_some() && cli.envd_url.is_some() {
         bail!("use either --envd or --envd-url, not both");
+    }
+    if envd.is_some() && cli.envd_profile != "dev" {
+        bail!(
+            "--envd-profile {} requires --envd-url (service mode)",
+            cli.envd_profile
+        );
     }
     if let Some(envd) = &envd {
         if !envd.exists() {
@@ -451,6 +461,7 @@ fn main() -> Result<()> {
         envd_data_tls: cli.envd_data_tls,
         envd_data_tls_name: cli.envd_data_tls_name.clone(),
         envd_ca,
+        envd_profile: cli.envd_profile.clone(),
         component_manifest,
         component_trust,
         component_host,
@@ -1055,7 +1066,9 @@ impl Daemon {
             .arg("--max-steps")
             .arg(max_steps.to_string())
             .arg("--max-context-tokens")
-            .arg(max_context_tokens.to_string());
+            .arg(max_context_tokens.to_string())
+            .arg("--envd-profile")
+            .arg(&self.envd_profile);
         if let Some(checkpoint) = &resume_checkpoint {
             command.arg("--resume-checkpoint").arg(checkpoint);
         }
@@ -1807,7 +1820,7 @@ impl Daemon {
 
         let env = client.call_tool(
             "env_create",
-            json!({"name": "terminal", "kind": "managed", "profile": "dev"}),
+            json!({"name": "terminal", "kind": "managed", "profile": self.envd_profile}),
         )?;
         let env_data = mcp_data(&env)?;
         let env_id = env_data

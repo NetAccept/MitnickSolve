@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/cynosure279/mitnick/tools/envd/internal/protocol"
@@ -18,6 +21,10 @@ const Version = "0.2.0"
 type Options struct {
 	Root     string
 	MaxFrame int
+	// Sandbox is the deployment-provided argv prefix for isolated
+	// environments. It is never supplied by a tool call and is never evaluated
+	// by a shell. An empty prefix makes the isolated profile unavailable.
+	Sandbox []string
 }
 
 type Env struct {
@@ -25,6 +32,64 @@ type Env struct {
 	Name      string `json:"name"`
 	Workspace string `json:"workspace"`
 	Profile   string `json:"profile"`
+	// Isolation names how this environment is enforced today: "none" for
+	// dev/host, "launcher" for isolated.
+	Isolation string `json:"isolation"`
+}
+
+// launchArgv wraps argv with the deployment sandbox when the environment is
+// isolated. The command arguments stay distinct; no shell interpolation is
+// performed. Callers must treat an error as a failed launch, never as a cue to
+// run the command directly.
+func (e *Env) launchArgv(argv []string, sandbox []string) ([]string, error) {
+	if len(argv) == 0 || argv[0] == "" {
+		return nil, errors.New("launch has no command")
+	}
+	for _, arg := range argv {
+		if strings.IndexByte(arg, 0) >= 0 {
+			return nil, errors.New("launch argument contains a NUL byte")
+		}
+	}
+	switch e.Profile {
+	case "dev", "host":
+		return argv, nil
+	case "isolated":
+		if strings.HasPrefix(argv[0], "-") {
+			return nil, errors.New("isolated command must not start with '-'")
+		}
+		if len(sandbox) == 0 || sandbox[0] == "" {
+			return nil, errors.New("isolated profile has no sandbox launcher")
+		}
+		launch := make([]string, 0, len(sandbox)+len(argv))
+		launch = append(launch, sandbox...)
+		launch = append(launch, argv...)
+		return launch, nil
+	default:
+		return nil, errors.New("unknown environment profile")
+	}
+}
+
+func (s *Server) sandboxConfigured() bool {
+	return len(s.opts.Sandbox) > 0 && s.opts.Sandbox[0] != ""
+}
+
+func (s *Server) isolatedAvailable() bool {
+	return s.transport != "embedded-stdio" && s.sandboxConfigured()
+}
+
+// profiles lists the profiles this deployment accepts. The embedded transport
+// shares the kernel's uid and only accepts dev. Isolated confinement itself is
+// delegated to the configured launcher; this list only says when it is
+// available, not that envd implements a sandbox.
+func (s *Server) profiles() []string {
+	if s.transport == "embedded-stdio" {
+		return []string{"dev"}
+	}
+	profiles := []string{"dev", "host"}
+	if s.isolatedAvailable() {
+		profiles = append(profiles, "isolated")
+	}
+	return profiles
 }
 
 type Server struct {
@@ -40,6 +105,7 @@ func New(opts Options) *Server {
 	if opts.MaxFrame <= 0 {
 		opts.MaxFrame = protocol.EmbeddedMaxFrame
 	}
+	opts.Sandbox = NormalizeSandbox(opts.Sandbox)
 	return &Server{
 		opts:      opts,
 		envs:      make(map[string]*Env),
@@ -48,10 +114,32 @@ func New(opts Options) *Server {
 	}
 }
 
+// NormalizeSandbox stores an absolute launcher path. exec.Cmd resolves a
+// relative Path after changing to the environment workspace, which would let a
+// client-writable directory supply the launcher.
+func NormalizeSandbox(argv []string) []string {
+	if len(argv) == 0 {
+		return nil
+	}
+	normalized := append([]string(nil), argv...)
+	if resolved, err := exec.LookPath(normalized[0]); err == nil {
+		if absolute, err := filepath.Abs(resolved); err == nil {
+			normalized[0] = absolute
+		}
+	}
+	return normalized
+}
+
 // RunEmbedded serves the frame protocol over stdin/stdout. It is the only
 // transport implemented in M0; service mode (MCP over HTTP) follows.
 func RunEmbedded(ctx context.Context, opts Options) error {
 	_ = ctx
+	if len(opts.Sandbox) > 0 {
+		return errors.New("--sandbox-command requires service mode")
+	}
+	if err := ValidateSandbox(opts.Sandbox, opts.Root); err != nil {
+		return err
+	}
 	return New(opts).serve(os.Stdin, os.Stdout)
 }
 

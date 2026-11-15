@@ -106,6 +106,9 @@ func RunService(ctx context.Context, opts ServiceOptions) error {
 	if opts.Addr == "" {
 		return errors.New("a control listen address is required")
 	}
+	if err := ValidateSandbox(opts.Sandbox, opts.Root); err != nil {
+		return err
+	}
 	server := New(opts.Options)
 	server.transport = "service-http"
 	server.dataPlane = opts.DataAddr != ""

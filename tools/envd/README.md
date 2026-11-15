@@ -79,9 +79,62 @@ the replay log remains available for a reconnect. Input is also credit-limited
 within the retained log. WebSocket transport is not implemented yet. The Rust
 `EnvDataClient` and mskd `--envd-data-addr` use this path for remote terminals.
 
+## Profiles and isolation
+
+`env_create` accepts three profiles. Their names describe deployment policy,
+not built-in sandboxing:
+
+| profile | Behavior |
+| --- | --- |
+| `dev` | Direct execution; the only profile available on `--embedded`. Unisolated. |
+| `host` | Direct execution over `--service`; unisolated but explicit. |
+| `isolated` | Every `exec`/pipe/PTY launch is prefixed with the deployment launcher; service mode only. Fails closed without a usable launcher. |
+
+Configure a launcher once at startup. Arguments are not shell-evaluated:
+
+```sh
+envd --service --token "$ENVD_TOKEN" \
+  --sandbox-command /usr/bin/bwrap \
+  --sandbox-arg=--unshare-all --sandbox-arg=--die-with-parent \
+  --sandbox-arg=--ro-bind --sandbox-arg=/ --sandbox-arg=/ \
+  --sandbox-arg=--dev --sandbox-arg=/dev --sandbox-arg=--proc --sandbox-arg=/proc \
+  --sandbox-arg=--tmpfs --sandbox-arg=/tmp \
+  --sandbox-arg=--bind --sandbox-arg=/srv/ctf --sandbox-arg=/srv/ctf \
+  --sandbox-arg=--
+```
+
+The launcher receives `argv = prefix + target argv`. It must:
+
+- accept stdin/stdout/stderr and propagate the target exit code;
+- terminate its sandbox when its root process dies (`--die-with-parent`,
+  container init, or an equivalent wrapper);
+- expose the environment workspace at the same host path (or `chdir` itself);
+  `cmd.Dir` is the host workspace before entering the launcher namespace;
+  bind only the workspace parent read-write; do **not** use `--dev-bind / /`,
+  which exposes the whole host root writable;
+- resolve the shell inside its own namespace if it provides a different
+  filesystem. envd does not resolve the shell on the host for isolated sessions.
+
+The launcher path is validated at startup and before every isolated launch:
+absolute, executable (PE on Windows), not a `.bat`/`.cmd`/`.ps1`, and not under
+the client-writable data root. If validation fails, `env_create` or the launch
+returns `FAILED_PRECONDITION`; envd never falls back to direct execution.
+The target `argv[0]` may not start with `-`. Prefer a `--` terminator in the
+prefix so target arguments can never be parsed as launcher options.
+
+File tools (`read_file`/`write_file`/...) stay in the envd process and are not
+wrapped; the workspace-relative checks are best-effort, not a filesystem
+sandbox. Child environments have all `ENVD_*` variables removed; the launcher
+must sanitize anything else it considers secret. envd terminates only the
+direct child, so process-tree teardown belongs to the launcher.
+
+`agent_info` reports `profiles`, `transport`, and `isolation`; `sandbox.launcher`
+is advertised only when isolated is actually available.
+
 ## Notes
 
 - Go standard library plus `github.com/aymanbagabas/go-pty` for PTY sessions.
+- `--sandbox-command/--sandbox-arg` require `--service`; embedded is dev-only.
 - Service mode requires an explicit token; embedded mode has no in-band auth
   because the pipe is established by the parent process.
 - `secureJoin` handles traversal and existing symlinks. Windows reserved names,

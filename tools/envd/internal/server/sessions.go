@@ -69,6 +69,16 @@ func (s *Server) toolSessionCreate(raw json.RawMessage) toolResult {
 	if err != nil {
 		return errResult(codeUnsupported, "UNSUPPORTED", err.Error())
 	}
+	shellPath := shell
+	if env.Profile != "isolated" {
+		if resolved, err := exec.LookPath(shell); err == nil {
+			shellPath = resolved
+		}
+	}
+	launch, err := s.launch(env, append([]string{shellPath}, shellArgs...))
+	if err != nil {
+		return errResult(codeFailedPrecondition, "FAILED_PRECONDITION", err.Error())
+	}
 
 	cols := args.Cols
 	if cols == 0 {
@@ -102,21 +112,16 @@ func (s *Server) toolSessionCreate(raw json.RawMessage) toolResult {
 		if err != nil {
 			return errResult(codeUnsupported, "UNSUPPORTED", "pty unavailable: "+err.Error())
 		}
-		shellPath := shell
-		if resolved, err := exec.LookPath(shell); err == nil {
-			shellPath = resolved
-		}
-		cmd := p.Command(shellPath, shellArgs...)
+		cmd := p.Command(launch[0], launch[1:]...)
 		cmd.Dir = env.Workspace
-		cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 		if runtime.GOOS == "windows" {
-			cmd.Env = append(cmd.Env, "PROMPT="+sessionPromptMarker)
+			cmd.Env = launchEnv("TERM=xterm-256color", "PROMPT="+sessionPromptMarker)
 		} else {
-			cmd.Env = append(cmd.Env, "PS1="+sessionPromptMarker)
+			cmd.Env = launchEnv("TERM=xterm-256color", "PS1="+sessionPromptMarker)
 		}
 		if err := cmd.Start(); err != nil {
 			_ = p.Close()
-			return errResult(codeInternal, "INTERNAL", err.Error())
+			return sessionStartError(env, err)
 		}
 		_ = p.Resize(int(cols), int(rows))
 		sess.pty = p
@@ -124,10 +129,12 @@ func (s *Server) toolSessionCreate(raw json.RawMessage) toolResult {
 		go sess.readLoop(p)
 		go func() { _ = cmd.Wait() }()
 	} else {
-		cmd := exec.Command(shell, shellArgs...)
+		cmd := exec.Command(launch[0], launch[1:]...)
 		cmd.Dir = env.Workspace
 		if runtime.GOOS == "windows" {
-			cmd.Env = append(os.Environ(), "PROMPT="+sessionPromptMarker)
+			cmd.Env = launchEnv("PROMPT=" + sessionPromptMarker)
+		} else {
+			cmd.Env = launchEnv()
 		}
 		stdin, err := cmd.StdinPipe()
 		if err != nil {
@@ -143,7 +150,7 @@ func (s *Server) toolSessionCreate(raw json.RawMessage) toolResult {
 			_ = writer.Close()
 			_ = output.Close()
 			_ = stdin.Close()
-			return errResult(codeInternal, "INTERNAL", err.Error())
+			return sessionStartError(env, err)
 		}
 		_ = writer.Close()
 		sess.cmd = cmd
@@ -171,6 +178,8 @@ func (s *Server) toolSessionCreate(raw json.RawMessage) toolResult {
 		"session_id": sess.ID,
 		"state":      "running",
 		"shell":      shell,
+		"profile":    env.Profile,
+		"isolation":  env.Isolation,
 		"pty":        args.Pty,
 		"cols":       cols,
 		"rows":       rows,
@@ -590,6 +599,14 @@ func (sess *Session) closeLocked() {
 	if sess.output != nil {
 		_ = sess.output.Close()
 	}
+}
+
+func sessionStartError(env *Env, err error) toolResult {
+	if env.Profile == "isolated" {
+		return errResult(codeFailedPrecondition, "FAILED_PRECONDITION",
+			"sandbox launcher failed to start")
+	}
+	return errResult(codeInternal, "INTERNAL", err.Error())
 }
 
 func resolveShell(requested string) (string, []string, error) {

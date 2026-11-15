@@ -49,7 +49,9 @@ func drainControlOutput(t *testing.T, s *Server, sessionID string, done func() b
 			"max_bytes":  1 << 20,
 			"timeout_ms": 0,
 		})
-		_ = mustTool(t, s, "session_read", string(payload))
+		// A data view may still be detaching; retry until the deadline rather
+		// than failing on a transient control/data handoff error.
+		_ = s.callTool("session_read", json.RawMessage(payload))
 		time.Sleep(10 * time.Millisecond)
 	}
 }

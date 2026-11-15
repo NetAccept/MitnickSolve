@@ -48,7 +48,7 @@
 | attachment | 客户端会话的一个连接视图；ro 或 rw。 |
 | stream | 数据面上的多路复用单元，类型为 session、file、connect、accept。 |
 | forward | 端口转发规则，local 或 remote。 |
-| profile | `isolated`、`host`、`dev`，描述隔离级别。 |
+| profile | `dev`/`host`/`isolated` 部署策略；`isolated` 需要部署 launcher，不代表 envd 自带沙箱。 |
 | ticket | 可选的短期数据面凭据，用于受限委派。 |
 | scope | token 上的权限标签。 |
 | request_id | 每次调用的唯一标识，用于审计与排障。 |
@@ -122,6 +122,7 @@
 
 - 客户端必须检查 `tools_version` 与所需 capabilities；不支持的调用返回 `UNSUPPORTED`。
 - 新增能力只追加，不改变既有字段语义。
+- 上例是目标契约，不是当前实现的完整能力集。当前 `initialize`/`agent_info` 只报告已实现能力；`wss`、`process.job`、`signals.*`、`fs.acl`、`sandbox.container`/`sandbox.wsl` 与 `env_info` 尚未落地。`profiles` 由 transport 与 launcher 配置动态决定。
 
 ### 4.3 弃用
 
@@ -219,8 +220,10 @@
 返回：
 
 ```json
-{"env_id": "env_...", "workspace": "/data/workspaces/web-01", "profile": "isolated", "limits": {}}
+{"env_id": "env_...", "workspace": "/data/workspaces/web-01", "profile": "isolated", "isolation": "launcher", "limits": {}}
 ```
+
+> 当前实现只支持 `kind=managed`；`limits`/`labels` 尚未解析。`profile=isolated` 在 service 模式下需要 `--sandbox-command` 且 launcher 通过校验，否则返回 `FAILED_PRECONDITION`，不会创建 workspace。
 
 - `managed`：必须位于 envd 数据目录下。
 - `mounted`：必须位于 `-allow-root` 声明的根内；删除只移除元数据，不删用户文件。
@@ -437,7 +440,7 @@
 - `resume.action`：`resumed`、`gap`、`unknown`。
 - 心跳：PING/PONG，15 秒；30 秒无响应断开。
 - `service` 模式连接断开不等于 session 结束；session 继续运行，按 idle timeout 清理。
-- `embedded` 模式是匿名管道，无法重连；EOF 表示内核退出，envd 终止所有 session 并退出。Linux 使用进程组与 Pdeathsig，Windows 使用带 `KILL_ON_JOB_CLOSE` 的 Job Object。
+- `embedded` 模式是匿名管道，无法重连；EOF 表示内核退出。当前实现尚未提供进程组/Pdeathsig/Job Object 清理；不要依赖 envd 杀死 shell 的后代，见 §12。
 - `embedded` 模式下 CONTROL 帧优先于 DATA 帧发送，避免大块输出造成控制面头阻塞；stdin/stdout 必须为二进制模式（Windows 禁用 CRLF 转换与 Ctrl-Z）。
 
 ### 7.2 帧格式
@@ -781,32 +784,30 @@ running ---------------------------------------> exited
 
 ## 12. 安全模型与部署 Profile
 
-| profile | 执行方式 | 默认用途 | 声明 |
+| profile | 当前实现 | 默认用途 | 保证边界 |
 | --- | --- | --- | --- |
-| `isolated` | 容器 / VM / gVisor；只读根、cap drop、no-new-privileges、独立 uid | 不可信挑战二进制 | 进程、文件、网络均受限 |
-| `host` | 专用 uid/gid；`os.Root`；最小 capability | 受控主机与工具链 | 文件 confine，进程共享宿主内核 |
-| `dev` | 回环、放宽限制、显式标记 | 本机开发 | 明确提示风险 |
+| `isolated` | 仅 `service`；每次进程启动前加部署提供的 `--sandbox-command` / `--sandbox-arg` argv 前缀；无可用 launcher 时 `env_create` 返回 `FAILED_PRECONDITION` | 不可信挑战二进制 | envd 只保证不裸跑、argv 不经 shell 拼接；实际进程/文件/网络隔离由 launcher 决定 |
+| `host` | `service` 下直接执行，无独立 uid、capability 或 Job Object | 受控主机与工具链 | 明确无隔离，部署负责 |
+| `dev` | 直接执行；`embedded-stdio` 唯一可用 profile | 本机开发 | 无隔离，明确标记 |
 
-平台能力（`env_info.capabilities`）：
+实际报告的能力（`initialize` / `agent_info`）：
 
-| capability | Linux | Windows | 说明 |
-| --- | --- | --- | --- |
-| `pty.posix` | 是 | 否 | POSIX PTY |
-| `pty.conpty` | 否 | 是 | Windows 10 1809+ |
-| `process.job` | 否 | 是 | Job Object 进程树 |
-| `signals.posix` | 是 | 否 | 完整 POSIX 信号 |
-| `signals.console` | 否 | 是 | Ctrl 事件映射 |
-| `fs.acl` | 否 | 是 | Windows ACL |
-| `sandbox.container` | 是 | 是（WSL2/容器） | |
-| `sandbox.wsl` | 否 | 是 | |
+| capability | 说明 |
+| --- | --- |
+| `session.pipe` | 管道会话 |
+| `session.pty` | PTY 会话（平台支持时） |
+| `sandbox.launcher` | 已配置并通过校验的 isolated 启动器 |
+| `transport.*`、`env.managed`、`exec`、`files` | 基础能力 |
 
-- `env_info` 返回 profile 与实际 capabilities；内核据此限制工具。
-- 容器是推荐的安全包装，不是执行模型；裸机部署明确标注隔离缺失。
-- 非回环必须 TLS；反向代理需 `--trust-proxy` 且校验来源。
-- `embedded-stdio` 与内核同 uid，不提供权限分离；命令可访问内核进程可见的资源。只允许 `dev` profile 或外层 bwrap/nsjail/容器命名空间；`host`/`isolated` 必须使用 `service`。
-- `embedded-stdio` 的 token 为空，依赖进程所有权；审计仍记录本地 agent_id 与请求。
-- Windows 原生为 Tier 2：优先 `pwsh.exe`，回退 `powershell.exe`/`cmd.exe`；PTY 使用 ConPTY，进程树用 Job Object；`isolated` 通过 WSL2/容器；文件使用长路径、拒绝 UNC/ADS/设备名，token 文件用 ACL 限制。
-- 命令用户不得读取 envd token、`/proc/1/environ` 或审计文件。
+尚未实现、因此不报告的字段/能力：`env_info`、`process.job`、`signals.*`、`fs.acl`、专用 uid/gid、容器/VM 内建隔离、WSL 自动选择。
+
+- `env_create` 的 `isolated` 没有 launcher 或 launcher 不可执行时返回 `FAILED_PRECONDITION`，不会创建 workspace；已存在的 isolated 环境在每次 `exec` / `session_create` 前重新校验 launcher，失败即拒绝，绝不降级为直接执行。
+- launcher 合同：argv 前缀后直接接目标 argv（不经过 shell）；目标 `argv[0]` 不得以 `-` 开头；建议前缀以 launcher 的选项终止符（如 bwrap/nsjail 的 `--`）结尾。launcher 必须接受 stdin/stdout/stderr、返回目标退出码，并在根进程被杀时清理自己的沙箱（如 `--die-with-parent`）。`cmd.Dir` 是宿主 workspace；容器/bwrap 部署必须把该路径映射到同一路径或自行 chdir。
+- 文件工具仍由 envd 宿主进程执行，launcher 只包住 `exec`/会话进程；不要把 `isolated` 当作文件系统隔离证明。
+- 命令环境会移除大小写不敏感的 `ENVD_*`；launcher 还应清理其余无关环境。`embedded-stdio` 的 token 为空，但只允许 `dev`。
+- 非回环必须 TLS；反向代理需部署侧校验来源。
+- Windows 原生当前只支持 `cmd.exe`；PTY 使用 ConPTY；`isolated` 需要部署提供 PE launcher（或 WSL/容器包装器）。Job Object、ACL、`pwsh` 回退尚未实现。
+- 进程树清理：envd 只终止直接子进程；launcher 必须负责其沙箱内的后代（bwrap `--die-with-parent`、容器 init、Job Object 包装器）。不要依赖 envd 目前未实现的 Pdeathsig/Job Object。
 
 ---
 
@@ -985,12 +986,12 @@ client (parent)                          envd (child)
 ## 附录 D：部署检查清单
 
 - 绑定地址：默认 `127.0.0.1`；非回环必须 TLS。
-- 嵌入式模式：仅 `dev` 或外层沙箱；stdin/stdout 二进制模式；退出清理靠 Pdeathsig/Job Object；不得用于 `host`/`isolated`。
-- token：随机生成、权限 0600、不进入命令环境；支持撤销。
-- 执行用户：独立 uid/gid；禁止读取 envd 环境与 token。
-- workspace：managed 在数据目录下；mounted 只允许声明根。
-- profile：不可信二进制只用 `isolated`；`host` 明确风险。
+- 嵌入式模式：仅 `dev`；stdin/stdout 二进制模式；`--sandbox-command` 被拒绝；进程树清理尚未实现，需由外层部署保证。
+- token：随机生成、权限 0600；命令环境会移除 `ENVD_*`；支持撤销仍待实现。
+- 执行用户：envd 不切换 uid/gid；需要独立用户时由容器/launcher/部署提供。
+- workspace：managed 在数据目录下；文件工具只做相对路径约束，不是 TOCTOU 安全的文件沙箱。
+- profile：不可信二进制使用 `isolated` 并提供经过校验的 launcher；`host` 明确无隔离。
 - 审计：开启，确认脱敏；保留期与容量。
-- 配额：至少设置 CPU、内存、磁盘、session 数。
+- 配额：envd 尚未强制 CPU/内存/磁盘/会话配额；由部署或后续实现提供。
 - 反向代理：`--trust-proxy` 仅对可信来源开启；校验 `Origin`。
-- Windows：原生支持 ConPTY、Job Object、ACL；`isolated` 使用 WSL2/容器；路径做长路径、UNC、ADS、保留名测试。
+- Windows：原生 ConPTY 可用；Job Object、ACL、`pwsh` 回退尚未实现；`isolated` 需要 PE launcher 或 WSL/容器包装器；路径长路径/UNC/ADS/保留名仍待加固。

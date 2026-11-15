@@ -122,7 +122,7 @@
 | Tier 4 | 其他 | 可构建 | 视宿主 | 不保证 | 不承诺 |
 
 - WASM 模块本身跨平台；差异来自 host imports 与远端执行环境，不是模块格式。
-- envd 通过 `env_info` 报告 `capabilities`（如 `pty.conpty`、`process.job`、`sandbox.wsl`）；内核按能力启用或禁用工具。
+- envd 通过 `agent_info`/`initialize` 报告当前实现的 `capabilities`；`env_info`、`process.job`、`sandbox.wsl` 等尚未实现的能力不应被消费。
 - 工具 manifest 声明平台/能力要求；不满足时返回 `UNSUPPORTED`，不静默降级。
 - “完全跨平台”指设计与构建；各平台的安全声明与语义差异独立陈述。
 
@@ -170,7 +170,7 @@ envd 只做机制，不做策略决策：
 - 内置失败安全机制：回环绑定、路径 confine、进程树终止、审计、限流、token 不可被命令读取。
 - 是否使用容器、以谁的身份执行、开放哪些出网，由部署 profile 和用户决定。
 - 传输分两种模式：`service`（MCP over HTTP + TLS/TCP 或 WebSocket，带 token、重连、多客户端与权限分离）与 `embedded`（内核以子进程启动 envd，stdio 帧同时承载控制与数据，无端口、无 token）。`embedded` 与内核同 uid，不提供权限分离，只允许 `dev` profile 或外层沙箱；`host`/`isolated` 必须用 `service`。
-- envd 通过 `env_info` 报告 profile 与 capabilities，内核据此决定哪些工具可用。
+- envd 通过 `agent_info` 报告 profile 与 capabilities，内核据此决定哪些工具可用（当前内核统一请求 `dev`，profile 可由 `--envd-profile` 选择）。
 
 ---
 
@@ -787,13 +787,13 @@ M0 实现：envd 支持 `pty=true` 的 PTY 会话（Windows ConPTY、Unix PTY）
 
 **Profile**
 
-| profile | 执行方式 | 默认用途 |
-| --- | --- | --- |
-| `isolated` | 容器 / VM / gVisor；只读根、cap drop、no-new-privileges | 运行不可信挑战二进制 |
-| `host` | 专用 uid/gid；路径 confine；最小 capability | 受控主机、CTF 工具链 |
-| `dev` | 回环、放宽限制、显式标记 | 本机开发 |
+| profile | 当前实现 | 默认用途 | 保证边界 |
+| --- | --- | --- | --- |
+| `isolated` | `service` + 部署 launcher argv 前缀；无 launcher 时 fail closed | 运行不可信挑战二进制 | 实际隔离 = launcher；envd 保证不裸跑、参数不经 shell |
+| `host` | `service` 下直接执行；无独立 uid/cap | 受控主机、CTF 工具链 | 明确无隔离 |
+| `dev` | 直接执行；embedded 唯一可用 | 本机开发 | 无隔离 |
 
-`env_info` 返回 profile 与 capabilities；内核据此限制工具（例如不可信二进制仅允许在 `isolated` 中运行）。
+`agent_info` 返回可接受 profile、transport、isolation 模式与实际 capabilities；内核据此选择 profile。`env_info`、专用 uid/gid、Job Object/进程组、ACL、`pwsh` 回退与容器内建隔离仍属未实现，不能作为当前保证。
 
 **审计**
 
@@ -803,21 +803,21 @@ M0 实现：envd 支持 `pty=true` 的 PTY 会话（Windows ConPTY、Unix PTY）
 **跨平台**
 
 - Linux/macOS：`/bin/sh` 或显式 shell；进程组终止。
-- Windows：原生 envd 作为 Tier 2 支持；shell 优先 `pwsh.exe`，回退 `powershell.exe`/`cmd.exe`；PTY 使用 ConPTY，进程树用 Job Object，信号映射为 console control events；`isolated` 仍需 WSL2/容器，`host`/`dev` 可原生。能力差异通过 `env_info` 报告。
+- Windows：原生 envd 作为 Tier 2 支持；当前 shell 为 `cmd.exe`（`pwsh` 回退未实现），PTY 使用 ConPTY；Job Object、ACL、信号映射尚未实现；`isolated` 需要 PE launcher 或 WSL2/容器。能力差异通过 `agent_info` 报告。
 - Termux/移动端作为可选部署，不进入 v1 主路径。
 
 ### 14.3 部署形态
 
 | 形态 | 传输 | profile | 说明 |
 | --- | --- | --- | --- |
-| 嵌入 | `embedded-stdio` | `dev` 或外层沙箱 | 内核以子进程启动 envd，无端口、无 token；同 uid，不提供权限分离；EOF 时清理会话。 |
-| 本地守护 | MCP HTTP + `tls-tcp` | `host` / `isolated` | 随内核发行，独立进程；token、重连、多客户端。 |
-| 容器 | MCP HTTP + `tls-tcp`/`wss` | `isolated` | envd 作为入口进程；只读根、cap drop、no-new-privileges。 |
-| 远程 | MCP HTTP + `wss` | `host` / `isolated` | TLS + 反向代理；按 server 配置连接。 |
+| 嵌入 | `embedded-stdio` | `dev` | 内核以子进程启动 envd，无端口、无 token；同 uid；`--sandbox-command` 在 embedded 模式被拒绝；EOF 清理仍待补强。 |
+| 本地守护 | MCP HTTP + `tls-tcp` | `dev` / `host` / `isolated`（launcher） | 随内核发行，独立进程；token、重连、多客户端。 |
+| 容器 | MCP HTTP + `tls-tcp`/`wss` | `dev`（外层容器即隔离） | envd 作为入口进程；只读根、cap drop 等由部署的容器配置提供，不由 envd 检查。 |
+| 远程 | MCP HTTP + `wss` | `dev` / `host` / `isolated`（launcher） | TLS + 反向代理；按 server 配置连接。 |
 
-- `embedded-stdio` 只用于本地开发或已处于 bwrap/nsjail/容器命名空间中的场景；`host`/`isolated` 不允许。
-- 容器与远程必须使用 `service` 绑定，保留 token、重连与多客户端。
-- 沙箱套件作为可选安装项，但安装器默认提供 `isolated` profile；v1 包含容器与 bwrap/nsjail，gVisor/microVM 作为后续 profile。
+- `embedded-stdio` 只用于本地开发；外层 bwrap/nsjail/容器由部署负责，envd 内部仍用 `dev`。
+- `host`/`isolated` 只允许 `service`；`isolated` 还需 `--sandbox-command`，否则 `env_create` 返回 `FAILED_PRECONDITION`。
+- 沙箱套件是部署责任；envd 不自带容器/VM/gVisor。容器化部署把整个 envd 放进容器后使用 `dev`，或提供 `bwrap`/`nsjail` 启动器。
 
 ### 14.4 命名
 
@@ -917,12 +917,12 @@ profile = "host"
 | 秘密不进入模型上下文 | 是 | 是 | 否（组件可读进程内存） | 是 | 是 |
 | 出网策略对工具有效 | 是 | 是 | 否（组件可绕过） | 是 | 是 |
 | 内核崩溃隔离 | — | — | 否 | 是 | 是 |
-| 不可信二进制隔离 | — | — | — | 是 | 否 |
+| 不可信二进制隔离 | — | — | — | 由 launcher 决定；未配置则拒绝 | 否 |
 | 供应链可追溯 | 是 | 是 | 是（签名） | 是 | 是 |
 
 结论：安全声明必须按组件集与 envd profile 分别陈述；不能把“仅第一方”的保证套用到含未审组件的运行上。
 
-`embedded-stdio` 不提供权限分离：envd 与内核同 uid，命令可访问内核进程可见的资源。它只允许在 `dev` profile 或外层沙箱中使用；上表 envd 行的保证不适用于 `embedded-stdio`。
+`embedded-stdio` 不提供权限分离：envd 与内核同 uid，命令可访问内核进程可见的资源。它只允许 `dev`；外层 bwrap/nsjail/容器是部署选择，不由 envd 声明或验证。上表 envd 行的保证不适用于 `embedded-stdio`。
 
 ---
 
@@ -988,7 +988,7 @@ profile = "host"
 - 事件完整性与恢复：`msk-replay` 校验 schema/seq/重复 ID/父链接并输出转录；`msk --session --resume <events.jsonl>` 将截断后的历史转录固定为新会话上下文，并显式标记旧 env/session 已失效。`turn.start` 现在记录用户原文，使日志成为完整对话来源。原生检查点在每轮后原子写入 `<root>/checkpoint.json`（Unix 0600），保存完整消息与 tool call/result 配对；`--resume-checkpoint` 在新 env 下恢复上下文、继续 turn 编号并标记旧会话失效。`create --fork-from <task>` 复制父检查点到新任务，以新 env 和延续的 turn 编号探索分支。`msk-store` 提供 SQLite 事件索引（task/kind/seq，WAL、0600），mskd `--store` 实时写入，`events.query`/`mskctl events`/`msk-replay --db` 可查询，重复 id 在日志重放时忽略。
 - 组件签名（M2 前半）：`ComponentManifest` 带 Ed25519 签名，签名覆盖去掉签名字段的规范化 JSON；`TrustStore` 按发布者显式信任公钥；工件校验 SHA-256 并拒绝越界路径。
 - 组件宿主（M2）：`libloading` 解析 `ms_component_entry`，先验签/信任、再校验工件哈希与路径，校验总 `struct_size`、ABI、port、vtable 头/保留槽后才复制指针；`init` 恰好一次，调用串行化，`shutdown` 仅在成功 init 后调用一次，库永不卸载。宿主带分配台账，响应先复制再释放，越权/未登记指针拒释放。`msk --provider component --component-manifest ...` 与 mskd 转发已可用；`msk-component-host` 提供进程外运行，组件 abort 只杀死 host，内核收到协议错误并继续；失败请求不自动重试，下一次调用会重启 host 并重新验签/校验工件。测试 cdylib 覆盖正常响应、空/越界/未登记/错误/panic/abort 模式。C 头文件与 Rust/C 布局探针已落地，`msk-component-check` 提供安装期验证/加载/一次调用/响应结构/台账/关闭检查；host 资源限制/syscall 沙箱、TOCTOU 加固、流式槽与更完整的跨语言 conformance 套件仍属后续（见 `docs/components.md`）。
-- envd 服务模式（P5）：`--service` 提供 MCP JSON-RPC over HTTP(S)，Bearer token 与 TLS 1.3；数据面为 TCP/TLS 上的 MSDP `HELLO/OPEN/DATA/RESIZE/CLOSE/EXIT`，直接引用控制面创建的 `session_id`。输出以绝对字节 `seq` 寻址，会话保留有界 replay log；输出 CREDIT 限流（初始 64 KiB、DATA ≤64 KiB、4 MiB cap），`OPEN since_seq` 支持重连并返回 GAP/STALE。数据视图附加期间独占输出，断开后控制面继续收到新输出。Rust `EnvDataClient` 已接入 mskd 的 `--envd-data-addr`，支持明文 TCP 与 TLS 1.3（单 I/O 线程、增量帧解析、20ms 读轮询），输出/输入 CREDIT、`OPEN since_seq` 与 `SEEK` 均已生效；私有 CA 通过 `--envd-ca` 同时用于 HTTPS 控制面与数据面。WSS 数据面仍待接。
+- envd 服务模式（P5）：`--service` 提供 MCP JSON-RPC over HTTP(S)，Bearer token 与 TLS 1.3；数据面为 TCP/TLS 上的 MSDP `HELLO/OPEN/DATA/RESIZE/CLOSE/EXIT`，直接引用控制面创建的 `session_id`。输出以绝对字节 `seq` 寻址，会话保留有界 replay log；输出 CREDIT 限流（初始 64 KiB、DATA ≤64 KiB、4 MiB cap），`OPEN since_seq` 支持重连并返回 GAP/STALE。数据视图附加期间独占输出，断开后控制面继续收到新输出。Rust `EnvDataClient` 已接入 mskd 的 `--envd-data-addr`，支持明文 TCP 与 TLS 1.3（单 I/O 线程、增量帧解析、20ms 读轮询），输出/输入 CREDIT、`OPEN since_seq` 与 `SEEK` 均已生效；私有 CA 通过 `--envd-ca` 同时用于 HTTPS 控制面与数据面。WSS 数据面仍待接；profile 机制已收紧：embedded 仅 dev；service 的 host 为显式无隔离；isolated 必须配置并校验部署 launcher（`--sandbox-command/--sandbox-arg`），`env_create` 在缺失/不可用时返回 FAILED_PRECONDITION，`exec`、pipe 与 PTY 会话共用同一包装路径，子进程环境移除 `ENVD_*`，每次启动前复验 launcher。
 - 远程 envd 客户端：`msk --envd-url/--envd-token` 通过 HTTP(S) 调 MCP，`EnvTransport` 抽象让 embedded 与 service 共用同一 WASM 宿主桥；已用服务模式完成 headless 会话、远程 `exec`、mskd 任务与 daemon 终端；断线重连与数据面重连游标待接。
 - 文件与网络工具：`read_file/write_file/list_dir/stat_file` 经 envd 的 `fs.workspace` 能力执行，写入默认审批；`http_request` 在宿主侧执行 HTTP(S)，受 `net.egress` 能力约束，仅允许 http/https、默认 30s 超时、4 MiB 响应上限并跟随重定向。SSRF/私网访问目前不做内建阻断，应由部署网络策略或沙箱负责。
 - 秘密存储：新增 `msk-secret`，`EnvSecretStore` 将 `$secret:name` 映射到 `MSK_SECRET_NAME`；`http_request` 在宿主侧完成 `secrets.read` 能力检查后解析头部，明文不进入模型观测或事件日志。

@@ -68,6 +68,9 @@ struct Cli {
     /// PEM CA bundle for the envd HTTPS control plane.
     #[arg(long)]
     envd_ca: Option<PathBuf>,
+    /// envd workspace profile: dev, host, or isolated.
+    #[arg(long, default_value = "dev", value_parser = ["dev", "host", "isolated"])]
+    envd_profile: String,
     /// Kernel state directory (events, envd data).
     #[arg(long, default_value = ".msk")]
     root: PathBuf,
@@ -415,6 +418,12 @@ fn connect_backend(cli: &Cli, sink: &dyn EventSink, name: &str) -> Result<Backen
     if cli.envd_url.is_some() && cli.envd.is_some() {
         bail!("use either --envd or --envd-url, not both");
     }
+    if cli.envd.is_some() && cli.envd_profile != "dev" {
+        bail!(
+            "--envd-profile {} requires --envd-url (service mode)",
+            cli.envd_profile
+        );
+    }
 
     if let Some(url) = &cli.envd_url {
         let token = cli
@@ -443,7 +452,7 @@ fn connect_backend(cli: &Cli, sink: &dyn EventSink, name: &str) -> Result<Backen
         let env = tool_data(
             &mut service,
             "env_create",
-            json!({"name": name, "kind": "managed", "profile": "dev"}),
+            json!({"name": name, "kind": "managed", "profile": cli.envd_profile}),
             sink,
         )?;
         let env_id = env
@@ -505,7 +514,7 @@ fn connect_backend(cli: &Cli, sink: &dyn EventSink, name: &str) -> Result<Backen
     let env = tool_data(
         &mut embedded,
         "env_create",
-        json!({"name": name, "kind": "managed", "profile": "dev"}),
+        json!({"name": name, "kind": "managed", "profile": cli.envd_profile}),
         sink,
     )?;
     let env_id = env

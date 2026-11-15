@@ -23,6 +23,24 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  envd-unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - name: Vet
+        working-directory: tools/envd
+        run: go vet ./...
+      - name: Test
+        working-directory: tools/envd
+        run: go test ./...
+
   envd:
     runs-on: ubuntu-latest
     steps:
@@ -60,6 +78,42 @@ jobs:
             -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}' \
             | jq -e '.result.serverInfo.name == "envd"'
           [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:17800/mcp -d '{}')" = 401 ]
+          curl -fsS -X POST http://127.0.0.1:17800/mcp \
+            -H 'Authorization: Bearer ci-token' -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"env_create","arguments":{"profile":"isolated"}}}' \
+            | jq -e '.result.isError == true and .result.structuredContent.error.code == 6'
+      - name: envd isolated launcher smoke
+        run: |
+          set -euo pipefail
+          rm -rf .msk/envd-ci2 /tmp/envd-launcher.log
+          mkdir -p .msk
+          cat > .msk/envd-launcher.sh <<'EOF'
+          #!/bin/sh
+          printf '%s\n' "$@" >> /tmp/envd-launcher.log
+          exec "$@"
+          EOF
+          chmod +x .msk/envd-launcher.sh
+          target/debug/envd --service --root .msk/envd-ci2 \
+            --listen 127.0.0.1:17802 --data-listen 127.0.0.1:17803 \
+            --token isolated-token \
+            --sandbox-command "$PWD/.msk/envd-launcher.sh" \
+            >.msk/envd-ci2.log 2>&1 &
+          envd_pid=$!
+          trap 'kill "$envd_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 100); do
+            if curl -fsS http://127.0.0.1:17802/healthz >/dev/null 2>&1; then break; fi
+            sleep 0.1
+          done
+          env_id=$(curl -fsS -X POST http://127.0.0.1:17802/mcp \
+            -H 'Authorization: Bearer isolated-token' -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"env_create","arguments":{"profile":"isolated"}}}' \
+            | jq -r '.result.structuredContent.data.env_id')
+          test -n "$env_id"
+          curl -fsS -X POST http://127.0.0.1:17802/mcp \
+            -H 'Authorization: Bearer isolated-token' -H 'Content-Type: application/json' \
+            -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"exec\",\"arguments\":{\"env_id\":\"$env_id\",\"argv\":[\"/bin/sh\",\"-c\",\"echo isolated-ok\"]}}}" \
+            | jq -e '.result.structuredContent.data.stdout | contains("isolated-ok")'
+          grep -q '/bin/sh' /tmp/envd-launcher.log
       - name: Build kernel
         run: |
           cargo build -p msk-kernel --bins
