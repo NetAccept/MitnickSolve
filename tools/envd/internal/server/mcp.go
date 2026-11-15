@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"runtime"
 )
 
 type rpcRequest struct {
@@ -96,6 +97,11 @@ func (s *Server) capabilities() []string {
 	}
 	if s.isolatedAvailable() {
 		caps = append(caps, "sandbox.launcher")
+	}
+	if runtime.GOOS == "windows" {
+		caps = append(caps, "process.job")
+	} else {
+		caps = append(caps, "process.group")
 	}
 	return caps
 }

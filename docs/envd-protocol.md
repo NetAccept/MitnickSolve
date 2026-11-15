@@ -122,7 +122,7 @@
 
 - 客户端必须检查 `tools_version` 与所需 capabilities；不支持的调用返回 `UNSUPPORTED`。
 - 新增能力只追加，不改变既有字段语义。
-- 上例是目标契约，不是当前实现的完整能力集。当前 `initialize`/`agent_info` 只报告已实现能力；`wss`、`process.job`、`signals.*`、`fs.acl`、`sandbox.container`/`sandbox.wsl` 与 `env_info` 尚未落地。`profiles` 由 transport 与 launcher 配置动态决定。
+- 上例是目标契约，不是当前实现的完整能力集。当前 `initialize`/`agent_info` 只报告已实现能力；`wss`、`signals.*`、`fs.acl`、`sandbox.container`/`sandbox.wsl` 与 `env_info` 尚未落地。`profiles` 由 transport 与 launcher 配置动态决定。
 
 ### 4.3 弃用
 
@@ -440,7 +440,7 @@
 - `resume.action`：`resumed`、`gap`、`unknown`。
 - 心跳：PING/PONG，15 秒；30 秒无响应断开。
 - `service` 模式连接断开不等于 session 结束；session 继续运行，按 idle timeout 清理。
-- `embedded` 模式是匿名管道，无法重连；EOF 表示内核退出。当前实现尚未提供进程组/Pdeathsig/Job Object 清理；不要依赖 envd 杀死 shell 的后代，见 §12。
+- `embedded` 模式是匿名管道，无法重连；EOF 表示内核退出并关闭所有 session。exec/pipe/PTY 使用 Unix 进程组或 Windows Job Object（`KILL_ON_JOB_CLOSE`）在超时/关闭时终止进程树；Pdeathsig 仍未实现。launcher 若把沙箱后代脱离该树，则由 launcher 负责清理。
 - `embedded` 模式下 CONTROL 帧优先于 DATA 帧发送，避免大块输出造成控制面头阻塞；stdin/stdout 必须为二进制模式（Windows 禁用 CRLF 转换与 Ctrl-Z）。
 
 ### 7.2 帧格式
@@ -650,7 +650,7 @@ running ---------------------------------------> exited
 
 - `service`：连接断开仅 detach，session 继续；重连按 `since_seq` 续读。
 - `embedded`：stdin EOF 或子进程退出等价于终止所有 session；不做恢复，缓冲不保留。
-- 内核崩溃时，Linux 通过 Pdeathsig/进程组、Windows 通过 Job Object 确保 envd 不残留。
+- envd 退出时关闭所有 session；内核崩溃时 envd 自身的存活依赖部署 supervisor。Pdeathsig 尚未实现，Windows Job Object 只清理 envd 启动的进程树。
 
 ---
 
@@ -797,17 +797,18 @@ running ---------------------------------------> exited
 | `session.pipe` | 管道会话 |
 | `session.pty` | PTY 会话（平台支持时） |
 | `sandbox.launcher` | 已配置并通过校验的 isolated 启动器 |
+| `process.group` / `process.job` | Unix 进程组 / Windows Job Object 清理 |
 | `transport.*`、`env.managed`、`exec`、`files` | 基础能力 |
 
-尚未实现、因此不报告的字段/能力：`env_info`、`process.job`、`signals.*`、`fs.acl`、专用 uid/gid、容器/VM 内建隔离、WSL 自动选择。
+尚未实现、因此不报告的字段/能力：`env_info`、`signals.*`、`fs.acl`、专用 uid/gid、容器/VM 内建隔离、WSL 自动选择。
 
 - `env_create` 的 `isolated` 没有 launcher 或 launcher 不可执行时返回 `FAILED_PRECONDITION`，不会创建 workspace；已存在的 isolated 环境在每次 `exec` / `session_create` 前重新校验 launcher，失败即拒绝，绝不降级为直接执行。
 - launcher 合同：argv 前缀后直接接目标 argv（不经过 shell）；目标 `argv[0]` 不得以 `-` 开头；建议前缀以 launcher 的选项终止符（如 bwrap/nsjail 的 `--`）结尾。launcher 必须接受 stdin/stdout/stderr、返回目标退出码，并在根进程被杀时清理自己的沙箱（如 `--die-with-parent`）。`cmd.Dir` 是宿主 workspace；容器/bwrap 部署必须把该路径映射到同一路径或自行 chdir。
 - 文件工具仍由 envd 宿主进程执行，launcher 只包住 `exec`/会话进程；不要把 `isolated` 当作文件系统隔离证明。
 - 命令环境会移除大小写不敏感的 `ENVD_*`；launcher 还应清理其余无关环境。`embedded-stdio` 的 token 为空，但只允许 `dev`。
 - 非回环必须 TLS；反向代理需部署侧校验来源。
-- Windows 原生当前只支持 `cmd.exe`；PTY 使用 ConPTY；`isolated` 需要部署提供 PE launcher（或 WSL/容器包装器）。Job Object、ACL、`pwsh` 回退尚未实现。
-- 进程树清理：envd 只终止直接子进程；launcher 必须负责其沙箱内的后代（bwrap `--die-with-parent`、容器 init、Job Object 包装器）。不要依赖 envd 目前未实现的 Pdeathsig/Job Object。
+- Windows 原生当前只支持 `cmd.exe`；PTY 使用 ConPTY；进程树使用 Job Object；`isolated` 需要部署提供 PE launcher（或 WSL/容器包装器）。ACL、`pwsh` 回退尚未实现。
+- 进程树清理：envd 为 exec/pipe/PTY 建立 Unix 进程组或 Windows Job Object，并在超时/关闭时终止整组；launcher 必须让沙箱后代留在该树内（或自行处理 parent-death）。envd 未实现 Pdeathsig。
 
 ---
 
@@ -994,4 +995,4 @@ client (parent)                          envd (child)
 - 审计：开启，确认脱敏；保留期与容量。
 - 配额：envd 尚未强制 CPU/内存/磁盘/会话配额；由部署或后续实现提供。
 - 反向代理：`--trust-proxy` 仅对可信来源开启；校验 `Origin`。
-- Windows：原生 ConPTY 可用；Job Object、ACL、`pwsh` 回退尚未实现；`isolated` 需要 PE launcher 或 WSL/容器包装器；路径长路径/UNC/ADS/保留名仍待加固。
+- Windows：原生 ConPTY 与 Job Object 可用；ACL、`pwsh` 回退尚未实现；`isolated` 需要 PE launcher 或 WSL/容器包装器；路径长路径/UNC/ADS/保留名仍待加固。

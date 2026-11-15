@@ -122,7 +122,7 @@
 | Tier 4 | 其他 | 可构建 | 视宿主 | 不保证 | 不承诺 |
 
 - WASM 模块本身跨平台；差异来自 host imports 与远端执行环境，不是模块格式。
-- envd 通过 `agent_info`/`initialize` 报告当前实现的 `capabilities`；`env_info`、`process.job`、`sandbox.wsl` 等尚未实现的能力不应被消费。
+- envd 通过 `agent_info`/`initialize` 报告当前实现的 `capabilities`；`env_info`、`sandbox.wsl` 等尚未实现的能力不应被消费。
 - 工具 manifest 声明平台/能力要求；不满足时返回 `UNSUPPORTED`，不静默降级。
 - “完全跨平台”指设计与构建；各平台的安全声明与语义差异独立陈述。
 
@@ -793,7 +793,7 @@ M0 实现：envd 支持 `pty=true` 的 PTY 会话（Windows ConPTY、Unix PTY）
 | `host` | `service` 下直接执行；无独立 uid/cap | 受控主机、CTF 工具链 | 明确无隔离 |
 | `dev` | 直接执行；embedded 唯一可用 | 本机开发 | 无隔离 |
 
-`agent_info` 返回可接受 profile、transport、isolation 模式与实际 capabilities；内核据此选择 profile。`env_info`、专用 uid/gid、Job Object/进程组、ACL、`pwsh` 回退与容器内建隔离仍属未实现，不能作为当前保证。
+`agent_info` 返回可接受 profile、transport、isolation 模式与实际 capabilities；内核据此选择 profile。`env_info`、专用 uid/gid、ACL、`pwsh` 回退与容器内建隔离仍属未实现，不能作为当前保证；exec/pipe/PTY 已使用 Unix 进程组或 Windows Job Object 清理进程树。
 
 **审计**
 
@@ -803,7 +803,7 @@ M0 实现：envd 支持 `pty=true` 的 PTY 会话（Windows ConPTY、Unix PTY）
 **跨平台**
 
 - Linux/macOS：`/bin/sh` 或显式 shell；进程组终止。
-- Windows：原生 envd 作为 Tier 2 支持；当前 shell 为 `cmd.exe`（`pwsh` 回退未实现），PTY 使用 ConPTY；Job Object、ACL、信号映射尚未实现；`isolated` 需要 PE launcher 或 WSL2/容器。能力差异通过 `agent_info` 报告。
+- Windows：原生 envd 作为 Tier 2 支持；当前 shell 为 `cmd.exe`（`pwsh` 回退未实现），PTY 使用 ConPTY；进程树使用 Job Object，ACL 与信号映射尚未实现；`isolated` 需要 PE launcher 或 WSL2/容器。能力差异通过 `agent_info` 报告。
 - Termux/移动端作为可选部署，不进入 v1 主路径。
 
 ### 14.3 部署形态

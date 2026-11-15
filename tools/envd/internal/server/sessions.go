@@ -33,6 +33,7 @@ type Session struct {
 	cmd       *exec.Cmd
 	ptyCmd    *gopty.Cmd
 	pty       gopty.Pty
+	guard     *processGuard
 	stdin     io.WriteCloser
 	output    *os.File
 	chunks    chan []byte
@@ -112,6 +113,11 @@ func (s *Server) toolSessionCreate(raw json.RawMessage) toolResult {
 		if err != nil {
 			return errResult(codeUnsupported, "UNSUPPORTED", "pty unavailable: "+err.Error())
 		}
+		guard, guardErr := newProcessGuard()
+		if guardErr != nil {
+			_ = p.Close()
+			return errResult(codeInternal, "INTERNAL", guardErr.Error())
+		}
 		cmd := p.Command(launch[0], launch[1:]...)
 		cmd.Dir = env.Workspace
 		if runtime.GOOS == "windows" {
@@ -121,16 +127,29 @@ func (s *Server) toolSessionCreate(raw json.RawMessage) toolResult {
 		}
 		if err := cmd.Start(); err != nil {
 			_ = p.Close()
+			guard.close()
 			return sessionStartError(env, err)
+		}
+		if err := guard.assign(cmd.Process.Pid); err != nil {
+			killProcessID(cmd.Process.Pid)
+			_ = p.Close()
+			guard.close()
+			return errResult(codeInternal, "INTERNAL", "assign process job: "+err.Error())
 		}
 		_ = p.Resize(int(cols), int(rows))
 		sess.pty = p
 		sess.ptyCmd = cmd
+		sess.guard = guard
 		go sess.readLoop(p)
 		go func() { _ = cmd.Wait() }()
 	} else {
+		guard, guardErr := newProcessGuard()
+		if guardErr != nil {
+			return errResult(codeInternal, "INTERNAL", guardErr.Error())
+		}
 		cmd := exec.Command(launch[0], launch[1:]...)
 		cmd.Dir = env.Workspace
+		configurePipeProcess(cmd)
 		if runtime.GOOS == "windows" {
 			cmd.Env = launchEnv("PROMPT=" + sessionPromptMarker)
 		} else {
@@ -150,10 +169,20 @@ func (s *Server) toolSessionCreate(raw json.RawMessage) toolResult {
 			_ = writer.Close()
 			_ = output.Close()
 			_ = stdin.Close()
+			guard.close()
 			return sessionStartError(env, err)
+		}
+		if err := guard.assign(cmd.Process.Pid); err != nil {
+			killProcess(cmd)
+			_ = writer.Close()
+			_ = output.Close()
+			_ = stdin.Close()
+			guard.close()
+			return errResult(codeInternal, "INTERNAL", "assign process job: "+err.Error())
 		}
 		_ = writer.Close()
 		sess.cmd = cmd
+		sess.guard = guard
 		sess.stdin = stdin
 		sess.output = output
 		go sess.readLoop(output)
@@ -165,9 +194,15 @@ func (s *Server) toolSessionCreate(raw json.RawMessage) toolResult {
 		sess.close()
 		return errResult(codeInternal, "INTERNAL", err.Error())
 	}
-	if err := sess.waitReady(readyMarker, 5*time.Second); err != nil {
+	var readyErr error
+	if sess.pty != nil {
+		readyErr = sess.waitReadyPTY(readyMarker, 5*time.Second)
+	} else {
+		readyErr = sess.waitReady(readyMarker, 5*time.Second)
+	}
+	if readyErr != nil {
 		sess.close()
-		return errResult(codeInternal, "INTERNAL", err.Error())
+		return errResult(codeInternal, "INTERNAL", readyErr.Error())
 	}
 
 	s.mu.Lock()
@@ -471,6 +506,19 @@ func (s *Server) toolSessionClose(raw json.RawMessage) toolResult {
 	})
 }
 
+func (s *Server) closeAllSessions() {
+	s.mu.Lock()
+	sessions := make([]*Session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		sessions = append(sessions, sess)
+	}
+	s.sessions = make(map[string]*Session)
+	s.mu.Unlock()
+	for _, sess := range sessions {
+		sess.close()
+	}
+}
+
 func (s *Server) getSession(id string) (*Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -545,6 +593,44 @@ func (sess *Session) waitReady(marker string, timeout time.Duration) error {
 	}
 }
 
+// waitReadyPTY ignores the terminal echo of the ready command and waits for the
+// marker printed by the shell. Without this, a PTY line discipline can echo the
+// command text and make session_create return before the shell has executed it.
+func (sess *Session) waitReadyPTY(marker string, timeout time.Duration) error {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	var pending []byte
+	for {
+		select {
+		case chunk, ok := <-sess.chunks:
+			if !ok {
+				return fmt.Errorf("shell exited before ready")
+			}
+			pending = append(pending, chunk...)
+			for {
+				index := bytes.IndexByte(pending, '\n')
+				if index < 0 {
+					break
+				}
+				line := string(pending[:index])
+				pending = pending[index+1:]
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "printf '") || strings.HasPrefix(trimmed, "echo ") {
+					continue
+				}
+				if strings.Contains(line, marker) {
+					return nil
+				}
+			}
+			if len(pending) > 1<<20 {
+				pending = pending[len(pending)-(1<<20):]
+			}
+		case <-deadline.C:
+			return fmt.Errorf("shell did not become ready within %s", timeout)
+		}
+	}
+}
+
 func handleSessionLine(
 	line, marker string,
 	out *bytes.Buffer,
@@ -588,10 +674,13 @@ func (sess *Session) closeLocked() {
 		_ = sess.pty.Close()
 	}
 	if sess.ptyCmd != nil && sess.ptyCmd.Process != nil {
-		_ = sess.ptyCmd.Process.Kill()
+		killProcessID(sess.ptyCmd.Process.Pid)
 	}
-	if sess.cmd != nil && sess.cmd.Process != nil {
-		_ = sess.cmd.Process.Kill()
+	if sess.cmd != nil {
+		killProcess(sess.cmd)
+	}
+	if sess.guard != nil {
+		sess.guard.close()
 	}
 	if sess.stdin != nil {
 		_ = sess.stdin.Close()

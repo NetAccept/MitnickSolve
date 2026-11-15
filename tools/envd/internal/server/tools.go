@@ -203,6 +203,16 @@ func (s *Server) toolEnvCreate(raw json.RawMessage) toolResult {
 	return okResult("created "+id, env)
 }
 
+func execStartFailure(env *Env, err error) toolResult {
+	var execErr *exec.Error
+	if env.Profile == "isolated" &&
+		(errors.As(err, &execErr) || errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission)) {
+		return errResult(codeFailedPrecondition, "FAILED_PRECONDITION",
+			"sandbox launcher failed to start")
+	}
+	return errResult(codeInternal, "INTERNAL", err.Error())
+}
+
 func (s *Server) toolExec(raw json.RawMessage) toolResult {
 	var args struct {
 		EnvID          string   `json:"env_id"`
@@ -243,7 +253,14 @@ func (s *Server) toolExec(raw json.RawMessage) toolResult {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(args.TimeoutMS)*time.Millisecond)
 	defer cancel()
+	guard, err := newProcessGuard()
+	if err != nil {
+		return errResult(codeInternal, "INTERNAL", "create process job: "+err.Error())
+	}
+	defer guard.close()
 	cmd := exec.CommandContext(ctx, launch[0], launch[1:]...)
+	configurePipeProcess(cmd)
+	cmd.Cancel = func() error { return processCancel(cmd) }
 	cmd.Dir = cwd
 	cmd.Env = launchEnv()
 	cmd.WaitDelay = 5 * time.Second
@@ -253,7 +270,14 @@ func (s *Server) toolExec(raw json.RawMessage) toolResult {
 	cmd.Stderr = stderr
 
 	started := time.Now()
-	err = cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return execStartFailure(env, err)
+	}
+	if err := guard.assign(cmd.Process.Pid); err != nil {
+		killProcess(cmd)
+		return errResult(codeInternal, "INTERNAL", "assign process job: "+err.Error())
+	}
+	err = cmd.Wait()
 	duration := time.Since(started).Milliseconds()
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return errResult(codeDeadlineExceeded, "DEADLINE_EXCEEDED",

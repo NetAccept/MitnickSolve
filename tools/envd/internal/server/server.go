@@ -144,6 +144,7 @@ func RunEmbedded(ctx context.Context, opts Options) error {
 }
 
 func (s *Server) serve(in io.Reader, out io.Writer) error {
+	defer s.closeAllSessions()
 	reader := bufio.NewReader(in)
 
 	first, err := protocol.ReadFrame(reader, s.opts.MaxFrame)
