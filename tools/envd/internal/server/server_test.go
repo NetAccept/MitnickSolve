@@ -271,3 +271,17 @@ func mustTool(t *testing.T, s *Server, name, args string) map[string]any {
 	}
 	return data
 }
+
+func TestEnvOpenReturnsExistingEnvironment(t *testing.T) {
+	s := New(Options{Root: t.TempDir(), MaxFrame: protocol.EmbeddedMaxFrame})
+	created := mustTool(t, s, "env_create", `{"name":"open","profile":"dev"}`)
+	id := created["env_id"].(string)
+	opened := mustTool(t, s, "env_open", `{"env_id":"`+id+`"}`)
+	if opened["env_id"] != id || opened["workspace"] != created["workspace"] {
+		t.Fatalf("opened = %v, created = %v", opened, created)
+	}
+	detail := toolError(t, s.callTool("env_open", json.RawMessage(`{"env_id":"env_missing"}`)))
+	if detail["name"] != "NOT_FOUND" {
+		t.Fatalf("error = %v", detail)
+	}
+}

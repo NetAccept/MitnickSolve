@@ -9,7 +9,7 @@ Execution environment. Two transports are implemented from
   Both require a bearer token; TLS 1.3 is enabled when `--tls-cert` and
   `--tls-key` are supplied.
 
-Tools: `agent_info`, `env_create`, `exec`, `read_file`, `write_file`,
+Tools: `agent_info`, `env_create`, `env_open`, `exec`, `read_file`, `write_file`,
 `list_dir`, `stat_file`, `session_create/exec/write/read/resize/list/close`.
 PTY sessions use raw `session_write`/`session_read`/`session_resize`;
 `session_exec` is pipe-only.

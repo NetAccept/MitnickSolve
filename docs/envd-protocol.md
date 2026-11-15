@@ -225,6 +225,14 @@
 
 > 当前实现只支持 `kind=managed`；`limits`/`labels` 尚未解析。`profile=isolated` 在 service 模式下需要 `--sandbox-command` 且 launcher 通过校验，否则返回 `FAILED_PRECONDITION`，不会创建 workspace。
 
+#### `env_open`
+
+```json
+{"env_id": "env_..."}
+```
+
+返回已存在环境的 env 描述（`env_id`、workspace、profile、isolation）。不存在时返回 `NOT_FOUND`。用于 kernel 检查点恢复时重开原环境，从而保留 shell/session 状态；它不创建、克隆或删除环境。
+
 - `managed`：必须位于 envd 数据目录下。
 - `mounted`：必须位于 `-allow-root` 声明的根内；删除只移除元数据，不删用户文件。
 - 启动时重新校验 mounted 根；配置失效则拒绝启动。

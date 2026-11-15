@@ -112,6 +112,10 @@ struct Cli {
     /// Restore a native context checkpoint (including tool call/result pairs).
     #[arg(long)]
     resume_checkpoint: Option<PathBuf>,
+    /// Create a fresh envd environment instead of reopening the checkpoint's
+    /// environment (forked tasks use this).
+    #[arg(long)]
+    fresh_env: bool,
     /// Approximate token budget for the agent context.
     #[arg(long, default_value_t = 100_000)]
     max_context_tokens: usize,
@@ -406,9 +410,15 @@ fn spawn_stdin_reader(
 struct Backend {
     client: Box<dyn EnvTransport>,
     env_id: String,
+    reused_env: bool,
 }
 
-fn connect_backend(cli: &Cli, sink: &dyn EventSink, name: &str) -> Result<Backend> {
+fn connect_backend(
+    cli: &Cli,
+    sink: &dyn EventSink,
+    name: &str,
+    resume_env: Option<&str>,
+) -> Result<Backend> {
     if !cli.tools_dir.exists() {
         bail!("tool directory not found: {}", cli.tools_dir.display());
     }
@@ -449,26 +459,92 @@ fn connect_backend(cli: &Cli, sink: &dyn EventSink, name: &str) -> Result<Backen
             .unwrap_or(0);
         human_line(cli, &format!("envd service: {url} ({tool_count} tools)"));
         emit(sink, "mcp.tools", json!({"count": tool_count}))?;
-        let env = tool_data(
-            &mut service,
-            "env_create",
-            json!({"name": name, "kind": "managed", "profile": cli.envd_profile}),
-            sink,
-        )?;
+        let mut reused = None;
+        if !cli.fresh_env {
+            if let Some(env_id) = resume_env {
+                match service.call_tool("env_open", json!({"env_id": env_id})) {
+                    Ok(result) => {
+                        let is_error = result
+                            .get("isError")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let structured = result
+                            .get("structuredContent")
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        let ok = structured
+                            .get("ok")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let data = structured.get("data").cloned().unwrap_or(Value::Null);
+                        let profile = data.get("profile").and_then(Value::as_str);
+                        if !is_error && ok && profile.is_none_or(|value| value == cli.envd_profile)
+                        {
+                            emit(
+                                sink,
+                                "env.open",
+                                json!({
+                                    "env_id": env_id,
+                                    "profile": data.get("profile"),
+                                    "isolation": data.get("isolation")
+                                }),
+                            )?;
+                            reused = Some(data);
+                        } else {
+                            emit(
+                                sink,
+                                "env.open_failed",
+                                json!({
+                                    "env_id": env_id,
+                                    "reason": if is_error || !ok {
+                                        "not_available"
+                                    } else {
+                                        "profile_mismatch"
+                                    }
+                                }),
+                            )?;
+                        }
+                    }
+                    Err(error) => {
+                        emit(
+                            sink,
+                            "env.open_failed",
+                            json!({"env_id": env_id, "reason": error.to_string()}),
+                        )?;
+                    }
+                }
+            }
+        }
+        let reused_env = reused.is_some();
+        let env = match reused {
+            Some(env) => env,
+            None => tool_data(
+                &mut service,
+                "env_create",
+                json!({"name": name, "kind": "managed", "profile": cli.envd_profile}),
+                sink,
+            )?,
+        };
         let env_id = env
             .get("env_id")
             .and_then(Value::as_str)
-            .context("env_create did not return env_id")?
+            .context("env_create/env_open did not return env_id")?
             .to_string();
-        human_line(cli, &format!("env: {env_id}"));
-        emit(
-            sink,
-            "env.create",
-            json!({"env_id": env_id, "workspace": env.get("workspace")}),
-        )?;
+        human_line(
+            cli,
+            &format!("env: {env_id}{}", if reused_env { " (reused)" } else { "" }),
+        );
+        if !reused_env {
+            emit(
+                sink,
+                "env.create",
+                json!({"env_id": env_id, "workspace": env.get("workspace")}),
+            )?;
+        }
         return Ok(Backend {
             client: Box::new(service),
             env_id,
+            reused_env,
         });
     }
 
@@ -537,6 +613,7 @@ fn connect_backend(cli: &Cli, sink: &dyn EventSink, name: &str) -> Result<Backen
     Ok(Backend {
         client: Box::new(embedded),
         env_id,
+        reused_env: false,
     })
 }
 fn main() -> Result<()> {
@@ -568,7 +645,7 @@ fn main() -> Result<()> {
         return run_session(&cli, sink, &events_path);
     }
 
-    let backend = connect_backend(&cli, sink.as_ref(), "demo")?;
+    let backend = connect_backend(&cli, sink.as_ref(), "demo", None)?;
     let env_id = backend.env_id.clone();
     let mut client = backend.client;
 
@@ -833,8 +910,28 @@ fn main() -> Result<()> {
 }
 
 fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Path) -> Result<()> {
-    let backend = connect_backend(cli, sink.as_ref(), "session")?;
+    let checkpoint = match &cli.resume_checkpoint {
+        Some(path) => {
+            let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+            let checkpoint: agent::Checkpoint =
+                serde_json::from_slice(&bytes).context("parse checkpoint")?;
+            if checkpoint.schema_version != 1 {
+                bail!(
+                    "unsupported checkpoint schema {}",
+                    checkpoint.schema_version
+                );
+            }
+            Some(checkpoint)
+        }
+        None => None,
+    };
+    let resume_env = checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.env_id.as_deref())
+        .map(str::to_string);
+    let backend = connect_backend(cli, sink.as_ref(), "session", resume_env.as_deref())?;
     let env_id = backend.env_id;
+    let env_reused = backend.reused_env;
     let client = backend.client;
 
     let object_store: Arc<dyn ObjectStore> =
@@ -898,32 +995,32 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
     let limits = ContextLimits::default()
         .with_max_tokens(cli.max_context_tokens)
         .with_min_recent_observations(cli.min_recent_observations);
-    let (mut context, initial_turns) = if let Some(path) = &cli.resume_checkpoint {
-        let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-        let checkpoint: agent::Checkpoint =
-            serde_json::from_slice(&bytes).context("parse checkpoint")?;
-        if checkpoint.schema_version != 1 {
-            bail!(
-                "unsupported checkpoint schema {}",
-                checkpoint.schema_version
-            );
-        }
+    let (mut context, initial_turns) = if let Some(checkpoint) = checkpoint {
         let turns = checkpoint.turns;
         let messages = checkpoint.messages.len();
         let mut context = ContextManager::restore(limits.clone(), checkpoint.messages);
-        context.push_pinned(
-            Role::System,
-            "Resumed from a context checkpoint. Environment and session IDs in the restored \
-             transcript are stale; create a new session before running commands.",
-        );
+        if env_reused {
+            context.push_pinned(
+                Role::System,
+                format!(
+                    "Resumed from a context checkpoint with the original envd environment {env_id} reopened. Session IDs in the restored transcript remain valid."
+                ),
+            );
+        } else {
+            context.push_pinned(
+                Role::System,
+                "Resumed from a context checkpoint. Environment and session IDs in the restored transcript are stale; create a new session before running commands.",
+            );
+        }
         context.push_pinned(Role::System, format!("env_id={env_id}"));
         emit(
             sink.as_ref(),
             "session.checkpoint_resume",
             json!({
-                "path": path.display().to_string(),
+                "path": cli.resume_checkpoint.as_ref().map(|path| path.display().to_string()).unwrap_or_default(),
                 "turns": turns,
-                "messages": messages
+                "messages": messages,
+                "env_reused": env_reused
             }),
         )?;
         (context, turns)

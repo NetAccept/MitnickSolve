@@ -86,6 +86,10 @@ pub struct Checkpoint {
     pub schema_version: u32,
     pub turns: u64,
     pub messages: Vec<ContextMessage>,
+    /// envd environment that produced the transcript. Service-mode resume can
+    /// reopen it so session IDs and shell state remain valid.
+    #[serde(default)]
+    pub env_id: Option<String>,
 }
 
 /// Blocking approval channel. The session calls this from the turn thread; the
@@ -491,6 +495,7 @@ impl Session {
             schema_version: 1,
             turns: self.turns,
             messages: self.context.messages().to_vec(),
+            env_id: Some(self.env_id.clone()),
         };
         let bytes = match serde_json::to_vec_pretty(&checkpoint) {
             Ok(bytes) => bytes,
@@ -819,6 +824,7 @@ mod tests {
         let checkpoint: Checkpoint = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(checkpoint.schema_version, 1);
         assert_eq!(checkpoint.turns, 2);
+        assert_eq!(checkpoint.env_id.as_deref(), Some("test"));
         assert_eq!(checkpoint.messages.len(), 5);
         let restored = ContextManager::restore(limits, checkpoint.messages);
         assert_eq!(restored.messages().len(), 5);

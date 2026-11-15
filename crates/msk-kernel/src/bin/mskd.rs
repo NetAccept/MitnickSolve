@@ -1072,6 +1072,11 @@ impl Daemon {
         if let Some(checkpoint) = &resume_checkpoint {
             command.arg("--resume-checkpoint").arg(checkpoint);
         }
+        if forked_from.is_some() {
+            // A fork explores a branch with a fresh environment; it must not
+            // share the parent's shells or filesystem state.
+            command.arg("--fresh-env");
+        }
         if provider == "component" {
             if let Some(manifest) = &self.component_manifest {
                 command.arg("--component-manifest").arg(manifest);

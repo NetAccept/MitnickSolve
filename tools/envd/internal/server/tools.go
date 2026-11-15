@@ -75,6 +75,8 @@ func (s *Server) callTool(name string, raw json.RawMessage) toolResult {
 		return s.toolAgentInfo()
 	case "env_create":
 		return s.toolEnvCreate(raw)
+	case "env_open":
+		return s.toolEnvOpen(raw)
 	case "exec":
 		return s.toolExec(raw)
 	case "read_file":
@@ -211,6 +213,20 @@ func execStartFailure(env *Env, err error) toolResult {
 			"sandbox launcher failed to start")
 	}
 	return errResult(codeInternal, "INTERNAL", err.Error())
+}
+
+func (s *Server) toolEnvOpen(raw json.RawMessage) toolResult {
+	var args struct {
+		EnvID string `json:"env_id"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return errResult(codeInvalidArgument, "INVALID_ARGUMENT", err.Error())
+	}
+	env, err := s.getEnv(args.EnvID)
+	if err != nil {
+		return errResult(codeNotFound, "NOT_FOUND", err.Error())
+	}
+	return okResult("opened "+env.ID, env)
 }
 
 func (s *Server) toolExec(raw json.RawMessage) toolResult {

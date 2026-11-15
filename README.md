@@ -100,9 +100,12 @@ M0 scaffold plus the P1 session/turn slice:
 - Native context checkpoints: every session turn writes
   `<root>/checkpoint.json` (or `--checkpoint`) with the full message list,
   including native tool call/result pairs. `--resume-checkpoint` restores it
-  under a fresh env and marks old env/session IDs stale; turn numbering
-  continues. Unix checkpoint files are written 0600. `create --fork-from <task>`
-  copies a parent checkpoint into a branched task with a fresh env.
+  and continues turn numbering. In service mode it reopens the checkpoint's
+  envd environment when `env_open` succeeds, so shell/session IDs remain valid;
+  embedded or missing environments fall back to a new env and mark the old IDs
+  stale. `--fresh-env` forces a new environment (forks use it). Unix checkpoint
+  files are written 0600. `create --fork-from <task>` copies a parent
+  checkpoint into a branched task with a fresh env.
 - Event integrity and replay: `msk-replay` validates `schema_version`, seq
   order, duplicate IDs, and parent links, then prints a transcript or filtered
   JSONL. `msk --session --resume <events.jsonl>` pins a capped transcript into
@@ -301,7 +304,9 @@ target/debug/msk --envd target/debug/envd --root .msk/session --session \
 The resumed transcript is pinned as context; old envd environment and session
 IDs are explicitly marked stale, so the model should create a new session.
 `--resume-checkpoint` restores the native context (including tool call/result
-pairs) and continues turn numbering; `--checkpoint` changes the write path.
+pairs) and continues turn numbering; in service mode it reopens the saved env
+when possible, preserving shells and session IDs. `--fresh-env` forces a new
+environment; `--checkpoint` changes the write path.
 
 Use `--provider openai` (or `openai-responses`) with the usual model environment
 variables for a real conversation. `--goal` is only used by the one-shot demo;

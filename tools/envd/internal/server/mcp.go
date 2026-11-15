@@ -127,6 +127,13 @@ func toolDefinitions(profiles []string) []map[string]any {
 			}),
 		},
 		{
+			"name":        "env_open",
+			"description": "Open an existing managed environment by id.",
+			"inputSchema": objectSchema(map[string]any{
+				"env_id": stringProp(),
+			}, "env_id"),
+		},
+		{
 			"name":        "exec",
 			"description": "Run a command in an environment and return captured output.",
 			"inputSchema": objectSchema(map[string]any{
