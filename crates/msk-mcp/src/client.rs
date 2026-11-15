@@ -27,17 +27,55 @@ pub struct ServiceClient {
 
 impl ServiceClient {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
+        Self::new_with_ca(base_url, token, None).expect("no CA parsing without a bundle")
+    }
+
+    /// Creates a client that trusts the certificates in `ca_pem` instead of the
+    /// Mozilla roots. The same bundle can be used for the data-plane TLS
+    /// settings.
+    pub fn new_with_ca(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        ca_pem: Option<Vec<u8>>,
+    ) -> io::Result<Self> {
+        let mut builder = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(120)))
-            .http_status_as_error(false)
-            .build()
-            .into();
-        Self {
+            .http_status_as_error(false);
+        if let Some(pem) = ca_pem {
+            let mut certificates = Vec::new();
+            for item in ureq::tls::parse_pem(&pem) {
+                match item {
+                    Ok(ureq::tls::PemItem::Certificate(certificate)) => {
+                        certificates.push(certificate)
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("parse envd CA bundle: {error}"),
+                        ));
+                    }
+                }
+            }
+            if certificates.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "envd CA bundle contains no certificates",
+                ));
+            }
+            let tls = ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::Specific(std::sync::Arc::new(
+                    certificates,
+                )))
+                .build();
+            builder = builder.tls_config(tls);
+        }
+        Ok(Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token: token.into(),
-            agent,
+            agent: builder.build().into(),
             next_id: 0,
-        }
+        })
     }
 
     pub fn initialize(&mut self) -> io::Result<Value> {
@@ -364,6 +402,68 @@ mod tests {
         });
 
         let mut client = ServiceClient::new(format!("http://{address}"), "secret");
+        let result = client.request("ping", json!({})).unwrap();
+        assert_eq!(result["ok"], true);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn service_client_trusts_a_supplied_ca_for_https() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        use rustls::{ServerConfig, ServerConnection, StreamOwned};
+        use std::sync::Arc;
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let server_key = KeyPair::generate().unwrap();
+        let server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+        let ca_pem = ca_cert.pem().into_bytes();
+        let config =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![CertificateDer::from(server_cert.der().to_vec())],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+                )
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let connection = ServerConnection::new(Arc::new(config)).unwrap();
+            let mut stream = StreamOwned::new(connection, stream);
+            while stream.conn.is_handshaking() {
+                stream.conn.complete_io(&mut stream.sock).unwrap();
+            }
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap() == 0 {
+                    break;
+                }
+                request.push(byte[0]);
+            }
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let mut client =
+            ServiceClient::new_with_ca(format!("https://localhost:{port}"), "secret", Some(ca_pem))
+                .unwrap();
         let result = client.request("ping", json!({})).unwrap();
         assert_eq!(result["ok"], true);
         server.join().unwrap();

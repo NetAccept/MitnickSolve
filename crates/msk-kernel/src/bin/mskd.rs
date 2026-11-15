@@ -41,6 +41,15 @@ struct Cli {
     /// envd service data address; enables the binary terminal path.
     #[arg(long)]
     envd_data_addr: Option<String>,
+    /// Use TLS 1.3 for --envd-data-addr.
+    #[arg(long)]
+    envd_data_tls: bool,
+    /// TLS server name for the data plane (defaults to the address host).
+    #[arg(long)]
+    envd_data_tls_name: Option<String>,
+    /// PEM CA bundle for the envd HTTPS control plane and data-plane TLS.
+    #[arg(long)]
+    envd_ca: Option<PathBuf>,
     /// Signed llm.provider manifest forwarded to component-provider tasks.
     #[arg(long)]
     component_manifest: Option<PathBuf>,
@@ -323,6 +332,9 @@ struct Daemon {
     envd_url: Option<String>,
     envd_token: Option<String>,
     envd_data_addr: Option<String>,
+    envd_data_tls: bool,
+    envd_data_tls_name: Option<String>,
+    envd_ca: Option<PathBuf>,
     component_manifest: Option<PathBuf>,
     component_trust: Option<PathBuf>,
     component_host: Option<PathBuf>,
@@ -364,6 +376,24 @@ fn main() -> Result<()> {
     let envd_data_addr = cli.envd_data_addr.clone();
     if envd_url.is_some() && envd_token.is_none() {
         bail!("--envd-token or ENVD_TOKEN is required with --envd-url");
+    }
+    if cli.envd_data_tls && envd_data_addr.is_none() {
+        bail!("--envd-data-tls requires --envd-data-addr");
+    }
+    if cli.envd_data_tls && envd_url.is_none() {
+        bail!("--envd-data-tls is only used with --envd-url");
+    }
+    if cli.envd_ca.is_some() && envd_url.is_none() {
+        bail!("--envd-ca requires --envd-url");
+    }
+    let envd_ca = cli
+        .envd_ca
+        .as_ref()
+        .map(|path| msk_ipc::normalize_root(path));
+    if let Some(path) = &envd_ca {
+        if !path.exists() {
+            bail!("envd CA bundle not found: {}", path.display());
+        }
     }
     let component_manifest = cli
         .component_manifest
@@ -418,6 +448,9 @@ fn main() -> Result<()> {
         envd_url,
         envd_token,
         envd_data_addr,
+        envd_data_tls: cli.envd_data_tls,
+        envd_data_tls_name: cli.envd_data_tls_name.clone(),
+        envd_ca,
         component_manifest,
         component_trust,
         component_host,
@@ -996,6 +1029,9 @@ impl Daemon {
                 .arg(url)
                 .arg("--envd-token")
                 .arg(self.envd_token.as_deref().unwrap_or_default());
+            if let Some(ca) = &self.envd_ca {
+                command.arg("--envd-ca").arg(ca);
+            }
         } else if let Some(envd) = &self.envd {
             command.arg("--envd").arg(envd);
         }
@@ -1729,8 +1765,18 @@ impl Daemon {
         let cols = params.get("cols").and_then(Value::as_u64).unwrap_or(100) as u16;
         let rows = params.get("rows").and_then(Value::as_u64).unwrap_or(30) as u16;
         let mut client: Box<dyn EnvTransport> = if let Some(url) = &self.envd_url {
-            let mut service =
-                ServiceClient::new(url, self.envd_token.as_deref().unwrap_or_default());
+            let ca_pem = match &self.envd_ca {
+                Some(path) => Some(
+                    fs::read(path).with_context(|| format!("read envd CA {}", path.display()))?,
+                ),
+                None => None,
+            };
+            let mut service = ServiceClient::new_with_ca(
+                url,
+                self.envd_token.as_deref().unwrap_or_default(),
+                ca_pem,
+            )
+            .context("configure envd TLS")?;
             service.initialize()?;
             Box::new(service)
         } else {
@@ -1765,14 +1811,44 @@ impl Daemon {
             .to_string();
 
         let data = if let (Some(address), Some(_)) = (&self.envd_data_addr, &self.envd_url) {
-            match EnvDataClient::connect(
-                address,
-                self.envd_token.as_deref().unwrap_or_default(),
-                &session_id,
-                cols,
-                rows,
-                None,
-            ) {
+            let tls = if self.envd_data_tls {
+                let ca_pem = match &self.envd_ca {
+                    Some(path) => Some(
+                        fs::read(path)
+                            .with_context(|| format!("read envd CA {}", path.display()))?,
+                    ),
+                    None => None,
+                };
+                Some(msk_mcp::TlsOptions {
+                    server_name: self
+                        .envd_data_tls_name
+                        .clone()
+                        .unwrap_or_else(|| host_part(address)),
+                    ca_pem,
+                })
+            } else {
+                None
+            };
+            let connected = match &tls {
+                Some(tls) => EnvDataClient::connect_tls(
+                    address,
+                    self.envd_token.as_deref().unwrap_or_default(),
+                    &session_id,
+                    cols,
+                    rows,
+                    None,
+                    tls,
+                ),
+                None => EnvDataClient::connect(
+                    address,
+                    self.envd_token.as_deref().unwrap_or_default(),
+                    &session_id,
+                    cols,
+                    rows,
+                    None,
+                ),
+            };
+            match connected {
                 Ok(data) => Some(data),
                 Err(err) => {
                     let _ = client.call_tool("session_close", json!({"session_id": session_id}));
@@ -1920,6 +1996,18 @@ impl Daemon {
         *guard = None;
         Ok(data)
     }
+}
+
+fn host_part(address: &str) -> String {
+    if let Some(rest) = address.strip_prefix('[')
+        && let Some((host, _)) = rest.split_once(']')
+    {
+        return host.to_string();
+    }
+    address
+        .rsplit_once(':')
+        .map(|(host, _)| host.to_string())
+        .unwrap_or_else(|| address.to_string())
 }
 
 fn mcp_data(result: &Value) -> Result<Value> {

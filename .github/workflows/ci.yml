@@ -150,3 +150,50 @@ jobs:
           [ "$(target/debug/mskctl --root .msk/ci state "$fork_task" | jq -r .state)" = done ]
           grep -q '"kind":"session.checkpoint_resume"' \
             .msk/ci/tasks/"$fork_task"/events.jsonl
+      - name: TLS service and data plane smoke
+        run: |
+          set -euo pipefail
+          rm -rf .msk/tls-ci
+          mkdir -p .msk/tls-ci
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout .msk/tls-ci/ca.key -out .msk/tls-ci/ca.pem \
+            -days 1 -subj "/CN=Mitnick CI CA" >/dev/null 2>&1
+          openssl req -newkey rsa:2048 -nodes \
+            -keyout .msk/tls-ci/server.key -out .msk/tls-ci/server.csr \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1
+          openssl x509 -req -in .msk/tls-ci/server.csr \
+            -CA .msk/tls-ci/ca.pem -CAkey .msk/tls-ci/ca.key -CAcreateserial \
+            -out .msk/tls-ci/server.pem -days 1 -copy_extensions copy >/dev/null 2>&1
+          target/debug/envd --service --root .msk/tls-ci/envd \
+            --listen 127.0.0.1:17810 --data-listen 127.0.0.1:17811 \
+            --token tls-ci-token \
+            --tls-cert .msk/tls-ci/server.pem --tls-key .msk/tls-ci/server.key \
+            >.msk/tls-ci/envd.log 2>&1 &
+          envd_pid=$!
+          daemon_pid=
+          trap 'kill "$envd_pid" $daemon_pid 2>/dev/null || true' EXIT
+          for _ in $(seq 1 100); do
+            if curl -kfsS https://localhost:17810/healthz >/dev/null 2>&1; then break; fi
+            sleep 0.1
+          done
+          target/debug/mskd --root .msk/tls-ci/daemon \
+            --envd-url https://localhost:17810 --envd-token tls-ci-token \
+            --envd-ca .msk/tls-ci/ca.pem \
+            --envd-data-addr 127.0.0.1:17811 --envd-data-tls \
+            --envd-data-tls-name localhost \
+            --tools-dir tools/wasm >.msk/tls-ci/daemon.log 2>&1 &
+          daemon_pid=$!
+          for _ in $(seq 1 100); do
+            if [ -f .msk/tls-ci/daemon/ipc.token ]; then break; fi
+            sleep 0.1
+          done
+          session=$(target/debug/mskctl --root .msk/tls-ci/daemon \
+            terminal-open --cols 80 --rows 24 | jq -r .session_id)
+          target/debug/mskctl --root .msk/tls-ci/daemon terminal-write \
+            --session "$session" --line "echo tls-ok" >/dev/null
+          output=$(target/debug/mskctl --root .msk/tls-ci/daemon terminal-read \
+            --session "$session" --timeout-ms 3000)
+          printf '%s' "$output" | grep -q "tls-ok"
+          target/debug/mskctl --root .msk/tls-ci/daemon terminal-close \
+            --session "$session" >/dev/null

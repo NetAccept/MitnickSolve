@@ -181,6 +181,19 @@ target/debug/mskd --root .msk --envd-url http://127.0.0.1:7800 \
   --tools-dir tools/wasm
 ```
 
+For a TLS service, use an `https://` URL and add `--envd-data-tls` so the
+daemon terminal also speaks TLS 1.3 to the data plane. Both planes trust the
+Mozilla roots by default; `--envd-ca ca.pem` replaces them with a private CA
+bundle (which must include the issuer of the envd certificate):
+```sh
+target/debug/msk --envd-url https://envd.internal:7800 --envd-token "$ENVD_TOKEN" \
+  --envd-ca ca.pem --root .msk/remote --session
+target/debug/mskd --root .msk --envd-url https://envd.internal:7800 \
+  --envd-token "$ENVD_TOKEN" --envd-data-addr envd.internal:7801 \
+  --envd-data-tls --envd-data-tls-name envd.internal --envd-ca ca.pem \
+  --tools-dir tools/wasm
+```
+
 With `--envd-data-addr`, the daemon terminal uses the binary MSDP data plane
 (`DATA`/`CREDIT`/`RESIZE`); without it, terminal I/O falls back to control-plane
 `session_read`/`session_write`.

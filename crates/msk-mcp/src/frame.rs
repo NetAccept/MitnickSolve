@@ -109,7 +109,7 @@ impl Frame {
     }
 
     /// Returns `Ok(None)` only on a clean EOF before any header byte.
-    pub fn decode<R: Read>(reader: &mut R, max_frame: usize) -> io::Result<Option<Self>> {
+    pub fn decode<R: Read + ?Sized>(reader: &mut R, max_frame: usize) -> io::Result<Option<Self>> {
         let mut header = [0u8; HEADER_LEN];
         let mut filled = 0;
         while filled < HEADER_LEN {

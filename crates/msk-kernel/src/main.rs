@@ -61,6 +61,9 @@ struct Cli {
     /// Bearer token for --envd-url (defaults to ENVD_TOKEN).
     #[arg(long)]
     envd_token: Option<String>,
+    /// PEM CA bundle for the envd HTTPS control plane.
+    #[arg(long)]
+    envd_ca: Option<PathBuf>,
     /// Kernel state directory (events, envd data).
     #[arg(long, default_value = ".msk")]
     root: PathBuf,
@@ -415,7 +418,14 @@ fn connect_backend(cli: &Cli, sink: &dyn EventSink, name: &str) -> Result<Backen
             .clone()
             .or_else(|| std::env::var("ENVD_TOKEN").ok())
             .context("--envd-token or ENVD_TOKEN is required with --envd-url")?;
-        let mut service = ServiceClient::new(url, token);
+        let ca_pem = match &cli.envd_ca {
+            Some(path) => Some(
+                std::fs::read(path).with_context(|| format!("read envd CA {}", path.display()))?,
+            ),
+            None => None,
+        };
+        let mut service =
+            ServiceClient::new_with_ca(url, token, ca_pem).context("configure envd TLS")?;
         let init = service.initialize().context("envd service initialize")?;
         emit(sink, "mcp.initialize", init)?;
         let tools = service.request("tools/list", json!({}))?;

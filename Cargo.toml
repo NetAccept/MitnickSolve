@@ -52,6 +52,9 @@ time = { version = "0.3", features = ["formatting"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = { version = "3.5", features = ["json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+webpki-roots = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [profile.release]
