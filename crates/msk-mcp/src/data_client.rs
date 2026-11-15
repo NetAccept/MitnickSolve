@@ -6,7 +6,7 @@
 
 use std::io::{self, Write};
 use std::net::TcpStream;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,8 +22,70 @@ pub enum DataEvent {
     Error(String),
 }
 
+struct CreditState {
+    credit: u64,
+    closed: bool,
+}
+
+struct InputCredit {
+    state: Mutex<CreditState>,
+    condvar: Condvar,
+}
+
+impl InputCredit {
+    fn new(credit: u64) -> Self {
+        Self {
+            state: Mutex::new(CreditState {
+                credit,
+                closed: false,
+            }),
+            condvar: Condvar::new(),
+        }
+    }
+
+    fn grant(&self, delta: u64) {
+        if delta == 0 {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.credit = state.credit.saturating_add(delta).min(4 << 20);
+            self.condvar.notify_all();
+        }
+    }
+
+    fn take(&self, want: usize) -> usize {
+        if want == 0 {
+            return 0;
+        }
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return 0,
+        };
+        while state.credit == 0 && !state.closed {
+            state = match self.condvar.wait(state) {
+                Ok(state) => state,
+                Err(_) => return 0,
+            };
+        }
+        if state.closed {
+            return 0;
+        }
+        let granted = state.credit.min(want as u64) as usize;
+        state.credit -= granted as u64;
+        granted
+    }
+
+    fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+            self.condvar.notify_all();
+        }
+    }
+}
+
 pub struct EnvDataClient {
     writer: Arc<Mutex<TcpStream>>,
+    input_credit: Arc<InputCredit>,
     events: mpsc::Receiver<DataEvent>,
     buffer: Vec<u8>,
     session_id: String,
@@ -83,6 +145,8 @@ impl EnvDataClient {
         }
         read_stream.set_read_timeout(None)?;
 
+        let input_credit = Arc::new(InputCredit::new(65536));
+        let reader_credit = input_credit.clone();
         let (sender, receiver) = mpsc::channel();
         let reader_writer = writer.clone();
         let reader = thread::spawn(move || {
@@ -102,8 +166,16 @@ impl EnvDataClient {
                                 return;
                             }
                         }
+                        FrameKind::Credit => {
+                            if frame.payload.len() == 8 {
+                                let delta =
+                                    u64::from_be_bytes(frame.payload[..8].try_into().unwrap());
+                                reader_credit.grant(delta);
+                            }
+                        }
                         FrameKind::Exit => {
                             let value = frame.json().unwrap_or(Value::Null);
+                            reader_credit.close();
                             let _ = sender.send(DataEvent::Exit(value));
                             return;
                         }
@@ -113,10 +185,12 @@ impl EnvDataClient {
                                 .get("message")
                                 .and_then(Value::as_str)
                                 .unwrap_or("envd data error");
+                            reader_credit.close();
                             let _ = sender.send(DataEvent::Error(message.to_string()));
                             return;
                         }
                         FrameKind::Close => {
+                            reader_credit.close();
                             let _ = sender.send(DataEvent::Closed);
                             return;
                         }
@@ -124,10 +198,12 @@ impl EnvDataClient {
                         _ => {}
                     },
                     Ok(None) => {
+                        reader_credit.close();
                         let _ = sender.send(DataEvent::Closed);
                         return;
                     }
                     Err(error) => {
+                        reader_credit.close();
                         let _ = sender.send(DataEvent::Error(error.to_string()));
                         return;
                     }
@@ -137,6 +213,7 @@ impl EnvDataClient {
 
         Ok(Self {
             writer,
+            input_credit,
             events: receiver,
             buffer: Vec::new(),
             session_id: session_id.to_string(),
@@ -182,7 +259,9 @@ impl EnvDataClient {
     }
 
     pub fn close(&self) -> io::Result<()> {
-        send_bytes(&self.writer, FrameKind::Close, &[])
+        let result = send_bytes(&self.writer, FrameKind::Close, &[]);
+        self.input_credit.close();
+        result
     }
 
     /// Returns up to `max_bytes`, collecting until the buffer is full, the
@@ -299,6 +378,23 @@ mod tests {
     use std::io::Read;
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn input_credit_blocks_until_granted_and_wakes_on_close() {
+        let credit = Arc::new(InputCredit::new(0));
+        let waiter = credit.clone();
+        let handle = thread::spawn(move || waiter.take(10));
+        thread::sleep(Duration::from_millis(30));
+        credit.grant(4);
+        assert_eq!(handle.join().unwrap(), 4);
+
+        let closed = Arc::new(InputCredit::new(0));
+        let waiter = closed.clone();
+        let handle = thread::spawn(move || waiter.take(10));
+        thread::sleep(Duration::from_millis(30));
+        closed.close();
+        assert_eq!(handle.join().unwrap(), 0);
+    }
 
     #[test]
     fn handshake_data_and_credit_roundtrip() {

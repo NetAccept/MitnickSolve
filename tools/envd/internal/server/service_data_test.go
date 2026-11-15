@@ -214,6 +214,62 @@ func TestServiceDataCreditBackpressure(t *testing.T) {
 	}
 }
 
+func TestServiceDataInputCredit(t *testing.T) {
+	s, sessionID := dataSession(t, 1<<20)
+	conn, ack := openDataView(t, s, "secret", sessionID, nil)
+	defer conn.Close()
+	if ack.Kind != protocol.KindOpenAck {
+		t.Fatalf("open ack kind: %s", ack.Kind)
+	}
+
+	// Consume most of the initial 64 KiB input window; the server should
+	// grant enough credit to return to the full window.
+	payload := make([]byte, 40<<10)
+	for index := range payload {
+		payload[index] = ' '
+	}
+	if err := protocol.WriteFrame(conn, protocol.Frame{
+		Kind: protocol.KindData, Payload: payload,
+	}, protocol.EmbeddedMaxFrame); err != nil {
+		t.Fatal(err)
+	}
+	granted := false
+	for !granted {
+		frame, err := protocol.ReadFrame(conn, protocol.EmbeddedMaxFrame)
+		if err != nil {
+			t.Fatalf("read credit: %v", err)
+		}
+		switch frame.Kind {
+		case protocol.KindCredit:
+			if len(frame.Payload) != 8 {
+				t.Fatalf("credit payload length: %d", len(frame.Payload))
+			}
+			granted = true
+		case protocol.KindData:
+			// PTY echo of the typed spaces.
+		case protocol.KindError:
+			t.Fatalf("unexpected error: %s", frame.Payload)
+		}
+	}
+
+	// A frame larger than the available window is rejected.
+	large := make([]byte, 80<<10)
+	if err := protocol.WriteFrame(conn, protocol.Frame{
+		Kind: protocol.KindData, Payload: large,
+	}, protocol.EmbeddedMaxFrame); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		frame, err := protocol.ReadFrame(conn, protocol.EmbeddedMaxFrame)
+		if err != nil {
+			t.Fatalf("expected credit error, got read error: %v", err)
+		}
+		if frame.Kind == protocol.KindError {
+			return
+		}
+	}
+}
+
 func TestServiceDataReportsGapBeforeFirstSeq(t *testing.T) {
 	s, sessionID := dataSession(t, 64<<10)
 	conn, ack := openDataView(t, s, "secret", sessionID, nil)

@@ -74,9 +74,10 @@ and kept in a bounded replay log (`session_create.output_buffer_bytes`, default
 4 MiB cap) and sends `GAP` (code 13) or `STALE` (code 14) when `since_seq` is
 outside the retained window. A data connection owns the session's output while
 attached; after detach, new output also feeds control-plane `session_read`, and
-the replay log remains available for a reconnect. Input credit, `SEEK`, and
-WebSocket transport are not implemented yet. The Rust `EnvDataClient` and mskd
-`--envd-data-addr` use this path for remote terminals.
+the replay log remains available for a reconnect. Input is also credit-limited
+(64 KiB window, replenished as it is consumed); `SEEK` and WebSocket transport
+are not implemented yet. The Rust `EnvDataClient` and mskd `--envd-data-addr`
+use this path for remote terminals.
 
 ## Notes
 

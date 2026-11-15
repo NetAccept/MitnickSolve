@@ -300,6 +300,7 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 		"server":          "envd " + Version,
 		"max_frame":       maxFrame,
 		"credits_initial": 65536,
+		"credits_input":   65536,
 		"resume":          []any{},
 		"transport":       "tcp",
 	}); err != nil {
@@ -400,11 +401,14 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 		"last_seq":        last,
 		"since_seq":       cursor,
 		"credits_initial": 65536,
+		"credits_input":   65536,
 		"takeover":        openPayload.Takeover,
 	}); err != nil {
 		return
 	}
 
+	inCredit := int64(65536)
+	const initialInCredit = int64(65536)
 	clientErr := make(chan error, 1)
 	go func() {
 		for {
@@ -419,12 +423,29 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 					clientErr <- fmt.Errorf("input exceeds 1 MiB")
 					return
 				}
+				if int64(len(frame.Payload)) > inCredit {
+					clientErr <- fmt.Errorf(
+						"input exceeds credit: %d > %d", len(frame.Payload), inCredit,
+					)
+					return
+				}
+				inCredit -= int64(len(frame.Payload))
 				session.mu.Lock()
 				err := session.writeRaw(frame.Payload)
 				session.mu.Unlock()
 				if err != nil {
 					clientErr <- err
 					return
+				}
+				if inCredit < initialInCredit/2 {
+					grant := initialInCredit - inCredit
+					var payload [8]byte
+					binary.BigEndian.PutUint64(payload[:], uint64(grant))
+					if err := writeFrame(protocol.KindCredit, 0, payload[:]); err != nil {
+						clientErr <- err
+						return
+					}
+					inCredit += grant
 				}
 			case protocol.KindCredit:
 				if len(frame.Payload) != 8 {
