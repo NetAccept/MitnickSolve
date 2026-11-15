@@ -118,7 +118,9 @@ M0 scaffold plus the P1 session/turn slice:
 - Shared blackboard: `blackboard_get/set/list` (`state.shared`) persist a
   per-root JSON map (`<root>/blackboard.json`, 64 KiB/value, 1 MiB total) so
   parent and child agents can coordinate findings. `mskctl bb-get/bb-set/bb-list`
-  expose it directly.
+  expose it directly. `flag_add/flag_list` record captured flags in the same
+  ledger, deduplicated by SHA-256 of the value and attributed with an optional
+  source.
 - Secrets: `EnvSecretStore` maps `$secret:name` to `MSK_SECRET_NAME` (names are
   uppercased, non-alphanumerics become `_`). `http_request` resolves secret
   header values on the host after the `secrets.read` capability check; the

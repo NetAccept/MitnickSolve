@@ -1,0 +1,6 @@
+{
+  "name": "flag_add",
+  "description": "Record a captured flag in the shared ledger (deduplicated by value hash).",
+  "input_schema": {"type": "object", "required": ["flag"]},
+  "capabilities": ["state.shared"]
+}

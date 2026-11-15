@@ -160,6 +160,14 @@ class Handler(BaseHTTPRequestHandler):
                 has_result = True
         return task_id, has_result
 
+    def wants_flag(self, request):
+        for message in request.get("messages", []):
+            if message.get("role") == "user" and "flag" in (
+                message.get("content") or ""
+            ):
+                return True
+        return False
+
     def wants_board(self, request):
         for message in request.get("messages", []):
             if message.get("role") == "user" and "board" in (
@@ -180,6 +188,61 @@ class Handler(BaseHTTPRequestHandler):
         wants_file = self.wants_file(request)
         wants_spawn = self.wants_spawn(request)
         wants_board = self.wants_board(request)
+        wants_flag = self.wants_flag(request)
+        if wants_flag and Handler.calls in (1, 2):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": f"call_flag_{Handler.calls}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "flag_add",
+                                        "arguments": json.dumps(
+                                            {
+                                                "flag": "flag{test}",
+                                                "source": "mock",
+                                            }
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ],
+                "usage": {"total_tokens": 7},
+            }
+        if wants_flag and Handler.calls == 3:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_flag_list",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "flag_list",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ],
+                "usage": {"total_tokens": 7},
+            }
+        if wants_flag:
+            return {
+                "choices": [
+                    {"message": {"content": "flag complete", "tool_calls": []}}
+                ],
+                "usage": {"total_tokens": 5},
+            }
         if Handler.calls == 1 and wants_board:
             return {
                 "choices": [

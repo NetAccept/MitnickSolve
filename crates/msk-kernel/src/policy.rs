@@ -44,6 +44,8 @@ pub fn default_policy() -> PolicyTable {
         ("blackboard_get", vec![Capability::SharedState]),
         ("blackboard_set", vec![Capability::SharedState]),
         ("blackboard_list", vec![Capability::SharedState]),
+        ("flag_add", vec![Capability::SharedState]),
+        ("flag_list", vec![Capability::SharedState]),
         ("echo", vec![]),
     ])
 }

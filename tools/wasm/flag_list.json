@@ -1,0 +1,6 @@
+{
+  "name": "flag_list",
+  "description": "List captured flags in the shared ledger.",
+  "input_schema": {"type": "object"},
+  "capabilities": ["state.shared"]
+}

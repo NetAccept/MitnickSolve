@@ -851,6 +851,8 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         "blackboard_get",
         "blackboard_set",
         "blackboard_list",
+        "flag_add",
+        "flag_list",
         "echo",
     ];
     let registry_policy = policy::policy_with_approvals(cli.approvals == Approvals::Ask);

@@ -7,7 +7,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -22,6 +22,7 @@ use msk_mcp::EnvTransport;
 use msk_secret::SecretStore;
 use msk_wasm::{ToolContext, ToolHost, ToolManifest, WasmtimeRuntime};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 /// M0 host bridge: the only native capability exposed to WASM tools.
 pub struct EnvHost {
@@ -281,6 +282,60 @@ impl EnvHost {
 
 impl ToolHost for EnvHost {
     fn call(&self, ctx: &ToolContext, input: &[u8]) -> Result<Vec<u8>, String> {
+        if matches!(ctx.tool.as_str(), "flag_add" | "flag_list") {
+            if !ctx.allows(Capability::SharedState) {
+                return Err("denied: state.shared not granted".to_string());
+            }
+            let control = self
+                .control
+                .as_ref()
+                .ok_or_else(|| "control plane is not configured".to_string())?;
+            let args: Value = serde_json::from_slice(input)
+                .map_err(|err| format!("invalid flag input: {err}"))?;
+            let value = if ctx.tool == "flag_add" {
+                let flag = args
+                    .get("flag")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "flag is required".to_string())?;
+                if flag.is_empty() || flag.len() > 4096 {
+                    return Err("flag must be 1..4096 bytes".into());
+                }
+                let source = args.get("source").and_then(Value::as_str);
+                let key = format!("flag:{}", sha256_hex(flag));
+                let existing = control.blackboard_get(&key)?;
+                if !existing.get("value").unwrap_or(&Value::Null).is_null() {
+                    json!({"added": false, "key": key, "existing": existing.get("value")})
+                } else {
+                    let entry = json!({
+                        "flag": flag,
+                        "source": source,
+                        "recorded_ms": now_unix_ms()
+                    });
+                    control.blackboard_set(&key, entry.clone())?;
+                    json!({"added": true, "key": key, "entry": entry})
+                }
+            } else {
+                let listed = control.blackboard_list()?;
+                let flags: Vec<Value> = listed
+                    .get("entries")
+                    .and_then(Value::as_array)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter(|entry| {
+                                entry
+                                    .get("key")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|key| key.starts_with("flag:"))
+                            })
+                            .map(|entry| entry.get("value").cloned().unwrap_or(Value::Null))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                json!({"flags": flags})
+            };
+            return serde_json::to_vec(&value).map_err(|err| err.to_string());
+        }
         if matches!(
             ctx.tool.as_str(),
             "blackboard_get" | "blackboard_set" | "blackboard_list"
@@ -570,6 +625,20 @@ pub fn substitute(
         _ => {}
     }
     Ok(())
+}
+
+fn sha256_hex(text: &str) -> String {
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 pub fn extract_data(value: &Value) -> Result<Value> {

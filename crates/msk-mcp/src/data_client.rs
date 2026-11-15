@@ -247,7 +247,24 @@ impl EnvDataClient {
                 "data view is closed",
             ));
         }
-        send_bytes(&self.writer, FrameKind::Data, data)
+        let mut offset = 0;
+        while offset < data.len() {
+            let want = (data.len() - offset).min(64 * 1024);
+            let granted = self.input_credit.take(want);
+            if granted == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "data view closed while waiting for input credit",
+                ));
+            }
+            send_bytes(
+                &self.writer,
+                FrameKind::Data,
+                &data[offset..offset + granted],
+            )?;
+            offset += granted;
+        }
+        Ok(())
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
