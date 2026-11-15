@@ -1,6 +1,6 @@
 {
   "name": "blackboard_set",
-  "description": "Write a shared blackboard value (JSON) by key.",
+  "description": "Write a shared blackboard value (JSON) by key; expected_version enables compare-and-swap.",
   "input_schema": {"type": "object", "required": ["key", "value"]},
   "capabilities": ["state.shared"]
 }

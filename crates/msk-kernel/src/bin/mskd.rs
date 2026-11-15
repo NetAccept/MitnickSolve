@@ -17,6 +17,7 @@ use msk_ipc::data::{DATA_MAX_FRAME, DataFrame, DataKind, write_frame};
 use msk_ipc::local::{self, Stream};
 use msk_ipc::{RpcNotification, RpcRequest, RpcResponse, TryClone, methods};
 use msk_mcp::{EnvClient, EnvDataClient, EnvTransport, ServiceClient};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -162,47 +163,104 @@ impl PendingApproval {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BlackboardEntry {
+    value: Value,
+    version: u64,
+    updated_ms: u64,
+}
+
 struct Blackboard {
     path: PathBuf,
-    values: BTreeMap<String, Value>,
+    entries: BTreeMap<String, BlackboardEntry>,
 }
 
 impl Blackboard {
     fn load(path: PathBuf) -> Self {
-        let values = std::fs::read_to_string(&path)
+        let entries = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|text| serde_json::from_str::<BTreeMap<String, Value>>(&text).ok())
+            .map(|text| {
+                if let Ok(entries) =
+                    serde_json::from_str::<BTreeMap<String, BlackboardEntry>>(&text)
+                {
+                    return entries;
+                }
+                // Backward compatibility with the unversioned value map.
+                serde_json::from_str::<BTreeMap<String, Value>>(&text)
+                    .map(|values| {
+                        values
+                            .into_iter()
+                            .map(|(key, value)| {
+                                (
+                                    key,
+                                    BlackboardEntry {
+                                        value,
+                                        version: 1,
+                                        updated_ms: now_ms() as u64,
+                                    },
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
             .unwrap_or_default();
-        Self { path, values }
+        Self { path, entries }
+    }
+
+    fn snapshot(key: &str, entry: Option<&BlackboardEntry>) -> Value {
+        match entry {
+            Some(entry) => json!({
+                "key": key,
+                "value": entry.value,
+                "version": entry.version,
+                "updated_ms": entry.updated_ms
+            }),
+            None => json!({
+                "key": key,
+                "value": Value::Null,
+                "version": 0
+            }),
+        }
     }
 
     fn get(&self, key: &str) -> Value {
-        json!({"key": key, "value": self.values.get(key).cloned().unwrap_or(Value::Null)})
+        Self::snapshot(key, self.entries.get(key))
     }
 
     fn list(&self) -> Value {
         let entries: Vec<Value> = self
-            .values
+            .entries
             .iter()
-            .map(|(key, value)| json!({"key": key, "value": value}))
+            .map(|(key, entry)| Self::snapshot(key, Some(entry)))
             .collect();
         json!({"entries": entries})
     }
 
-    fn set(&mut self, key: &str, value: Value) -> Result<Value> {
+    fn set(&mut self, key: &str, value: Value, expected_version: Option<u64>) -> Result<Value> {
         if key.is_empty() || key.len() > 128 || key.chars().any(char::is_control) {
             bail!("blackboard key must be 1..128 printable characters");
+        }
+        if let Some(expected) = expected_version {
+            let current = self.entries.get(key).map_or(0, |entry| entry.version);
+            if current != expected {
+                return Ok(json!({
+                    "ok": false,
+                    "conflict": true,
+                    "current": Self::snapshot(key, self.entries.get(key))
+                }));
+            }
         }
         let encoded = serde_json::to_vec(&value)?;
         if encoded.len() > 64 * 1024 {
             bail!("blackboard value exceeds 64 KiB");
         }
         let existing: usize = self
-            .values
+            .entries
             .iter()
             .filter(|(existing_key, _)| existing_key.as_str() != key)
-            .map(|(_, value)| {
-                serde_json::to_vec(value)
+            .map(|(_, entry)| {
+                serde_json::to_vec(&entry.value)
                     .map(|bytes| bytes.len())
                     .unwrap_or(0)
             })
@@ -210,9 +268,23 @@ impl Blackboard {
         if existing.saturating_add(encoded.len()) > 1 << 20 {
             bail!("blackboard exceeds 1 MiB");
         }
-        self.values.insert(key.to_string(), value.clone());
+        let version = self
+            .entries
+            .get(key)
+            .map_or(1, |entry| entry.version.saturating_add(1));
+        self.entries.insert(
+            key.to_string(),
+            BlackboardEntry {
+                value,
+                version,
+                updated_ms: now_ms() as u64,
+            },
+        );
         self.save()?;
-        Ok(json!({"key": key, "value": value}))
+        Ok(json!({
+            "ok": true,
+            "entry": Self::snapshot(key, self.entries.get(key))
+        }))
     }
 
     fn save(&self) -> Result<()> {
@@ -222,7 +294,7 @@ impl Blackboard {
         let temporary = self
             .path
             .with_extension(format!("tmp-{}", std::process::id()));
-        std::fs::write(&temporary, serde_json::to_vec_pretty(&self.values)?)?;
+        std::fs::write(&temporary, serde_json::to_vec_pretty(&self.entries)?)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -628,11 +700,12 @@ impl Daemon {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 let value = params.get("value").cloned().unwrap_or(Value::Null);
+                let expected_version = params.get("expected_version").and_then(Value::as_u64);
                 let result = self
                     .blackboard
                     .lock()
                     .map_err(|_| anyhow::anyhow!("blackboard poisoned"))
-                    .and_then(|mut blackboard| blackboard.set(key, value));
+                    .and_then(|mut blackboard| blackboard.set(key, value, expected_version));
                 match result {
                     Ok(value) => (RpcResponse::ok(id, value), None),
                     Err(err) => (RpcResponse::err(id, -32000, err.to_string()), None),
@@ -2066,14 +2139,27 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("blackboard.json");
         let mut blackboard = Blackboard::load(path.clone());
-        blackboard.set("finding", json!({"port": 8080})).unwrap();
+        let first = blackboard
+            .set("finding", json!({"port": 8080}), None)
+            .unwrap();
+        assert_eq!(first["ok"], true);
+        assert_eq!(first["entry"]["version"], 1);
         assert_eq!(blackboard.get("finding")["value"]["port"], 8080);
         let reloaded = Blackboard::load(path.clone());
         assert_eq!(reloaded.get("finding")["value"]["port"], 8080);
-        assert!(blackboard.set("", Value::Null).is_err());
+        let updated = blackboard
+            .set("finding", json!({"port": 8081}), Some(1))
+            .unwrap();
+        assert_eq!(updated["entry"]["version"], 2);
+        let conflict = blackboard
+            .set("finding", json!({"port": 8082}), Some(1))
+            .unwrap();
+        assert_eq!(conflict["conflict"], true);
+        assert_eq!(conflict["current"]["version"], 2);
+        assert!(blackboard.set("", Value::Null, None).is_err());
         assert!(
             blackboard
-                .set("huge", Value::String("x".repeat(70 * 1024)))
+                .set("huge", Value::String("x".repeat(70 * 1024)), None)
                 .is_err()
         );
         let _ = std::fs::remove_dir_all(dir);

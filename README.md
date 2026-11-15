@@ -117,11 +117,12 @@ M0 scaffold plus the P1 session/turn slice:
   child. `mskctl create --headless --goal ...` and `mskctl result task-...`
   expose the same path.
 - Shared blackboard: `blackboard_get/set/list` (`state.shared`) persist a
-  per-root JSON map (`<root>/blackboard.json`, 64 KiB/value, 1 MiB total) so
-  parent and child agents can coordinate findings. `mskctl bb-get/bb-set/bb-list`
-  expose it directly. `flag_add/flag_list` record captured flags in the same
-  ledger, deduplicated by SHA-256 of the value and attributed with an optional
-  source.
+  per-root JSON map (`<root>/blackboard.json`, 64 KiB/value, 1 MiB total) with
+  `version` and `updated_ms`. `blackboard_set` accepts `expected_version` for
+  compare-and-swap; a mismatch returns the current entry instead of
+  overwriting. `mskctl bb-get/bb-set/bb-list` expose it directly.
+  `flag_add/flag_list` record captured flags in the same ledger, deduplicated
+  by SHA-256 of the value and attributed with an optional source.
 - Secrets: `EnvSecretStore` maps `$secret:name` to `MSK_SECRET_NAME` (names are
   uppercased, non-alphanumerics become `_`). `http_request` resolves secret
   header values on the host after the `secrets.read` capability check; the
@@ -358,6 +359,7 @@ target/debug/mskctl --root .msk approvals
 target/debug/mskctl --root .msk approve --task task-... --id 1
 target/debug/mskctl --root .msk deny --task task-... --id 2
 target/debug/mskctl --root .msk bb-set finding '{"port":8080}'
+target/debug/mskctl --root .msk bb-set finding '{"port":8081}' --expected-version 1
 target/debug/mskctl --root .msk bb-get finding
 target/debug/mskctl --root .msk bb-list
 target/debug/mskctl --root .msk events --task task-... --limit 50

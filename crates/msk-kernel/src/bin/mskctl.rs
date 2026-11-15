@@ -88,7 +88,13 @@ enum Command {
     /// Read one shared blackboard entry.
     BbGet { key: String },
     /// Write one shared blackboard entry (JSON value or plain string).
-    BbSet { key: String, value: String },
+    BbSet {
+        key: String,
+        value: String,
+        /// Require this version for compare-and-swap.
+        #[arg(long)]
+        expected_version: Option<u64>,
+    },
     /// Cancel a running task.
     Cancel { task: String },
     /// Query the daemon's SQLite event index.
@@ -247,11 +253,21 @@ fn main() -> Result<()> {
             let result = client.request(methods::BLACKBOARD_GET, json!({"key": key}))?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        Command::BbSet { key, value } => {
+        Command::BbSet {
+            key,
+            value,
+            expected_version,
+        } => {
             let value =
                 serde_json::from_str(&value).unwrap_or_else(|_| serde_json::Value::String(value));
-            let result =
-                client.request(methods::BLACKBOARD_SET, json!({"key": key, "value": value}))?;
+            let result = client.request(
+                methods::BLACKBOARD_SET,
+                json!({
+                    "key": key,
+                    "value": value,
+                    "expected_version": expected_version
+                }),
+            )?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Cancel { task } => {

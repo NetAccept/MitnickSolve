@@ -116,13 +116,25 @@ impl ControlPlane {
             .map_err(|err| err.to_string())
     }
 
-    pub fn blackboard_set(&self, key: &str, value: Value) -> std::result::Result<Value, String> {
+    pub fn blackboard_set(
+        &self,
+        key: &str,
+        value: Value,
+        expected_version: Option<u64>,
+    ) -> std::result::Result<Value, String> {
         let mut client = self
             .client
             .lock()
             .map_err(|_| "control client lock poisoned".to_string())?;
         client
-            .request(methods::BLACKBOARD_SET, json!({"key": key, "value": value}))
+            .request(
+                methods::BLACKBOARD_SET,
+                json!({
+                    "key": key,
+                    "value": value,
+                    "expected_version": expected_version
+                }),
+            )
             .map_err(|err| err.to_string())
     }
 
@@ -314,7 +326,7 @@ impl ToolHost for EnvHost {
                         "source": source,
                         "recorded_ms": now_unix_ms()
                     });
-                    control.blackboard_set(&key, entry.clone())?;
+                    control.blackboard_set(&key, entry.clone(), None)?;
                     json!({"added": true, "key": key, "entry": entry})
                 }
             } else {
@@ -366,7 +378,8 @@ impl ToolHost for EnvHost {
                         .and_then(Value::as_str)
                         .ok_or_else(|| "key is required".to_string())?;
                     let value = args.get("value").cloned().unwrap_or(Value::Null);
-                    control.blackboard_set(key, value)?
+                    let expected_version = args.get("expected_version").and_then(Value::as_u64);
+                    control.blackboard_set(key, value, expected_version)?
                 }
                 _ => control.blackboard_list()?,
             };
