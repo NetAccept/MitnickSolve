@@ -132,6 +132,19 @@ thread. In-process mode (no `--component-host`) can read kernel memory and abort
 the process. `thread_safety` does not grant concurrency. Component
 configuration/secrets are not injected in this slice.
 
+## Install-time conformance
+
+```sh
+msk-component-check --manifest component/manifest.json --trust component/trust.json
+msk-component-check --verify-only --manifest ... --trust ...
+```
+
+The checker verifies signature/trust/artifact, loads and initializes, sends one
+minimal `llm.provider` request (or `--request file.json`), validates the
+response envelope and tool-call shape, checks the allocation ledger is empty,
+and drops the instance so `shutdown` runs exactly once. It executes component
+code in-process; use it only on code you are willing to run in this process.
+
 ## Test fixture
 
 `cargo run -p msk-loader --example sign_test_fixture -- <artifact> <out-dir>`

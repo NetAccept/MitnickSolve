@@ -221,9 +221,17 @@ in a child process. The daemon accepts `--component-manifest`,
 `--component-trust`, and `--component-host` and forwards them to tasks created
 with `--provider component`.
 
-On Linux/macOS the artifact is `libmsk_test_component.so` / `.dylib`. See
-[`docs/components.md`](docs/components.md) for the ABI, ownership rules, limits,
-and security boundary.
+On Linux/macOS the artifact is `libmsk_test_component.so` / `.dylib`. Run the
+install-time conformance check (or `--verify-only` to hash without loading):
+
+```sh
+target/debug/msk-component-check --manifest .msk/component-test/manifest.json \
+  --trust .msk/component-test/trust.json
+target/debug/msk-component-check --verify-only --manifest ... --trust ...
+```
+
+See [`docs/components.md`](docs/components.md) for the ABI, ownership rules,
+limits, and security boundary.
 
 ## Interactive session
 

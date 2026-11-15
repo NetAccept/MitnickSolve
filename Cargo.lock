@@ -1337,6 +1337,7 @@ name = "msk-loader"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "clap",
  "ed25519-dalek",
  "libloading",
  "msk-abi",

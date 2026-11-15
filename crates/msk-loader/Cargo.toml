@@ -9,8 +9,13 @@ rust-version.workspace = true
 name = "msk-component-host"
 path = "src/bin/msk-component-host.rs"
 
+[[bin]]
+name = "msk-component-check"
+path = "src/bin/msk-component-check.rs"
+
 [dependencies]
 base64.workspace = true
+clap.workspace = true
 ed25519-dalek.workspace = true
 libloading.workspace = true
 msk-abi.workspace = true

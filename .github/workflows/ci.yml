@@ -66,12 +66,15 @@ jobs:
         run: |
           set -euo pipefail
           cargo build -p msk-test-component
-          cargo build -p msk-loader --bin msk-component-host
+          cargo build -p msk-loader --bin msk-component-host --bin msk-component-check
           artifact=$(find target/debug -type f \
             \( -name 'libmsk_test_component*.so' -o -name 'libmsk_test_component*.dylib' -o -name 'msk_test_component*.dll' \) \
             | head -1)
           test -n "$artifact"
           cargo run -q -p msk-loader --example sign_test_fixture -- "$artifact" .msk/component-fixture
+          target/debug/msk-component-check \
+            --manifest .msk/component-fixture/manifest.json \
+            --trust .msk/component-fixture/trust.json | grep -q "component check ok"
       - name: Daemon interactive session smoke
         run: |
           set -euo pipefail
