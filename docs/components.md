@@ -125,12 +125,14 @@ rejects `provider=component` at `task.create`.
 
 Signatures, hashes, ABI, and vtable checks are install gates, not a sandbox.
 With `--component-host`, the component runs in `msk-component-host`; a component
-abort kills that child and the kernel receives a protocol error, as covered by
-the abort test. The host is still trusted code with process access and no
-restart policy, resource limits, or syscall sandbox; a hung call blocks the turn
-thread. In-process mode (no `--component-host`) can read kernel memory and abort
-the process. `thread_safety` does not grant concurrency. Component
-configuration/secrets are not injected in this slice.
+abort kills that child and the kernel receives a protocol error. The failed
+request is not retried, because a provider call may have side effects; the next
+call starts a fresh host and re-runs the signed manifest/artifact checks. The
+abort test verifies that recovery. The host is still trusted code with process
+access and no resource limits or syscall sandbox; a hung call blocks the turn
+thread until it returns. In-process mode (no `--component-host`) can read kernel
+memory and abort the kernel. `thread_safety` does not grant concurrency.
+Component configuration/secrets are not injected in this slice.
 
 ## Install-time conformance
 

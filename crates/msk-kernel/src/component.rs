@@ -68,10 +68,17 @@ impl Backend {
     }
 }
 
-struct ProcessHost {
+struct RunningHost {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+
+struct ProcessHost {
+    host: PathBuf,
+    manifest: PathBuf,
+    trust: PathBuf,
+    running: Option<RunningHost>,
     next_id: u64,
 }
 
@@ -81,12 +88,30 @@ impl ProcessHost {
         manifest: &std::path::Path,
         trust: &std::path::Path,
     ) -> Result<Self> {
-        let mut command = Command::new(host);
+        let mut process = Self {
+            host: host.to_path_buf(),
+            manifest: manifest.to_path_buf(),
+            trust: trust.to_path_buf(),
+            running: None,
+            next_id: 0,
+        };
+        process.ensure_running()?;
+        Ok(process)
+    }
+
+    /// Starts the host if it is not running. A host that exited or aborted is
+    /// replaced on the next call; the request that observed the failure is not
+    /// retried, so a side-effecting call is never executed twice.
+    fn ensure_running(&mut self) -> Result<()> {
+        if self.running.is_some() {
+            return Ok(());
+        }
+        let mut command = Command::new(&self.host);
         command
             .arg("--manifest")
-            .arg(manifest)
+            .arg(&self.manifest)
             .arg("--trust")
-            .arg(trust)
+            .arg(&self.trust)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -99,17 +124,27 @@ impl ProcessHost {
         let mut child = command.spawn().context("spawn component host")?;
         let stdin = child.stdin.take().context("component host stdin")?;
         let stdout = BufReader::new(child.stdout.take().context("component host stdout")?);
-        let mut host = Self {
+        let mut running = RunningHost {
             child,
             stdin,
             stdout,
-            next_id: 0,
         };
-        let ready = host.read_json().context("component host ready line")?;
+        let ready = match read_json(&mut running) {
+            Ok(ready) => ready,
+            Err(error) => {
+                let _ = running.child.kill();
+                let _ = running.child.wait();
+                return Err(error).context("component host ready line");
+            }
+        };
         if ready.get("type").and_then(Value::as_str) != Some("ready") {
+            let _ = running.child.kill();
+            let _ = running.child.wait();
             bail!("component host did not become ready: {ready}");
         }
         if ready.get("ok").and_then(Value::as_bool) != Some(true) {
+            let _ = running.child.kill();
+            let _ = running.child.wait();
             bail!(
                 "component host failed: {}",
                 ready
@@ -118,19 +153,33 @@ impl ProcessHost {
                     .unwrap_or("unknown error")
             );
         }
-        Ok(host)
+        self.running = Some(running);
+        Ok(())
     }
 
-    fn read_json(&mut self) -> Result<Value> {
-        let mut line = String::new();
-        let read = self.stdout.read_line(&mut line)?;
-        if read == 0 {
-            bail!("component host closed the stream");
+    fn stop(&mut self) {
+        if let Some(mut running) = self.running.take() {
+            let _ = writeln!(running.stdin, "{}", serde_json::json!({"type": "shutdown"}));
+            let _ = running.stdin.flush();
+            let _ = running.child.kill();
+            let _ = running.child.wait();
         }
-        serde_json::from_str(&line).context("component host JSON")
     }
 
     fn complete(&mut self, request: &[u8]) -> std::result::Result<Vec<u8>, LlmCallError> {
+        if let Err(error) = self.ensure_running() {
+            return Err(LlmCallError::Protocol(format!(
+                "component host unavailable: {error}"
+            )));
+        }
+        let result = self.complete_running(request);
+        if result.is_err() {
+            self.stop();
+        }
+        result
+    }
+
+    fn complete_running(&mut self, request: &[u8]) -> std::result::Result<Vec<u8>, LlmCallError> {
         self.next_id += 1;
         let id = self.next_id;
         let value = serde_json::json!({
@@ -138,11 +187,14 @@ impl ProcessHost {
             "id": id,
             "request_base64": BASE64.encode(request)
         });
-        writeln!(self.stdin, "{value}")
-            .and_then(|_| self.stdin.flush())
+        let running = self
+            .running
+            .as_mut()
+            .ok_or_else(|| LlmCallError::Protocol("component host is not running".into()))?;
+        writeln!(running.stdin, "{value}")
+            .and_then(|_| running.stdin.flush())
             .map_err(|error| LlmCallError::Protocol(format!("component host write: {error}")))?;
-        let response = self
-            .read_json()
+        let response = read_json(running)
             .map_err(|error| LlmCallError::Protocol(format!("component host read: {error}")))?;
         if response.get("type").and_then(Value::as_str) != Some("response")
             || response.get("id").and_then(Value::as_u64) != Some(id)
@@ -170,12 +222,18 @@ impl ProcessHost {
     }
 }
 
+fn read_json(running: &mut RunningHost) -> Result<Value> {
+    let mut line = String::new();
+    let read = running.stdout.read_line(&mut line)?;
+    if read == 0 {
+        bail!("component host closed the stream");
+    }
+    serde_json::from_str(&line).context("component host JSON")
+}
+
 impl Drop for ProcessHost {
     fn drop(&mut self) {
-        let _ = writeln!(self.stdin, "{}", serde_json::json!({"type": "shutdown"}));
-        let _ = self.stdin.flush();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop();
     }
 }
 
@@ -507,16 +565,16 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(error, LlmError::Protocol(_)), "{error}");
-        // The kernel survives; the next call reports the dead host, not a panic.
-        assert!(
-            provider
-                .complete(&LlmRequest {
-                    messages: vec![Message::text("user", "after abort")],
-                    tools: Vec::new(),
-                    max_tokens: Some(64),
-                })
-                .is_err()
-        );
+        // The kernel survives, and the next call starts a fresh host rather
+        // than staying permanently bound to the aborted process.
+        let response = provider
+            .complete(&LlmRequest {
+                messages: vec![Message::text("user", "recover now")],
+                tools: Vec::new(),
+                max_tokens: Some(64),
+            })
+            .unwrap();
+        assert!(response.text.contains("component hello"));
         drop(provider);
         let _ = std::fs::remove_dir_all(dir);
     }

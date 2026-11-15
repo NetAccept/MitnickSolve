@@ -75,6 +75,9 @@ jobs:
           target/debug/msk-component-check \
             --manifest .msk/component-fixture/manifest.json \
             --trust .msk/component-fixture/trust.json | grep -q "component check ok"
+      - name: Component host abort and restart
+        run: |
+          cargo test -p msk-kernel --lib component::tests::out_of_process_host_isolates_a_component_abort -- --exact
       - name: Daemon interactive session smoke
         run: |
           set -euo pipefail
