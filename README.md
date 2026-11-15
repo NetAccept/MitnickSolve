@@ -13,8 +13,9 @@ M0 scaffold plus the P1 session/turn slice:
   (and the same flags on `mskd`) speaks MCP over HTTP(S) instead of spawning
   envd; tasks, subagents, and the daemon terminal share the remote service.
   `mskd --envd-data-addr host:7801` uses the binary MSDP data plane for
-  terminals, with CREDIT and replay-cursor reconnects. Embedded stdio remains
-  the default.
+  terminals, with CREDIT and replay-cursor reconnects. The data plane can use
+  TLS 1.3 (`--envd-data-tls`), and `--envd-ca ca.pem` supplies a private CA for
+  both HTTPS control and TLS data. Embedded stdio remains the default.
 - Embedded `envd` over stdio frames (Go; `go-pty` for cross-platform PTY) and
   service mode: MCP JSON-RPC over HTTP(S) plus an MSDP TCP/TLS data plane, both
   behind a bearer token. The data plane uses absolute byte offsets, a bounded
@@ -74,6 +75,9 @@ M0 scaffold plus the P1 session/turn slice:
   credit-based backpressure; `Ctrl+Q` detaches. The TUI renders it through a
   `vt100` parser (colors, cursor, alternate screen), so full-screen programs are
   usable. `mskctl terminal-*` exposes the control-plane path for scripting.
+- Web client: `msk-web` serves a loopback-only UI over the same IPC: task list,
+  transcript, message composer, approvals, and blackboard. It uses a per-run
+  bearer token and refuses non-loopback binds without `--allow-remote`.
 - Tri-state tool policy and approvals: `exec`, `session_exec`, and
   `session_write` are `allow` or `ask`; unknown tools are `deny`. Interactive
   tasks default to `ask`, so the turn blocks until a human approves or denies.
@@ -418,6 +422,24 @@ target/debug/mskctl --root .msk terminal-stream --line "echo hi" --timeout-ms 20
 `terminal-stream` uses the binary data plane (MSKD frames, credit, resize,
 close); the control-plane `terminal-*` commands are convenient for scripting.
 
+### Web UI
+
+`msk-web` is a loopback web client for the same daemon. It is a frontend only:
+it opens normal IPC connections and calls `task.*`, `approval.*`, and
+`blackboard.*`, so it does not change kernel behavior.
+
+```sh
+target/debug/mskd --root .msk --envd target/debug/envd --tools-dir tools/wasm &
+target/debug/msk-web --root .msk
+# open the printed http://127.0.0.1:8787/?token=... URL
+```
+
+The web token is generated per run (or pass `--token`), and the server refuses
+non-loopback addresses unless `--allow-remote` is set; the token is the only
+authentication. The UI polls the daemon for task snapshots and transcripts,
+sends messages, interrupts or cancels tasks, resolves approvals, and shows the
+shared blackboard. It is an initial M6 client, not a native GUI.
+
 ## Layout
 
 | Path | Purpose |
@@ -435,6 +457,7 @@ close); the control-plane `terminal-*` commands are convenient for scripting.
 | `crates/msk-loader` | Signed core component manifest/loader boundary |
 | `crates/msk-kernel` | Kernel binary and M0 demo |
 | `crates/msk-tui` | Minimal event viewer |
+| `crates/msk-web` | Loopback web client for mskd |
 | `tools/envd` | Go execution environment |
 | `tools/wasm` | WAT modules and manifests |
 | `docs/` | Design and protocol drafts |

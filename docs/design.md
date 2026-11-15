@@ -191,6 +191,7 @@ mitnick/
 │   ├── msk-events/             # 事件日志、重放
 │   ├── msk-ipc/                # 前端 IPC 协议
 │   ├── msk-tui/                # ratatui 前端
+│   ├── msk-web/                # 回环 Web 前端（mskd IPC 客户端）
 │   └── msk-testkit/            # conformance harness、测试替身
 ├── components/                 # 第一方内核组件（各自独立 crate，cdylib）
 │   ├── llm-anthropic/
@@ -969,6 +970,8 @@ profile = "host"
 
 - GUI 客户端、远程网关、多前端并发。
 - 退出标准：GUI 不修改内核代码即可接入。
+
+> **实现状态**：`msk-web` 已作为第一个 M6 前端落地：回环 HTTP 服务、一次性 Bearer token、任务/转录/审批/黑板视图，全部通过现有 `mskd` IPC 方法访问，未改动内核协议。原生 GUI、远程网关与多前端并发仍待后续。
 
 ### 实施进度（P1 首个切片，已落地）
 

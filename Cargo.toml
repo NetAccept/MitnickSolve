@@ -14,6 +14,7 @@ members = [
     "crates/msk-loader",
     "crates/msk-kernel",
     "crates/msk-tui",
+    "crates/msk-web",
     "crates/msk-testkit",
     "crates/msk-test-component",
 ]
@@ -48,6 +49,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
+tiny_http = "0.12"
 time = { version = "0.3", features = ["formatting"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

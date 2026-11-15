@@ -61,7 +61,9 @@ jobs:
             | jq -e '.result.serverInfo.name == "envd"'
           [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:17800/mcp -d '{}')" = 401 ]
       - name: Build kernel
-        run: cargo build -p msk-kernel --bins
+        run: |
+          cargo build -p msk-kernel --bins
+          cargo build -p msk-web
       - name: Build component fixture
         run: |
           set -euo pipefail
@@ -91,7 +93,8 @@ jobs:
             --component-host target/debug/msk-component-host \
             >.msk/ci/daemon.log 2>&1 &
           daemon=$!
-          trap 'kill "$daemon" 2>/dev/null || true' EXIT
+          web_pid=
+          trap 'kill "$daemon" $web_pid 2>/dev/null || true' EXIT
           for _ in $(seq 1 100); do
             if [ -f .msk/ci/ipc.token ]; then break; fi
             sleep 0.1
@@ -150,6 +153,31 @@ jobs:
           [ "$(target/debug/mskctl --root .msk/ci state "$fork_task" | jq -r .state)" = done ]
           grep -q '"kind":"session.checkpoint_resume"' \
             .msk/ci/tasks/"$fork_task"/events.jsonl
+          target/debug/msk-web --root .msk/ci --listen 127.0.0.1:17820 \
+            --token web-ci-token >.msk/ci/web.log 2>&1 &
+          web_pid=$!
+          for _ in $(seq 1 100); do
+            if curl -fsS http://127.0.0.1:17820/ >/dev/null 2>&1; then break; fi
+            sleep 0.1
+          done
+          curl -fsS http://127.0.0.1:17820/ | grep -q "<title>MitnickSolve</title>"
+          [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:17820/api/tasks)" = 401 ]
+          curl -fsS -H 'Authorization: Bearer web-ci-token' \
+            http://127.0.0.1:17820/api/health | jq -e '.ok == true'
+          curl -fsS -H 'Authorization: Bearer web-ci-token' \
+            http://127.0.0.1:17820/api/tasks | jq -e '.tasks | length > 0'
+          web_task=$(curl -fsS -H 'Authorization: Bearer web-ci-token' \
+            -H 'Content-Type: application/json' \
+            -d '{"goal":"web smoke","provider":"scripted","interactive":false,"headless":true,"approvals":"allow"}' \
+            http://127.0.0.1:17820/api/tasks | jq -r .task_id)
+          for _ in $(seq 1 100); do
+            web_state=$(curl -fsS -H 'Authorization: Bearer web-ci-token' \
+              http://127.0.0.1:17820/api/tasks/"$web_task" | jq -r .task.state)
+            if [ "$web_state" = done ] || [ "$web_state" = failed ]; then break; fi
+            sleep 0.1
+          done
+          [ "$(curl -fsS -H 'Authorization: Bearer web-ci-token' \
+            http://127.0.0.1:17820/api/tasks/"$web_task" | jq -r .task.state)" = done ]
       - name: TLS service and data plane smoke
         run: |
           set -euo pipefail

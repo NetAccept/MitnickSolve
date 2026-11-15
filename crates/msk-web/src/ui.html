@@ -1,0 +1,735 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MitnickSolve</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0a0e13;
+    --panel: #101821;
+    --panel-2: #0d141c;
+    --line: #1d2a38;
+    --line-soft: #16212d;
+    --text: #d9e2ec;
+    --muted: #8496aa;
+    --faint: #5d6d7f;
+    --accent: #5eead4;
+    --accent-dim: #134e4a;
+    --amber: #fbbf24;
+    --red: #fb7185;
+    --blue: #60a5fa;
+    --green: #34d399;
+    --radius: 12px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(900px 500px at 15% -10%, rgba(94, 234, 212, 0.07), transparent 60%),
+      radial-gradient(700px 400px at 100% 0%, rgba(96, 165, 250, 0.05), transparent 55%),
+      var(--bg);
+    color: var(--text);
+    font: 14px/1.5 var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  button, input, select, textarea { font: inherit; color: inherit; }
+  button {
+    cursor: pointer;
+    border: 1px solid var(--line);
+    background: #131d27;
+    border-radius: 8px;
+    padding: 7px 12px;
+    transition: border-color 120ms ease, background 120ms ease, opacity 120ms ease;
+  }
+  button:hover:not(:disabled) { border-color: #2c4056; background: #172331; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #04201d; font-weight: 650; }
+  button.primary:hover:not(:disabled) { background: #7df3df; border-color: #7df3df; }
+  button.danger { color: var(--red); border-color: #43222b; }
+  button.ghost { background: transparent; }
+  code, pre { font-family: var(--mono); }
+  .app { min-height: 100%; display: flex; flex-direction: column; }
+  header {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 14px 20px; border-bottom: 1px solid var(--line-soft);
+    background: rgba(10, 14, 19, 0.82); backdrop-filter: blur(10px);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .brand { display: flex; align-items: center; gap: 11px; min-width: 0; }
+  .mark {
+    width: 32px; height: 32px; border-radius: 9px; display: grid; place-items: center;
+    background: linear-gradient(145deg, #5eead4, #2dd4bf 55%, #0f766e);
+    color: #03201c; font-weight: 900; letter-spacing: -0.04em;
+    box-shadow: 0 0 24px rgba(94, 234, 212, 0.18);
+  }
+  .brand h1 { margin: 0; font-size: 15px; letter-spacing: -0.01em; }
+  .brand p { margin: 0; color: var(--faint); font-size: 11px; font-family: var(--mono); }
+  .header-actions { display: flex; align-items: center; gap: 10px; }
+  .pill {
+    font-size: 11px; font-family: var(--mono); color: var(--muted);
+    border: 1px solid var(--line); border-radius: 999px; padding: 4px 9px;
+    display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  }
+  .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--faint); }
+  .pill.connected::before { background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .pill.offline::before { background: var(--red); }
+  main {
+    flex: 1; display: grid; grid-template-columns: 264px minmax(0, 1fr) 330px;
+    gap: 0; min-height: 0;
+  }
+  .sidebar, .rail { padding: 16px; min-height: 0; }
+  .sidebar { border-right: 1px solid var(--line-soft); }
+  .rail { border-left: 1px solid var(--line-soft); display: flex; flex-direction: column; gap: 14px; }
+  .panel-title {
+    display: flex; align-items: center; justify-content: space-between;
+    color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em;
+    font-size: 10px; font-weight: 700; margin: 0 2px 9px;
+  }
+  .panel-title span { color: var(--faint); letter-spacing: 0; font-family: var(--mono); }
+  .task-list { display: flex; flex-direction: column; gap: 6px; overflow-y: auto; max-height: calc(100vh - 120px); }
+  .task-item {
+    width: 100%; text-align: left; border: 1px solid transparent; background: transparent;
+    border-radius: 9px; padding: 9px 10px; display: grid; gap: 5px;
+  }
+  .task-item:hover { background: #111a24; }
+  .task-item.active { background: #121e2a; border-color: #25445a; }
+  .task-item .goal {
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden; font-size: 12.5px; line-height: 1.35; color: #c8d4e1;
+  }
+  .task-item .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .task-item .id { font-family: var(--mono); font-size: 9.5px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 5px; border-radius: 999px;
+    padding: 2px 7px; font-size: 9.5px; font-family: var(--mono); white-space: nowrap;
+    border: 1px solid var(--line);
+  }
+  .badge::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+  .badge.running { color: var(--amber); border-color: #453719; }
+  .badge.running::before { animation: pulse 1.2s ease-in-out infinite; }
+  .badge.waiting_input { color: var(--blue); border-color: #1e3a5f; }
+  .badge.done { color: var(--green); border-color: #1c4538; }
+  .badge.failed { color: var(--red); border-color: #4a2330; }
+  .badge.cancelled { color: var(--muted); }
+  @keyframes pulse { 50% { opacity: 0.25; } }
+  .workspace { min-width: 0; display: flex; flex-direction: column; min-height: 0; }
+  .empty {
+    flex: 1; display: grid; place-content: center; justify-items: center; gap: 12px;
+    padding: 40px; color: var(--muted); text-align: center;
+  }
+  .empty .mark { width: 48px; height: 48px; border-radius: 14px; font-size: 20px; }
+  .empty h2 { margin: 4px 0 0; color: var(--text); font-size: 18px; letter-spacing: -0.02em; }
+  .empty p { margin: 0; max-width: 380px; font-size: 13px; }
+  .detail { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  .task-head {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 16px;
+    padding: 16px 20px 13px; border-bottom: 1px solid var(--line-soft);
+  }
+  .task-head h2 { margin: 0 0 5px; font-size: 15.5px; line-height: 1.35; letter-spacing: -0.01em; }
+  .meta { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; color: var(--faint); font-size: 11px; }
+  .meta code { color: var(--muted); }
+  .task-actions { display: flex; gap: 7px; flex-shrink: 0; }
+  .transcript {
+    flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column;
+    gap: 8px; scroll-behavior: smooth;
+  }
+  .line {
+    white-space: pre-wrap; overflow-wrap: anywhere; border-radius: 8px;
+    padding: 7px 10px; font-size: 13px; line-height: 1.55; font-family: var(--mono);
+  }
+  .line.user { background: #11202a; border-left: 2px solid var(--accent); color: #d8f7f1; }
+  .line.assistant { background: #111a24; border-left: 2px solid #3b5b78; color: #d6e2ef; }
+  .line.tool { background: #0e151d; border-left: 2px solid #3a4654; color: #9fb0c2; font-size: 12px; }
+  .line.meta { color: var(--faint); font-size: 11px; padding: 3px 10px; }
+  .line.plain { color: #aebdcc; }
+  .composer {
+    display: flex; gap: 9px; padding: 13px 20px 17px; border-top: 1px solid var(--line-soft);
+    background: var(--panel-2); align-items: flex-end;
+  }
+  .composer textarea {
+    flex: 1; resize: none; min-height: 42px; max-height: 160px; padding: 10px 12px;
+    background: #0b1219; border: 1px solid var(--line); border-radius: 9px; outline: none;
+  }
+  .composer textarea:focus { border-color: #2b4e63; box-shadow: 0 0 0 3px rgba(94, 234, 212, 0.07); }
+  .composer textarea:disabled { opacity: 0.45; }
+  .approvals, .blackboard { display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
+  .approvals { max-height: 48vh; }
+  .approval {
+    border: 1px solid #3d3020; background: #17140f; border-radius: 9px; padding: 10px;
+    display: grid; gap: 7px;
+  }
+  .approval .tool { font-family: var(--mono); font-size: 12px; color: var(--amber); }
+  .approval .reason { font-size: 12px; color: #c9b794; }
+  .approval pre {
+    margin: 0; padding: 7px; background: #0d1117; border: 1px solid #2a241a;
+    border-radius: 6px; font-size: 10.5px; color: #a99a80; max-height: 120px; overflow: auto;
+  }
+  .approval .actions { display: flex; gap: 6px; }
+  .approval .actions button { padding: 5px 9px; font-size: 11.5px; }
+  .board-entry { border-bottom: 1px solid var(--line-soft); padding: 7px 2px; font-size: 11.5px; }
+  .board-entry:last-child { border-bottom: 0; }
+  .board-entry .key { font-family: var(--mono); color: var(--accent); }
+  .board-entry .value { color: var(--muted); overflow-wrap: anywhere; white-space: pre-wrap; font-family: var(--mono); font-size: 10.5px; }
+  .muted { color: var(--faint); font-size: 12px; }
+  dialog {
+    border: 1px solid var(--line); border-radius: 14px; padding: 0; color: var(--text);
+    background: var(--panel); width: min(560px, calc(100vw - 32px));
+    box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+  }
+  dialog::backdrop { background: rgba(2, 6, 10, 0.72); backdrop-filter: blur(3px); }
+  .dialog-body { padding: 20px; display: grid; gap: 14px; }
+  .dialog-body h2 { margin: 0; font-size: 17px; letter-spacing: -0.02em; }
+  .field { display: grid; gap: 6px; }
+  .field label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; font-weight: 700; }
+  .field textarea, .field input, .field select {
+    width: 100%; padding: 9px 11px; background: #0b1219; border: 1px solid var(--line);
+    border-radius: 8px; outline: none;
+  }
+  .field textarea { min-height: 90px; resize: vertical; }
+  .field textarea:focus, .field input:focus, .field select:focus { border-color: #2b4e63; }
+  .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .check { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12.5px; }
+  .check input { width: auto; }
+  .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 4px; }
+  .toast {
+    position: fixed; right: 18px; bottom: 18px; z-index: 50; max-width: min(440px, calc(100vw - 36px));
+    background: #2a1419; border: 1px solid #562430; color: #ffd7dd; border-radius: 9px;
+    padding: 10px 13px; font-size: 12.5px; box-shadow: 0 18px 50px rgba(0,0,0,.45);
+  }
+  .token-screen { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+  .token-card { width: min(420px, 100%); background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 24px; display: grid; gap: 14px; }
+  .token-card h2 { margin: 0; font-size: 18px; }
+  .token-card p { margin: 0; color: var(--muted); font-size: 13px; }
+  @media (max-width: 1100px) {
+    main { grid-template-columns: 230px minmax(0, 1fr); }
+    .rail { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--line-soft); flex-direction: row; flex-wrap: wrap; }
+    .rail > .panel { flex: 1 1 280px; }
+  }
+  @media (max-width: 760px) {
+    main { grid-template-columns: 1fr; }
+    .sidebar { border-right: 0; border-bottom: 1px solid var(--line-soft); }
+    .task-list { max-height: 200px; }
+    .task-head { flex-direction: column; }
+    .rail { flex-direction: column; }
+  }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div id="token-screen" class="token-screen" hidden>
+  <form class="token-card" id="token-form">
+    <div class="brand"><span class="mark">M</span><div><h1>MitnickSolve</h1><p>kernel daemon</p></div></div>
+    <h2>Connect to mskd</h2>
+    <p>Paste the token printed by <code>msk-web</code>. It is stored only in this browser's local storage.</p>
+    <div class="field"><label for="token-input">Web token</label><input id="token-input" autocomplete="off" spellcheck="false" required></div>
+    <button class="primary" type="submit">Connect</button>
+  </form>
+</div>
+
+<div id="app" class="app" hidden>
+  <header>
+    <div class="brand"><span class="mark">M</span><div><h1>MitnickSolve</h1><p id="root-label">kernel daemon</p></div></div>
+    <div class="header-actions">
+      <span id="connection" class="pill">connecting</span>
+      <button id="new-task" class="primary">New task</button>
+    </div>
+  </header>
+  <main>
+    <aside class="sidebar">
+      <div class="panel-title">Tasks <span id="task-count">0</span></div>
+      <div id="task-list" class="task-list"></div>
+    </aside>
+    <section class="workspace">
+      <div id="empty" class="empty">
+        <span class="mark">M</span>
+        <h2>No task selected</h2>
+        <p>Create a task, or pick one from the sidebar. Each task is an agent process supervised by mskd.</p>
+      </div>
+      <div id="detail" class="detail" hidden>
+        <div class="task-head">
+          <div style="min-width:0">
+            <h2 id="task-goal"></h2>
+            <div class="meta">
+              <code id="task-id"></code>
+              <span id="task-state" class="badge"></span>
+              <span id="task-provider"></span>
+              <span id="task-turns"></span>
+            </div>
+          </div>
+          <div class="task-actions">
+            <button id="interrupt">Interrupt</button>
+            <button id="cancel" class="danger">Cancel</button>
+          </div>
+        </div>
+        <div id="transcript" class="transcript"></div>
+        <div class="composer">
+          <textarea id="message" placeholder="Message the agent…" rows="1"></textarea>
+          <button id="send" class="primary">Send</button>
+        </div>
+      </div>
+    </section>
+    <aside class="rail">
+      <section class="panel">
+        <div class="panel-title">Approvals <span id="approval-count">0</span></div>
+        <div id="approvals" class="approvals"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-title">Blackboard</div>
+        <div id="blackboard" class="blackboard"></div>
+      </section>
+    </aside>
+  </main>
+</div>
+
+<dialog id="new-dialog">
+  <form id="new-form" class="dialog-body">
+    <h2>New task</h2>
+    <div class="field">
+      <label for="goal">Goal</label>
+      <textarea id="goal" required placeholder="Find the flag in ./challenge and explain the exploit."></textarea>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="provider">Provider</label>
+        <select id="provider">
+          <option value="scripted">scripted (offline demo)</option>
+          <option value="openai">openai</option>
+          <option value="responses">openai responses</option>
+          <option value="component">signed component</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="approvals">Approvals</label>
+        <select id="approvals">
+          <option value="ask">ask before risky tools</option>
+          <option value="allow">allow directly</option>
+        </select>
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="tokens">Context budget</label>
+        <input id="tokens" type="number" min="1000" max="10000000" step="1000" value="100000">
+      </div>
+      <label class="check" style="align-self:end;padding-bottom:9px"><input id="interactive" type="checkbox" checked> Interactive session</label>
+    </div>
+    <div class="dialog-actions">
+      <button type="button" id="new-cancel" class="ghost">Cancel</button>
+      <button type="submit" class="primary">Create</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toast" class="toast" hidden></div>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (selector) => document.querySelector(selector);
+  const state = {
+    token: null,
+    tasks: [],
+    approvals: [],
+    board: [],
+    selected: null,
+    detail: null,
+    polling: false,
+    timer: null,
+  };
+
+  const saveToken = (token) => {
+    state.token = token;
+    try { localStorage.setItem("mskToken", token); } catch (_) {}
+  };
+  const clearToken = () => {
+    state.token = null;
+    try { localStorage.removeItem("mskToken"); } catch (_) {}
+  };
+
+  function bootToken() {
+    const params = new URLSearchParams(location.search);
+    const incoming = params.get("token");
+    if (incoming) {
+      saveToken(incoming);
+      params.delete("token");
+      const query = params.toString();
+      history.replaceState(null, "", location.pathname + (query ? "?" + query : ""));
+    } else {
+      let stored = null;
+      try { stored = localStorage.getItem("mskToken"); } catch (_) {}
+      if (stored) state.token = stored;
+    }
+    if (!state.token) {
+      $("#token-screen").hidden = false;
+      $("#token-input").focus();
+      return;
+    }
+    start();
+  }
+
+  $("#token-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const token = $("#token-input").value.trim();
+    if (!token) return;
+    saveToken(token);
+    $("#token-screen").hidden = true;
+    start();
+  });
+
+  async function api(path, options = {}) {
+    const response = await fetch(path, {
+      ...options,
+      headers: {
+        "Authorization": "Bearer " + state.token,
+        ...(options.body ? { "Content-Type": "application/json" } : {}),
+        ...(options.headers || {}),
+      },
+    });
+    let body = null;
+    try { body = await response.json(); } catch (_) {}
+    if (response.status === 401) {
+      clearToken();
+      clearInterval(state.timer);
+      state.timer = null;
+      $("#app").hidden = true;
+      $("#token-screen").hidden = false;
+      $("#token-input").focus();
+      throw new Error("web token rejected");
+    }
+    if (!response.ok || (body && body.error)) {
+      throw new Error((body && body.error) || ("HTTP " + response.status));
+    }
+    return body;
+  }
+
+  function setConnection(kind) {
+    const pill = $("#connection");
+    pill.className = "pill " + kind;
+    pill.textContent = kind === "connected" ? "connected" : "offline";
+  }
+
+  let toastTimer = null;
+  function showToast(message) {
+    const toast = $("#toast");
+    toast.textContent = message;
+    toast.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toast.hidden = true; }, 5000);
+  }
+
+  async function start() {
+    $("#app").hidden = false;
+    try {
+      const health = await api("/api/health");
+      $("#root-label").textContent = health.root || "kernel daemon";
+    } catch (error) {
+      showToast(error.message);
+    }
+    await refresh();
+    clearInterval(state.timer);
+    state.timer = setInterval(() => {
+      if (!document.hidden) refresh();
+    }, 1200);
+  }
+
+  async function refresh() {
+    if (state.polling) return;
+    state.polling = true;
+    try {
+      const [list, approvals, board] = await Promise.all([
+        api("/api/tasks"),
+        api("/api/approvals"),
+        api("/api/blackboard"),
+      ]);
+      state.tasks = (list && list.tasks) || [];
+      state.approvals = (approvals && approvals.approvals) || [];
+      state.board = (board && board.entries) || [];
+      renderTasks();
+      renderApprovals();
+      renderBoard();
+      if (!state.selected && state.tasks.length) {
+        selectTask(state.tasks[state.tasks.length - 1].task_id, false);
+      }
+      if (state.selected) await loadDetail(state.selected);
+      setConnection("connected");
+    } catch (error) {
+      setConnection("offline");
+      showToast(error.message);
+    } finally {
+      state.polling = false;
+    }
+  }
+
+  function selectTask(id, scroll = true) {
+    state.selected = id;
+    state.detail = null;
+    renderTasks();
+    if (scroll && window.innerWidth > 760) {
+      $("#transcript").scrollTop = 0;
+    }
+    loadDetail(id).catch((error) => showToast(error.message));
+  }
+
+  async function loadDetail(id) {
+    const detail = await api("/api/tasks/" + encodeURIComponent(id));
+    if (state.selected === id) {
+      state.detail = detail;
+      renderDetail();
+    }
+  }
+
+  function stateBadge(task) {
+    const badge = document.createElement("span");
+    badge.className = "badge " + (task.state || "cancelled");
+    badge.textContent = (task.state || "unknown").replace("_", " ");
+    return badge;
+  }
+
+  function renderTasks() {
+    const list = $("#task-list");
+    list.replaceChildren();
+    $("#task-count").textContent = String(state.tasks.length);
+    const sorted = [...state.tasks].sort((a, b) => (b.task_id || "").localeCompare(a.task_id || ""));
+    if (!sorted.length) {
+      const empty = document.createElement("div");
+      empty.className = "muted";
+      empty.textContent = "No tasks yet.";
+      list.append(empty);
+      return;
+    }
+    for (const task of sorted) {
+      const item = document.createElement("button");
+      item.className = "task-item" + (task.task_id === state.selected ? " active" : "");
+      item.addEventListener("click", () => selectTask(task.task_id));
+      const goal = document.createElement("div");
+      goal.className = "goal";
+      goal.textContent = task.goal || "(no goal)";
+      const row = document.createElement("div");
+      row.className = "row";
+      const id = document.createElement("span");
+      id.className = "id";
+      id.textContent = task.task_id || "";
+      row.append(id, stateBadge(task));
+      item.append(goal, row);
+      list.append(item);
+    }
+  }
+
+  function renderDetail() {
+    const detail = state.detail;
+    if (!detail || !detail.task) {
+      $("#empty").hidden = false;
+      $("#detail").hidden = true;
+      return;
+    }
+    const task = detail.task;
+    $("#empty").hidden = true;
+    $("#detail").hidden = false;
+    $("#task-goal").textContent = task.goal || "(no goal)";
+    $("#task-id").textContent = task.task_id || "";
+    $("#task-provider").textContent = task.provider || "";
+    $("#task-turns").textContent = "turn " + (task.turns || 0) + " · " + (detail.events || 0) + " events";
+    const holder = $("#task-state");
+    holder.className = "badge " + (task.state || "cancelled");
+    holder.textContent = (task.state || "unknown").replace("_", " ");
+
+    const transcript = $("#transcript");
+    const atBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80;
+    const previousTop = transcript.scrollTop;
+    renderTranscript(detail.transcript || "");
+    transcript.scrollTop = atBottom ? transcript.scrollHeight : previousTop;
+
+    const terminal = ["done", "failed", "cancelled"].includes(task.state);
+    $("#message").disabled = !task.interactive || terminal;
+    $("#send").disabled = !task.interactive || terminal;
+    $("#message").placeholder = task.interactive
+      ? (terminal ? "This task has finished." : "Message the agent…")
+      : "This is a headless task.";
+    $("#interrupt").disabled = task.state !== "running";
+    $("#cancel").disabled = !["running", "waiting_input"].includes(task.state);
+  }
+
+  function renderTranscript(text) {
+    const container = $("#transcript");
+    container.replaceChildren();
+    for (const raw of text.split("\n")) {
+      if (!raw.trim()) continue;
+      const line = document.createElement("div");
+      if (raw.startsWith("user:") || raw.includes("] user:")) line.className = "line user";
+      else if (raw.startsWith("assistant:")) line.className = "line assistant";
+      else if (raw.startsWith("tool ")) line.className = "line tool";
+      else if (raw.startsWith("turn end:") || raw.startsWith("[")) line.className = "line meta";
+      else line.className = "line plain";
+      line.textContent = raw;
+      container.append(line);
+    }
+    if (!container.childElementCount) {
+      const empty = document.createElement("div");
+      empty.className = "muted";
+      empty.textContent = "No events yet. Send the first message.";
+      container.append(empty);
+    }
+  }
+
+  function renderApprovals() {
+    const container = $("#approvals");
+    container.replaceChildren();
+    $("#approval-count").textContent = String(state.approvals.length);
+    if (!state.approvals.length) {
+      const empty = document.createElement("div");
+      empty.className = "muted";
+      empty.textContent = "No pending approvals.";
+      container.append(empty);
+      return;
+    }
+    for (const approval of state.approvals) {
+      const card = document.createElement("div");
+      card.className = "approval";
+      const tool = document.createElement("div");
+      tool.className = "tool";
+      tool.textContent = approval.tool || "tool";
+      const reason = document.createElement("div");
+      reason.className = "reason";
+      reason.textContent = approval.reason || "Approval requested";
+      const args = document.createElement("pre");
+      args.textContent = JSON.stringify(approval.args, null, 2);
+      const actions = document.createElement("div");
+      actions.className = "actions";
+      const approve = document.createElement("button");
+      approve.className = "primary";
+      approve.textContent = "Approve";
+      approve.addEventListener("click", () => respondApproval(approval, true));
+      const deny = document.createElement("button");
+      deny.className = "danger";
+      deny.textContent = "Deny";
+      deny.addEventListener("click", () => respondApproval(approval, false));
+      actions.append(approve, deny);
+      card.append(tool, reason, args, actions);
+      container.append(card);
+    }
+  }
+
+  async function respondApproval(approval, approved) {
+    try {
+      await api("/api/approvals/" + encodeURIComponent(approval.task_id) + "/" + approval.id, {
+        method: "POST",
+        body: JSON.stringify({ approved }),
+      });
+      await refresh();
+    } catch (error) {
+      showToast(error.message);
+    }
+  }
+
+  function renderBoard() {
+    const container = $("#blackboard");
+    container.replaceChildren();
+    if (!state.board.length) {
+      const empty = document.createElement("div");
+      empty.className = "muted";
+      empty.textContent = "Shared state is empty.";
+      container.append(empty);
+      return;
+    }
+    for (const entry of state.board) {
+      const row = document.createElement("div");
+      row.className = "board-entry";
+      const key = document.createElement("div");
+      key.className = "key";
+      key.textContent = entry.key + " · v" + entry.version;
+      const value = document.createElement("div");
+      value.className = "value";
+      value.textContent = typeof entry.value === "string" ? entry.value : JSON.stringify(entry.value);
+      row.append(key, value);
+      container.append(row);
+    }
+  }
+
+  async function sendMessage() {
+    const input = $("#message");
+    const text = input.value.trim();
+    if (!text || !state.selected) return;
+    try {
+      await api("/api/tasks/" + encodeURIComponent(state.selected) + "/message", {
+        method: "POST",
+        body: JSON.stringify({ text }),
+      });
+      input.value = "";
+      autoSize();
+      await refresh();
+    } catch (error) {
+      showToast(error.message);
+    }
+  }
+
+  function autoSize() {
+    const input = $("#message");
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 160) + "px";
+  }
+
+  $("#send").addEventListener("click", sendMessage);
+  $("#message").addEventListener("input", autoSize);
+  $("#message").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      sendMessage();
+    }
+  });
+
+  $("#interrupt").addEventListener("click", async () => {
+    if (!state.selected) return;
+    try {
+      await api("/api/tasks/" + encodeURIComponent(state.selected) + "/interrupt", { method: "POST" });
+      await refresh();
+    } catch (error) { showToast(error.message); }
+  });
+
+  $("#cancel").addEventListener("click", async () => {
+    if (!state.selected) return;
+    if (!confirm("Cancel this task and terminate its agent process?")) return;
+    try {
+      await api("/api/tasks/" + encodeURIComponent(state.selected) + "/cancel", { method: "POST" });
+      await refresh();
+    } catch (error) { showToast(error.message); }
+  });
+
+  const dialog = $("#new-dialog");
+  $("#new-task").addEventListener("click", () => dialog.showModal());
+  $("#new-cancel").addEventListener("click", () => dialog.close());
+  $("#new-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const goal = $("#goal").value.trim();
+    if (!goal) return;
+    const interactive = $("#interactive").checked;
+    const body = {
+      goal,
+      provider: $("#provider").value,
+      approvals: $("#approvals").value,
+      interactive,
+      headless: !interactive,
+      max_context_tokens: Number($("#tokens").value || 100000),
+    };
+    try {
+      const result = await api("/api/tasks", { method: "POST", body: JSON.stringify(body) });
+      dialog.close();
+      $("#goal").value = "";
+      if (result && result.task_id) {
+        selectTask(result.task_id);
+      }
+      await refresh();
+    } catch (error) {
+      showToast(error.message);
+    }
+  });
+
+  bootToken();
+})();
+</script>
+</body>
+</html>
