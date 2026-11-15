@@ -967,7 +967,7 @@ profile = "host"
 - replay / re-execute、评测 harness、基线数据。
 - 退出标准：固定子集可重复运行；架构变更可量化对比；v1 功能冻结。
 
-> **实现状态**：`msk-replay` 已覆盖 JSONL/SQLite 校验与转录；`msk-eval` 以 IPC 客户端身份运行 JSON 场景，断言终态、转录、轮数/事件数与黑板条目，`scripted-demo` provider 提供无模型、可重复的工具调用序列；`evals/core.json` 是首个固定子集。真实模型基线与 re-execute 仍待后续。
+> **实现状态**：`msk-replay` 已覆盖 JSONL/SQLite 校验与转录；`msk-eval` 以 IPC 客户端身份运行 JSON 场景，断言终态、转录、轮数/事件数与黑板条目，`scripted-demo` provider 提供无模型、可重复的工具调用序列；`evals/core.json` 是首个固定子集；`llm.response` 事件现在记录完整 `calls`，`msk --provider replay --replay-events` 可按录制响应重跑工具链（工具会实际执行）。真实模型基线与跨环境 re-execute 仍待后续。
 
 ### M6：GUI 与远程（v1 后）
 

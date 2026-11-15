@@ -43,6 +43,9 @@ enum ProviderKind {
     /// Replays a built-in deterministic demo script. Intended for tests and
     /// `msk-eval`, which need tool calls without a model.
     ScriptedDemo,
+    /// Replays `llm.response` events recorded by an earlier run. Tools still
+    /// execute against the selected envd, so use it for regression runs.
+    Replay,
     Openai,
     OpenaiResponses,
     Component,
@@ -80,6 +83,9 @@ struct Cli {
     /// Fallback module for tools without a matching <tool>.wat.
     #[arg(long, default_value = "tools/wasm/exec.wat")]
     wasm: PathBuf,
+    /// Event log used by --provider replay.
+    #[arg(long)]
+    replay_events: Option<PathBuf>,
     /// Scripted agent demo to run.
     #[arg(long, value_enum, default_value_t = Demo::Session)]
     demo: Demo,
@@ -1225,6 +1231,7 @@ fn provider_kind_str(kind: ProviderKind) -> &'static str {
     match kind {
         ProviderKind::Scripted => "scripted",
         ProviderKind::ScriptedDemo => "scripted-demo",
+        ProviderKind::Replay => "replay",
         ProviderKind::Openai => "openai",
         ProviderKind::OpenaiResponses => "openai-responses",
         ProviderKind::Component => "component",
@@ -1251,6 +1258,19 @@ fn build_provider(cli: &Cli, demo: bool) -> Result<Box<dyn LlmProvider>> {
             "scripted-demo",
             demo_responses(cli.demo),
         )),
+        ProviderKind::Replay => {
+            let path = cli
+                .replay_events
+                .as_ref()
+                .context("--replay-events is required with --provider replay")?;
+            let events = msk_events::read_events(path)
+                .with_context(|| format!("read {}", path.display()))?;
+            let responses = replay_responses(&events)?;
+            if responses.is_empty() {
+                bail!("no llm.response events in {}", path.display());
+            }
+            Box::new(ScriptedProvider::new("replay", responses))
+        }
         ProviderKind::Openai => {
             Box::new(OpenAiProvider::new(openai_config(cli)?).context("configure OpenAI provider")?)
         }
@@ -1438,6 +1458,39 @@ fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
             },
         ],
     }
+}
+
+fn replay_responses(events: &[msk_events::Event]) -> Result<Vec<LlmResponse>> {
+    let mut responses = Vec::new();
+    for event in events {
+        if event.kind != "llm.response" {
+            continue;
+        }
+        let text = event
+            .data
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let calls = event
+            .data
+            .get("calls")
+            .cloned()
+            .context("llm.response event has no recorded tool calls")?;
+        let tool_calls: Vec<msk_core::ToolCall> =
+            serde_json::from_value(calls).context("decode recorded tool calls")?;
+        let usage_tokens = event
+            .data
+            .get("usage_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        responses.push(LlmResponse {
+            text,
+            tool_calls,
+            usage_tokens,
+        });
+    }
+    Ok(responses)
 }
 
 fn tool_data(

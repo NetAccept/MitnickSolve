@@ -224,6 +224,7 @@ impl Session {
                 json!({
                     "text": response.text,
                     "tool_calls": response.tool_calls.len(),
+                    "calls": response.tool_calls,
                     "usage_tokens": response.usage_tokens,
                     "streamed": self.stream
                 }),

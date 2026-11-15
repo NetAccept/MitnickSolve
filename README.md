@@ -372,6 +372,21 @@ target/debug/msk-replay --events .msk/events.jsonl --from-seq 100 --format jsonl
 target/debug/msk-replay --db .msk/store.db --task task-... --check
 ```
 
+Re-execute a recording against a fresh environment. The replay provider returns
+the recorded model responses in order, while tools execute normally, so this is
+a deterministic regression run (use it only where re-running side effects is
+acceptable):
+
+```sh
+target/debug/msk --root .msk/replay --envd target/debug/envd \
+  --provider replay --replay-events .msk/events.jsonl \
+  --headless --goal "replay" --approvals allow
+```
+
+Recordings must include the `calls` field on `llm.response` events, written by
+current kernels. Older logs fail with an explicit error instead of silently
+dropping tool calls.
+
 The demo writes events to `.msk/events.jsonl`. Inspect them with the TUI:
 
 ```sh
