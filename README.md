@@ -92,7 +92,8 @@ M0 scaffold plus the P1 session/turn slice:
   `<root>/checkpoint.json` (or `--checkpoint`) with the full message list,
   including native tool call/result pairs. `--resume-checkpoint` restores it
   under a fresh env and marks old env/session IDs stale; turn numbering
-  continues. Unix checkpoint files are written 0600.
+  continues. Unix checkpoint files are written 0600. `create --fork-from <task>`
+  copies a parent checkpoint into a branched task with a fresh env.
 - Event integrity and replay: `msk-replay` validates `schema_version`, seq
   order, duplicate IDs, and parent links, then prints a transcript or filtered
   JSONL. `msk --session --resume <events.jsonl>` pins a capped transcript into
@@ -352,6 +353,7 @@ Interactive tasks stay alive between messages:
 target/debug/mskctl --root .msk create --interactive
 target/debug/mskctl --root .msk create --headless --goal "run one task and exit"
 target/debug/mskctl --root .msk create --headless --max-context-tokens 5000
+target/debug/mskctl --root .msk create --headless --fork-from task-... --goal "try another branch"
 target/debug/mskctl --root .msk result task-...
 target/debug/mskctl --root .msk send --task task-... --text "list the workspace"
 target/debug/mskctl --root .msk interrupt task-...

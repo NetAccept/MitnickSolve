@@ -137,3 +137,13 @@ jobs:
             echo "third subagent was accepted"
             exit 1
           fi
+          fork_task=$(target/debug/mskctl --root .msk/ci create --headless \
+            --fork-from "$task" --goal "fork branch" | jq -r .task_id)
+          for _ in $(seq 1 100); do
+            state=$(target/debug/mskctl --root .msk/ci state "$fork_task" | jq -r .state)
+            if [ "$state" = done ] || [ "$state" = failed ]; then break; fi
+            sleep 0.1
+          done
+          [ "$(target/debug/mskctl --root .msk/ci state "$fork_task" | jq -r .state)" = done ]
+          grep -q '"kind":"session.checkpoint_resume"' \
+            .msk/ci/tasks/"$fork_task"/events.jsonl

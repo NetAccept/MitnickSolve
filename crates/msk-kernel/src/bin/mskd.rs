@@ -90,6 +90,7 @@ struct Task {
     headless: bool,
     agent_depth: u32,
     parent_task: Option<String>,
+    forked_from: Option<String>,
     max_steps: usize,
     max_context_tokens: usize,
     state: TaskState,
@@ -115,6 +116,7 @@ impl Task {
             "headless": self.headless,
             "agent_depth": self.agent_depth,
             "parent_task": self.parent_task,
+            "forked_from": self.forked_from,
             "max_steps": self.max_steps,
             "max_context_tokens": self.max_context_tokens,
             "state": self.state.as_str(),
@@ -612,6 +614,10 @@ impl Daemon {
                     .get("parent_task")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                let forked_from = params
+                    .get("fork_from")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 match self.create_task(
                     goal,
                     demo,
@@ -624,6 +630,7 @@ impl Daemon {
                     max_steps,
                     max_context_tokens,
                     parent_task,
+                    forked_from,
                 ) {
                     Ok(snapshot) => (RpcResponse::ok(id, snapshot), None),
                     Err(err) => (RpcResponse::err(id, -32000, err.to_string()), None),
@@ -809,6 +816,7 @@ impl Daemon {
         max_steps: usize,
         max_context_tokens: usize,
         parent_task: Option<String>,
+        forked_from: Option<String>,
     ) -> Result<Value> {
         if !matches!(approvals.as_str(), "allow" | "ask") {
             bail!("approvals must be allow or ask");
@@ -836,6 +844,7 @@ impl Daemon {
             headless,
             agent_depth,
             parent_task,
+            forked_from,
             max_steps,
             max_context_tokens,
             state: TaskState::Running,
@@ -853,6 +862,11 @@ impl Daemon {
                 .inner
                 .lock()
                 .map_err(|_| anyhow::anyhow!("task map poisoned"))?;
+            if let Some(source) = &task.forked_from {
+                if !inner.tasks.contains_key(source) {
+                    bail!("fork source task not found: {source}");
+                }
+            }
             if let Some(parent) = &task.parent_task {
                 let mut children = 0usize;
                 let mut subagents = 0usize;
@@ -895,6 +909,7 @@ impl Daemon {
             approvals,
             headless,
             agent_depth,
+            forked_from,
             max_steps,
             max_context_tokens,
             child_handle,
@@ -915,6 +930,7 @@ impl Daemon {
                     task.approvals.clone(),
                     task.headless,
                     task.agent_depth,
+                    task.forked_from.clone(),
                     task.max_steps,
                     task.max_context_tokens,
                     task.child.clone(),
@@ -922,6 +938,43 @@ impl Daemon {
                 ),
                 None => return,
             }
+        };
+
+        let resume_checkpoint = if let Some(source) = &forked_from {
+            let source_dir = self
+                .inner
+                .lock()
+                .ok()
+                .and_then(|inner| inner.tasks.get(source).map(|task| task.dir.clone()));
+            let Some(source_dir) = source_dir else {
+                self.finish_task(
+                    &task_id,
+                    TaskState::Failed,
+                    Some(format!("fork source task not found: {source}")),
+                );
+                return;
+            };
+            let source_checkpoint = source_dir.join("checkpoint.json");
+            if !source_checkpoint.exists() {
+                self.finish_task(
+                    &task_id,
+                    TaskState::Failed,
+                    Some(format!("fork source has no checkpoint: {source}")),
+                );
+                return;
+            }
+            let target = dir.join("checkpoint.json");
+            if let Err(err) = std::fs::copy(&source_checkpoint, &target) {
+                self.finish_task(
+                    &task_id,
+                    TaskState::Failed,
+                    Some(format!("copy fork checkpoint: {err}")),
+                );
+                return;
+            }
+            Some(target)
+        } else {
+            None
         };
 
         let stderr = match OpenOptions::new()
@@ -967,6 +1020,9 @@ impl Daemon {
             .arg(max_steps.to_string())
             .arg("--max-context-tokens")
             .arg(max_context_tokens.to_string());
+        if let Some(checkpoint) = &resume_checkpoint {
+            command.arg("--resume-checkpoint").arg(checkpoint);
+        }
         if provider == "component" {
             if let Some(manifest) = &self.component_manifest {
                 command.arg("--component-manifest").arg(manifest);

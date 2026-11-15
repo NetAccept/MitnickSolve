@@ -53,6 +53,9 @@ enum Command {
         /// Parent task id for a delegated subagent.
         #[arg(long)]
         parent_task: Option<String>,
+        /// Fork this task's checkpoint into the new task.
+        #[arg(long)]
+        fork_from: Option<String>,
     },
     /// Send a user message to an interactive task.
     Send {
@@ -187,6 +190,7 @@ fn main() -> Result<()> {
             approvals,
             max_context_tokens,
             parent_task,
+            fork_from,
         } => {
             let mut params = json!({
                 "goal": goal,
@@ -204,6 +208,9 @@ fn main() -> Result<()> {
             }
             if let Some(parent_task) = parent_task {
                 params["parent_task"] = json!(parent_task);
+            }
+            if let Some(fork_from) = fork_from {
+                params["fork_from"] = json!(fork_from);
             }
             let result = client.request(methods::TASK_CREATE, params)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
