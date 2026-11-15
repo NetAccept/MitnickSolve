@@ -440,6 +440,40 @@ authentication. The UI polls the daemon for task snapshots and transcripts,
 sends messages, interrupts or cancels tasks, resolves approvals, and shows the
 shared blackboard. It is an initial M6 client, not a native GUI.
 
+### Evaluation suites
+
+`msk-eval` runs a JSON suite against a running daemon and asserts task state,
+transcript contents, turn/event counts, and blackboard entries. Use the
+`scripted-demo` provider for deterministic offline cases; it replays the named
+built-in demo (`echo`, `session`, or `ctf`) and needs no model or network.
+
+```sh
+target/debug/msk-eval --root .msk --suite evals/core.json
+target/debug/msk-eval --root .msk --suite evals/core.json --json
+```
+
+Each case creates a headless task, waits for `done`/`failed`/`cancelled`, and
+checks:
+
+```json
+{
+  "name": "flag-ledger",
+  "goal": "Record a captured flag.",
+  "provider": "scripted-demo",
+  "demo": "ctf",
+  "expect": {
+    "state": "done",
+    "transcript_contains": ["ctf demo complete"],
+    "min_turns": 1,
+    "blackboard": [{"key_prefix": "flag:", "value_contains": "flag{eval_demo}"}]
+  }
+}
+```
+
+The process exits non-zero if any case fails, so it can gate CI. Real-model
+evaluation can point cases at the daemon's configured `openai`/`responses`
+provider instead of `scripted-demo`.
+
 ## Layout
 
 | Path | Purpose |
@@ -458,6 +492,7 @@ shared blackboard. It is an initial M6 client, not a native GUI.
 | `crates/msk-kernel` | Kernel binary and M0 demo |
 | `crates/msk-tui` | Minimal event viewer |
 | `crates/msk-web` | Loopback web client for mskd |
+| `crates/msk-eval` | Scenario evaluator over mskd IPC |
 | `tools/envd` | Go execution environment |
 | `tools/wasm` | WAT modules and manifests |
 | `docs/` | Design and protocol drafts |

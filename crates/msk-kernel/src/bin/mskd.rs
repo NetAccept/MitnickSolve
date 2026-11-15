@@ -1073,6 +1073,8 @@ impl Daemon {
         if interactive {
             command
                 .arg("--session")
+                .arg("--demo")
+                .arg(&demo)
                 .arg("--stdio-json")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped());
@@ -1082,6 +1084,8 @@ impl Daemon {
         } else if headless {
             command
                 .arg("--headless")
+                .arg("--demo")
+                .arg(&demo)
                 .arg("--goal")
                 .arg(&goal)
                 .stdout(Stdio::null());
@@ -1625,6 +1629,18 @@ impl Daemon {
                     }
                     offset += read as u64;
                     if let Ok(event) = serde_json::from_slice::<Event>(&raw) {
+                        if event.kind == "turn.end" {
+                            let turn = event
+                                .data
+                                .get("turn")
+                                .and_then(Value::as_u64)
+                                .unwrap_or_default();
+                            if let Ok(mut inner) = self.inner.lock()
+                                && let Some(task) = inner.tasks.get_mut(task_id)
+                            {
+                                task.turns = task.turns.max(turn);
+                            }
+                        }
                         self.record_event(task_id, event);
                     }
                 }

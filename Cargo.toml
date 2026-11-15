@@ -15,6 +15,7 @@ members = [
     "crates/msk-kernel",
     "crates/msk-tui",
     "crates/msk-web",
+    "crates/msk-eval",
     "crates/msk-testkit",
     "crates/msk-test-component",
 ]

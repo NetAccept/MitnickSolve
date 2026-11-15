@@ -192,6 +192,7 @@ mitnick/
 │   ├── msk-ipc/                # 前端 IPC 协议
 │   ├── msk-tui/                # ratatui 前端
 │   ├── msk-web/                # 回环 Web 前端（mskd IPC 客户端）
+│   ├── msk-eval/               # 场景评测客户端（mskd IPC）
 │   └── msk-testkit/            # conformance harness、测试替身
 ├── components/                 # 第一方内核组件（各自独立 crate，cdylib）
 │   ├── llm-anthropic/
@@ -965,6 +966,8 @@ profile = "host"
 
 - replay / re-execute、评测 harness、基线数据。
 - 退出标准：固定子集可重复运行；架构变更可量化对比；v1 功能冻结。
+
+> **实现状态**：`msk-replay` 已覆盖 JSONL/SQLite 校验与转录；`msk-eval` 以 IPC 客户端身份运行 JSON 场景，断言终态、转录、轮数/事件数与黑板条目，`scripted-demo` provider 提供无模型、可重复的工具调用序列；`evals/core.json` 是首个固定子集。真实模型基线与 re-execute 仍待后续。
 
 ### M6：GUI 与远程（v1 后）
 

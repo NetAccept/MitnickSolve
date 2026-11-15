@@ -64,6 +64,7 @@ jobs:
         run: |
           cargo build -p msk-kernel --bins
           cargo build -p msk-web
+          cargo build -p msk-eval
       - name: Build component fixture
         run: |
           set -euo pipefail
@@ -178,6 +179,7 @@ jobs:
           done
           [ "$(curl -fsS -H 'Authorization: Bearer web-ci-token' \
             http://127.0.0.1:17820/api/tasks/"$web_task" | jq -r .task.state)" = done ]
+          target/debug/msk-eval --root .msk/ci --suite evals/core.json
       - name: TLS service and data plane smoke
         run: |
           set -euo pipefail

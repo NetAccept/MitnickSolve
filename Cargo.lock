@@ -1291,6 +1291,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "msk-eval"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "msk-ipc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "msk-events"
 version = "0.1.0"
 dependencies = [

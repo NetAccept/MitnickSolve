@@ -34,11 +34,15 @@ use tracing_subscriber::EnvFilter;
 enum Demo {
     Session,
     Echo,
+    Ctf,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum ProviderKind {
     Scripted,
+    /// Replays a built-in deterministic demo script. Intended for tests and
+    /// `msk-eval`, which need tool calls without a model.
+    ScriptedDemo,
     Openai,
     OpenaiResponses,
     Component,
@@ -628,6 +632,7 @@ fn main() -> Result<()> {
             "artifact_read",
         ],
         Demo::Echo => &["echo"],
+        Demo::Ctf => &["flag_add", "flag_list"],
     };
     let registry = load_registry(&cli.tools_dir, &cli.wasm, host, tool_names)?;
     emit(
@@ -1113,6 +1118,7 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
 fn provider_kind_str(kind: ProviderKind) -> &'static str {
     match kind {
         ProviderKind::Scripted => "scripted",
+        ProviderKind::ScriptedDemo => "scripted-demo",
         ProviderKind::Openai => "openai",
         ProviderKind::OpenaiResponses => "openai-responses",
         ProviderKind::Component => "component",
@@ -1135,6 +1141,10 @@ fn build_provider(cli: &Cli, demo: bool) -> Result<Box<dyn LlmProvider>> {
                 Box::new(EchoProvider::new("echo"))
             }
         }
+        ProviderKind::ScriptedDemo => Box::new(ScriptedProvider::new(
+            "scripted-demo",
+            demo_responses(cli.demo),
+        )),
         ProviderKind::Openai => {
             Box::new(OpenAiProvider::new(openai_config(cli)?).context("configure OpenAI provider")?)
         }
@@ -1296,6 +1306,31 @@ fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
                 },
             ]
         }
+        Demo::Ctf => vec![
+            LlmResponse {
+                text: "record the captured flag".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    tool: "flag_add".into(),
+                    args: json!({"flag": "flag{eval_demo}", "source": "ctf-demo"}),
+                }],
+                usage_tokens: 10,
+            },
+            LlmResponse {
+                text: "list recorded flags".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c2".into(),
+                    tool: "flag_list".into(),
+                    args: json!({}),
+                }],
+                usage_tokens: 10,
+            },
+            LlmResponse {
+                text: "ctf demo complete".into(),
+                tool_calls: Vec::new(),
+                usage_tokens: 10,
+            },
+        ],
     }
 }
 

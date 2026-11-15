@@ -1,0 +1,49 @@
+{
+  "cases": [
+    {
+      "name": "scripted-echo",
+      "goal": "Exercise the echo tool through the WASM host bridge.",
+      "provider": "scripted-demo",
+      "demo": "echo",
+      "expect": {
+        "state": "done",
+        "transcript_contains": ["tool echo result", "hello from echo", "echo demo complete"],
+        "min_turns": 1,
+        "max_turns": 2,
+        "min_events": 4
+      }
+    },
+    {
+      "name": "scripted-session",
+      "goal": "Create a persistent shell, verify state, and close it.",
+      "provider": "scripted-demo",
+      "demo": "session",
+      "expect": {
+        "state": "done",
+        "transcript_contains": ["session-one", "session demo complete"],
+        "min_turns": 1,
+        "max_turns": 2,
+        "min_events": 8
+      }
+    },
+    {
+      "name": "flag-ledger",
+      "goal": "Record a captured flag in the shared ledger.",
+      "provider": "scripted-demo",
+      "demo": "ctf",
+      "expect": {
+        "state": "done",
+        "transcript_contains": ["flag{eval_demo}", "ctf demo complete"],
+        "min_turns": 1,
+        "max_turns": 2,
+        "min_events": 4,
+        "blackboard": [
+          {
+            "key_prefix": "flag:",
+            "value_contains": "flag{eval_demo}"
+          }
+        ]
+      }
+    }
+  ]
+}
