@@ -214,6 +214,56 @@ func TestServiceDataCreditBackpressure(t *testing.T) {
 	}
 }
 
+func TestServiceDataSeekReplaysAndRejectsStale(t *testing.T) {
+	s, sessionID := dataSession(t, 1<<20)
+	conn, ack := openDataView(t, s, "secret", sessionID, nil)
+	defer conn.Close()
+	if ack.Kind != protocol.KindOpenAck {
+		t.Fatalf("open ack kind: %s", ack.Kind)
+	}
+	writeSessionData(t, s, sessionID, "echo seek-data")
+	readDataUntil(t, conn, "seek-data")
+	writeSessionData(t, s, sessionID, "echo second-marker")
+	readDataUntil(t, conn, "second-marker")
+
+	var seek [8]byte
+	binary.BigEndian.PutUint64(seek[:], 0)
+	if err := protocol.WriteFrame(conn, protocol.Frame{
+		Kind: protocol.KindSeek, Payload: seek[:],
+	}, protocol.EmbeddedMaxFrame); err != nil {
+		t.Fatal(err)
+	}
+	replayed, _ := readDataUntil(t, conn, "seek-data")
+	if !strings.Contains(string(replayed), "second-marker") {
+		t.Fatalf("seek replay missing later output: %q", replayed)
+	}
+
+	binary.BigEndian.PutUint64(seek[:], 1<<40)
+	if err := protocol.WriteFrame(conn, protocol.Frame{
+		Kind: protocol.KindSeek, Payload: seek[:],
+	}, protocol.EmbeddedMaxFrame); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		frame, err := protocol.ReadFrame(conn, protocol.EmbeddedMaxFrame)
+		if err != nil {
+			t.Fatalf("expected STALE error, got read error: %v", err)
+		}
+		if frame.Kind == protocol.KindError {
+			var payload struct {
+				Code int `json:"code"`
+			}
+			if err := json.Unmarshal(frame.Payload, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload.Code != 14 {
+				t.Fatalf("expected STALE code 14, got %d", payload.Code)
+			}
+			return
+		}
+	}
+}
+
 func TestServiceDataInputCredit(t *testing.T) {
 	s, sessionID := dataSession(t, 1<<20)
 	conn, ack := openDataView(t, s, "secret", sessionID, nil)

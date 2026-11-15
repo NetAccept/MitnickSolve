@@ -267,6 +267,18 @@ impl EnvDataClient {
         Ok(())
     }
 
+    /// Repositions the view cursor within the retained replay window. Replayed
+    /// bytes arrive as normal DATA; an out-of-window cursor produces an ERROR.
+    pub fn seek(&self, seq: u64) -> io::Result<()> {
+        if self.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "data view is closed",
+            ));
+        }
+        send_bytes(&self.writer, FrameKind::Seek, &seq.to_be_bytes())
+    }
+
     pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         send_json(
             &self.writer,

@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cynosure279/mitnick/tools/envd/internal/protocol"
@@ -409,6 +410,9 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 
 	inCredit := int64(65536)
 	const initialInCredit = int64(65536)
+	var viewCursor atomic.Uint64
+	viewCursor.Store(cursor)
+	seekCh := make(chan uint64, 1)
 	clientErr := make(chan error, 1)
 	go func() {
 		for {
@@ -476,8 +480,11 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 				clientErr <- errDataClosed
 				return
 			case protocol.KindSeek:
-				clientErr <- fmt.Errorf("SEEK is not supported; reconnect and OPEN with since_seq")
-				return
+				if len(frame.Payload) != 8 {
+					clientErr <- fmt.Errorf("SEEK payload must be 8 bytes")
+					return
+				}
+				seekCh <- binary.BigEndian.Uint64(frame.Payload)
 			default:
 				clientErr <- fmt.Errorf("unsupported frame %s", frame.Kind)
 				return
@@ -486,12 +493,23 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 	}()
 
 	for {
+		select {
+		case offset := <-seekCh:
+			viewCursor.Store(offset)
+			continue
+		default:
+		}
+		cursorValue := viewCursor.Load()
 		first, last, finished, logNotify := session.replay.bounds()
-		if cursor < first {
+		if cursorValue < first {
 			sendError(13, "GAP", "output was trimmed before the view could read it")
 			return
 		}
-		if cursor >= last {
+		if cursorValue > last {
+			sendError(14, "STALE", "seek is ahead of the session output")
+			return
+		}
+		if cursorValue >= last {
 			if finished {
 				_ = writeJSON(protocol.KindExit, map[string]any{"exit_code": 0, "last_seq": last})
 				return
@@ -499,6 +517,8 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 			select {
 			case <-logNotify:
 			case <-credit.wait():
+			case offset := <-seekCh:
+				viewCursor.Store(offset)
 			case err := <-clientErr:
 				if errors.Is(err, errDataClosed) || errors.Is(err, io.EOF) {
 					return
@@ -508,7 +528,7 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 			}
 			continue
 		}
-		want := int64(last - cursor)
+		want := int64(last - cursorValue)
 		if want > 64<<10 {
 			want = 64 << 10
 		}
@@ -517,6 +537,8 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 			select {
 			case <-credit.wait():
 			case <-logNotify:
+			case offset := <-seekCh:
+				viewCursor.Store(offset)
 			case err := <-clientErr:
 				if errors.Is(err, errDataClosed) || errors.Is(err, io.EOF) {
 					return
@@ -526,7 +548,7 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 			}
 			continue
 		}
-		data, gap, _, _ := session.replay.read(cursor, int(granted))
+		data, gap, _, _ := session.replay.read(cursorValue, int(granted))
 		if gap {
 			sendError(13, "GAP", "output was trimmed before the view could read it")
 			return
@@ -536,6 +558,8 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 			select {
 			case <-logNotify:
 			case <-credit.wait():
+			case offset := <-seekCh:
+				viewCursor.Store(offset)
 			case err := <-clientErr:
 				if errors.Is(err, errDataClosed) || errors.Is(err, io.EOF) {
 					return
@@ -545,12 +569,13 @@ func (s *Server) handleDataConn(conn net.Conn, token string) {
 			}
 			continue
 		}
-		if err := writeFrame(protocol.KindData, cursor, data); err != nil {
+		if err := writeFrame(protocol.KindData, cursorValue, data); err != nil {
 			return
 		}
-		cursor += uint64(len(data))
+		viewCursor.Store(cursorValue + uint64(len(data)))
 		credit.refund(granted - int64(len(data)))
 	}
+
 }
 
 func writeServiceFrame(conn net.Conn, maxFrame int, kind protocol.Kind, streamID uint32, value any) error {
