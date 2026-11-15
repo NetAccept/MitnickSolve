@@ -112,8 +112,9 @@ M0 scaffold plus the P1 session/turn slice:
 - Subagents: `spawn_agent` creates a headless child task and `agent_result`
   waits for its state/transcript. Both require `agent.spawn`; spawning is
   approval-gated by default, the child runs with delegated `approvals=allow`,
-  and depth is capped at 2. `max_steps` and `max_context_tokens` bound each
-  child; `mskctl create --headless --goal ...` and `mskctl result task-...`
+  and depth is capped at 2. Each parent may have at most 2 active subagents and
+  the daemon allows 8 globally; `max_steps` and `max_context_tokens` bound each
+  child. `mskctl create --headless --goal ...` and `mskctl result task-...`
   expose the same path.
 - Shared blackboard: `blackboard_get/set/list` (`state.shared`) persist a
   per-root JSON map (`<root>/blackboard.json`, 64 KiB/value, 1 MiB total) so

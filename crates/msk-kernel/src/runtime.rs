@@ -31,6 +31,7 @@ pub struct EnvHost {
     pub control: Option<Arc<ControlPlane>>,
     pub secrets: Arc<dyn SecretStore>,
     pub agent_depth: u32,
+    pub task_id: Option<String>,
     pub default_provider: String,
 }
 
@@ -55,6 +56,7 @@ impl ControlPlane {
         provider: &str,
         max_steps: usize,
         max_context_tokens: usize,
+        parent_task: Option<&str>,
         depth: u32,
     ) -> std::result::Result<Value, String> {
         if depth >= 2 {
@@ -74,6 +76,7 @@ impl ControlPlane {
                     "headless": true,
                     "approvals": "allow",
                     "agent_depth": depth + 1,
+                    "parent_task": parent_task,
                     "max_steps": max_steps,
                     "max_context_tokens": max_context_tokens
                 }),
@@ -403,6 +406,7 @@ impl ToolHost for EnvHost {
                     provider,
                     max_steps,
                     max_context_tokens,
+                    self.task_id.as_deref(),
                     self.agent_depth,
                 )?
             } else {

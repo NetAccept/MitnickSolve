@@ -986,7 +986,7 @@ profile = "host"
 - 远程 envd 客户端：`msk --envd-url/--envd-token` 通过 HTTP(S) 调 MCP，`EnvTransport` 抽象让 embedded 与 service 共用同一 WASM 宿主桥；已用服务模式完成 headless 会话、远程 `exec`、mskd 任务与 daemon 终端；断线重连与数据面重连游标待接。
 - 文件与网络工具：`read_file/write_file/list_dir/stat_file` 经 envd 的 `fs.workspace` 能力执行，写入默认审批；`http_request` 在宿主侧执行 HTTP(S)，受 `net.egress` 能力约束，仅允许 http/https、默认 30s 超时、4 MiB 响应上限并跟随重定向。SSRF/私网访问目前不做内建阻断，应由部署网络策略或沙箱负责。
 - 秘密存储：新增 `msk-secret`，`EnvSecretStore` 将 `$secret:name` 映射到 `MSK_SECRET_NAME`；`http_request` 在宿主侧完成 `secrets.read` 能力检查后解析头部，明文不进入模型观测或事件日志。
-- 多 agent（M4 首个切片）：`spawn_agent` 通过控制面创建 headless 子任务，`agent_result` 轮询 `task.result` 并返回状态与转录；两者受 `agent.spawn` 能力约束，spawn 默认审批，子 agent 以委派策略 `allow` 运行，深度上限 2，`max_steps`/`max_context_tokens` 限定子任务预算。`blackboard_get/set/list`（`state.shared`）提供每 root 持久化共享黑板（单值 64 KiB、总量 1 MiB），父子 agent 可协作；`flag_add/flag_list` 在黑板中以 flag 值的 SHA-256 去重记录来源。`mskctl bb-*` 可直接操作黑板。
+- 多 agent（M4 首个切片）：`spawn_agent` 通过控制面创建 headless 子任务，`agent_result` 轮询 `task.result` 并返回状态与转录；两者受 `agent.spawn` 能力约束，spawn 默认审批，子 agent 以委派策略 `allow` 运行，深度上限 2，每个父任务最多 2 个活跃子 agent、daemon 全局最多 8 个，`max_steps`/`max_context_tokens` 限定子任务预算。`blackboard_get/set/list`（`state.shared`）提供每 root 持久化共享黑板（单值 64 KiB、总量 1 MiB），父子 agent 可协作；`flag_add/flag_list` 在黑板中以 flag 值的 SHA-256 去重记录来源。`mskctl bb-*` 可直接操作黑板。
 - 验收：同一会话连续两轮消息得到两次 `turn.end`，第二轮请求携带第一轮上下文；真实 mock provider 的 echo 工具调用跨轮保留；工具 trap 后该轮仍能收到下一次模型响应；审批通过后命令实际执行，拒绝后下一轮仍可用；父 agent 能 spawn 子 agent 并取回其转录；`msk --envd-url` 可对远程 envd 执行会话与命令。
 - 尚未进入本切片：envd WSS/SEEK 与 TLS 数据面、检查点级工具状态恢复、子 agent 结果合并/并发预算调度/黑板冲突策略。
 

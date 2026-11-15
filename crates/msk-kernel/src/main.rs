@@ -602,6 +602,7 @@ fn main() -> Result<()> {
         control: None,
         secrets: Arc::new(EnvSecretStore::default()),
         agent_depth: 0,
+        task_id: cli.task_id.clone(),
         default_provider: "scripted".into(),
     });
     let host: Arc<dyn ToolHost> = env_host.clone();
@@ -829,6 +830,7 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         control: control.map(Arc::new),
         secrets: Arc::new(EnvSecretStore::default()),
         agent_depth: cli.agent_depth,
+        task_id: cli.task_id.clone(),
         default_provider: provider_kind_str(cli.provider).into(),
     });
     let host: Arc<dyn ToolHost> = env_host.clone();

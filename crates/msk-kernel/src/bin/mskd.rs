@@ -88,6 +88,7 @@ struct Task {
     approvals: String,
     headless: bool,
     agent_depth: u32,
+    parent_task: Option<String>,
     max_steps: usize,
     max_context_tokens: usize,
     state: TaskState,
@@ -112,6 +113,7 @@ impl Task {
             "approvals": self.approvals,
             "headless": self.headless,
             "agent_depth": self.agent_depth,
+            "parent_task": self.parent_task,
             "max_steps": self.max_steps,
             "max_context_tokens": self.max_context_tokens,
             "state": self.state.as_str(),
@@ -534,6 +536,10 @@ impl Daemon {
                     .and_then(Value::as_u64)
                     .unwrap_or(100_000)
                     .clamp(4_096, 1_000_000) as usize;
+                let parent_task = params
+                    .get("parent_task")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 match self.create_task(
                     goal,
                     demo,
@@ -545,6 +551,7 @@ impl Daemon {
                     agent_depth,
                     max_steps,
                     max_context_tokens,
+                    parent_task,
                 ) {
                     Ok(snapshot) => (RpcResponse::ok(id, snapshot), None),
                     Err(err) => (RpcResponse::err(id, -32000, err.to_string()), None),
@@ -728,6 +735,7 @@ impl Daemon {
         agent_depth: u32,
         max_steps: usize,
         max_context_tokens: usize,
+        parent_task: Option<String>,
     ) -> Result<Value> {
         if !matches!(approvals.as_str(), "allow" | "ask") {
             bail!("approvals must be allow or ask");
@@ -754,6 +762,7 @@ impl Daemon {
             approvals,
             headless,
             agent_depth,
+            parent_task,
             max_steps,
             max_context_tokens,
             state: TaskState::Running,
@@ -766,11 +775,36 @@ impl Daemon {
             created_ms: now_ms(),
         };
         let snapshot = task.snapshot();
-        self.inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("task map poisoned"))?
-            .tasks
-            .insert(id.clone(), task);
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("task map poisoned"))?;
+            if let Some(parent) = &task.parent_task {
+                let mut children = 0usize;
+                let mut subagents = 0usize;
+                for existing in inner.tasks.values() {
+                    let active =
+                        matches!(existing.state, TaskState::Running | TaskState::WaitingInput);
+                    if !active {
+                        continue;
+                    }
+                    if existing.parent_task.is_some() {
+                        subagents += 1;
+                    }
+                    if existing.parent_task.as_deref() == Some(parent.as_str()) {
+                        children += 1;
+                    }
+                }
+                if children >= 2 {
+                    bail!("parent {parent} already has 2 active subagents");
+                }
+                if subagents >= 8 {
+                    bail!("global subagent limit reached (8)");
+                }
+            }
+            inner.tasks.insert(id.clone(), task);
+        }
         self.broadcast_state(&id, &snapshot);
         let daemon = self.clone();
         thread::spawn(move || daemon.run_task(id));

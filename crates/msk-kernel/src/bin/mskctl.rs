@@ -50,6 +50,9 @@ enum Command {
         /// Context token budget for the task (default 100000).
         #[arg(long)]
         max_context_tokens: Option<u64>,
+        /// Parent task id for a delegated subagent.
+        #[arg(long)]
+        parent_task: Option<String>,
     },
     /// Send a user message to an interactive task.
     Send {
@@ -177,6 +180,7 @@ fn main() -> Result<()> {
             headless,
             approvals,
             max_context_tokens,
+            parent_task,
         } => {
             let mut params = json!({
                 "goal": goal,
@@ -191,6 +195,9 @@ fn main() -> Result<()> {
             }
             if let Some(max_context_tokens) = max_context_tokens {
                 params["max_context_tokens"] = json!(max_context_tokens);
+            }
+            if let Some(parent_task) = parent_task {
+                params["parent_task"] = json!(parent_task);
             }
             let result = client.request(methods::TASK_CREATE, params)?;
             println!("{}", serde_json::to_string_pretty(&result)?);

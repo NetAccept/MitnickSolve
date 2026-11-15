@@ -130,3 +130,10 @@ jobs:
             | jq -r .transcript | grep -q "component hello"
           target/debug/mskctl --root .msk/ci events --task "$task" --limit 5 \
             | jq -e '.count > 0'
+          for _ in 1 2; do
+            target/debug/mskctl --root .msk/ci create --interactive --parent-task cap >/dev/null
+          done
+          if target/debug/mskctl --root .msk/ci create --interactive --parent-task cap >/dev/null 2>&1; then
+            echo "third subagent was accepted"
+            exit 1
+          fi
