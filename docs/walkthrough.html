@@ -204,12 +204,12 @@
   <div class="hero">
     <div class="eyebrow">one command · real daemon · real tools</div>
     <h1>From a clean checkout to an approved tool call.</h1>
-    <p class="lede"><code>msk</code> now opens the conversational terminal app directly. This is a real run: a mock OpenAI-compatible model asked the kernel to execute a command, the TUI paused for approval, and the tool result returned to the same conversation.</p>
+    <p class="lede"><code>msk</code> now opens the conversational terminal app directly. This is a real run in a project directory: a mock OpenAI-compatible model asked the kernel to execute a command, the TUI paused for approval, and the tool result returned to the same conversation. The agent sees the files in the directory you launched from.</p>
     <div class="hero-note">
       <span class="chip"><strong>msk</strong> opens the TUI</span>
       <span class="chip"><strong>mskd</strong> auto-starts</span>
       <span class="chip"><strong>scripted-demo</strong> works offline</span>
-      <span class="chip"><strong>task.history</strong> restores context</span>
+      <span class="chip"><strong>cwd</strong> is the workspace</span><span class="chip"><strong>/resume</strong> restores a checkpoint</span>
     </div>
   </div>
 
@@ -227,22 +227,21 @@
       </div>
       <div class="steps">
         <div class="step"><div class="step-no">1</div><div><h3>No daemon yet?</h3><p><code>msk</code> starts <code>mskd</code> with the local envd, tools directory and a fresh <code>.msk</code> root. The daemon stays up after you quit.</p></div></div>
-        <div class="step"><div class="step-no">2</div><div><h3>No API key?</h3><p>The first screen uses the offline <code>scripted-demo</code> provider. Type a goal or <code>/demo</code>; you get a real tool session without a model. <code>/provider openai</code> switches when a key is present.</p></div></div>
+        <div class="step"><div class="step-no">2</div><div><h3>No API key?</h3><p>The first screen uses the offline <code>scripted-demo</code> provider. Type a goal or <code>/demo</code>; you get a real tool session without a model. The embedded envd opens the current directory, so <code>./challenge</code> is visible immediately. <code>/provider openai</code> switches when a key is present.</p></div></div>
         <div class="step"><div class="step-no">3</div><div><h3>Need a different root?</h3><p><code>msk-tui --root .msk/lab</code> opens or starts that daemon. <code>msk-tui --connect .msk/lab</code> only connects and never spawns one.</p></div></div>
       </div>
       <div class="term">
         <div class="term-head"><span class="dots"><i></i><i></i><i></i></span>first screen · actual --snapshot output</div>
         <pre>┌session───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│MitnickSolve  .msk/welcome-snap  ·  provider scripted-demo  ·  0 task(s)                                              │
+│MitnickSolve  C:\Users\cy\MitnickSolve\.msk\ws-project  ·  scripted-demo / - / effort default  ·  0 session(s)        │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌tasks─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                                                                                                      │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌conversation──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│Welcome. Describe the challenge below and press Enter to start a task.                                                │
+┌session───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│Welcome. Describe the challenge below and press Enter to start a session.                                                │
 │                                                                                                                      │
 │Examples:  inspect ./challenge and find the flag  ·  run the binary and explain the exploit                           │
 │Commands:  /new  /provider openai  /terminal  /approvals  /help                                                       │
+│Press p to choose provider, model and effort; /setup does the same.                                                   │
+│Offline demo provider: replies are canned. Use /provider openai for a real model.                                     │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
@@ -264,47 +263,48 @@
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
-│                                                                                                                      │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌new task — provider scripted-demo─────────────────────────────────────────────────────────────────────────────────────┐
-│&gt;                                                                                                                     │
 │                                                                                                                      │
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-Enter send  Esc close editor  ←/→ move  Ctrl+U clear  Ctrl+C cancel  / commands</pre>
+┌new session — provider scripted-demo──────────────────────────────────────────────────────────────────────────────────┐
+│&gt; Describe the challenge…                                                                                             │
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+Enter start session  Esc cancel  Shift+Enter newline  / commands</pre>
       </div>
-      <p class="caption">The composer is focused. Typing a challenge and pressing Enter creates the task and sends the first turn.</p>
+      <p class="caption">The composer is focused. Typing a challenge and pressing Enter creates the session and sends the first turn.</p>
     </div>
   </section>
 
   <section id="setup">
     <div class="section-head"><div class="section-num">02</div><div>
       <h2>Provider, model and effort are chosen, not guessed.</h2>
-      <p><code>p</code> or <code>/setup</code> opens a guided wizard. The selection is saved to <code>tui-config.json</code> and applied to every new task. The API key stays in <code>mskd</code>'s environment; the setup screen only reports whether it is present.</p>
+      <p><code>p</code> or <code>/setup</code> opens a guided wizard. The selection is saved to <code>tui-config.json</code> and applied to every new session. The API key stays in <code>mskd</code>'s environment; the setup screen only reports whether it is present.</p>
     </div></div>
     <div class="body">
       <div class="term">
         <div class="term-head"><span class="dots"><i></i><i></i><i></i></span>setup · provider · actual --snapshot output</div>
         <pre>┌session───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│MitnickSolve  C:\Users\cy\MitnickSolve\.msk\model-e2e  ·  openai / gpt-5 / effort minimal  ·  1 task(s)               │
+│MitnickSolve  C:\Users\cy\MitnickSolve\.msk\ws-project  ·  openai / gpt-5 / effort minimal  ·  1 session(s)           │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌tasks─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│›   task-1794751127213-1  done         exec echo model                                                                │
-└──────┌setup — provider / model / effort / base URL────────────────────────────────────────────────────────────┐──────┘
-┌conver│Choose how the agent reaches a model.                                                                   │──────┐
-│tool: │                                                                                                        │      │
-│      │  scripted-demo  — offline canned tool session, no model or key                                         │      │
-│tool: │› openai  — OpenAI-compatible Chat Completions                                                          │      │
-│      │  openai-responses  — OpenAI Responses API function calls                                               │      │
-│you: e│  component  — signed llm.provider component configured on mskd                                         │      │
+┌session — Inspect challenge.txt and explain it [done]─────────────────────────────────────────────────────────────────┐
+│tool: ▸ env_create {&quot;kind&quot;:&quot;managed&quot;,&quot;name&quot;:&quot;session&quot;,&quot;profile&quot;:&quot;dev&quot;,&quot;root&quot;:&quot;.&quot;}                                     │
+│      ┌setup — provider / model / effort / base URL────────────────────────────────────────────────────────────┐      │
+│tool: │Choose how the agent reaches a model.                                                                   │      │
 │      │                                                                                                        │      │
-│tool: │mskd has MSK_LLM_API_KEY                                                                                │      │
-│      │config: C:\Users\cy\MitnickSolve\.msk\model-e2e\tui-config.json                                         │      │
-│tool: │                                                                                                        │      │
-│      │↑/↓ choose · Enter next · Esc back/cancel · Ctrl+U clear input                                          │      │
-│agent:│                                                                                                        │      │
-│      │                                                                                                        │      │
+│you: I│  scripted-demo  — offline canned tool session, no model or key                                         │      │
+│      │› openai  — OpenAI-compatible Chat Completions                                                          │      │
+│agent:│  openai-responses  — OpenAI Responses API function calls                                               │      │
+│      │  component  — signed llm.provider component configured on mskd                                         │      │
 │turn e│                                                                                                        │      │
+│      │mskd has MSK_LLM_API_KEY                                                                                │      │
+│      │config: C:\Users\cy\MitnickSolve\.msk\showcase2\tui-config.json                                         │      │
+│      │                                                                                                        │      │
+│      │↑/↓ choose · Enter next · Esc back/cancel · Ctrl+U clear input                                          │      │
+│      │                                                                                                        │      │
+│      │                                                                                                        │      │
+│      │                                                                                                        │      │
 │      │                                                                                                        │      │
 │      │                                                                                                        │      │
 │      │                                                                                                        │      │
@@ -324,30 +324,30 @@ Enter send  Esc close editor  ←/→ move  Ctrl+U clear  Ctrl+C cancel  / comma
 │                                                                                                                      │
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-Enter/i message  n new  / commands  PgUp/PgDn scroll  v events  j/k task  s interrupt  t terminal  ? help  q quit</pre>
+Enter/i message  n new  / commands  Tab sessions  PgUp/PgDn scroll  v events  s interrupt  ? help  q quit</pre>
       </div>
       <div class="term">
         <div class="term-head"><span class="dots"><i></i><i></i><i></i></span>setup · model · actual --snapshot output</div>
         <pre>┌session───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│MitnickSolve  C:\Users\cy\MitnickSolve\.msk\model-e2e  ·  openai / gpt-5 / effort minimal  ·  1 task(s)               │
+│MitnickSolve  C:\Users\cy\MitnickSolve\.msk\ws-project  ·  openai / gpt-5 / effort minimal  ·  1 session(s)           │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌tasks─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│›   task-1794751127213-1  done         exec echo model                                                                │
-└──────┌setup — provider / model / effort / base URL────────────────────────────────────────────────────────────┐──────┘
-┌conver│Model for openai. Choose a preset or custom.                                                            │──────┐
-│tool: │                                                                                                        │      │
-│      │› gpt-5                                                                                                 │      │
-│tool: │  gpt-5-mini                                                                                            │      │
-│      │  o3                                                                                                    │      │
-│you: e│  o4-mini                                                                                               │      │
-│      │  custom…                                                                                               │      │
-│tool: │                                                                                                        │      │
-│      │current: gpt-5                                                                                          │      │
-│tool: │                                                                                                        │      │
-│      │mskd has MSK_LLM_API_KEY                                                                                │      │
-│agent:│config: C:\Users\cy\MitnickSolve\.msk\model-e2e\tui-config.json                                         │      │
+┌session — Inspect challenge.txt and explain it [done]─────────────────────────────────────────────────────────────────┐
+│tool: ▸ env_create {&quot;kind&quot;:&quot;managed&quot;,&quot;name&quot;:&quot;session&quot;,&quot;profile&quot;:&quot;dev&quot;,&quot;root&quot;:&quot;.&quot;}                                     │
+│      ┌setup — provider / model / effort / base URL────────────────────────────────────────────────────────────┐      │
+│tool: │Model for openai. Choose a preset or custom.                                                            │      │
 │      │                                                                                                        │      │
-│turn e│↑/↓ choose · Enter next · Esc back/cancel · Ctrl+U clear input                                          │      │
+│you: I│› gpt-5                                                                                                 │      │
+│      │  gpt-5-mini                                                                                            │      │
+│agent:│  o3                                                                                                    │      │
+│      │  o4-mini                                                                                               │      │
+│turn e│  custom…                                                                                               │      │
+│      │                                                                                                        │      │
+│      │current: gpt-5                                                                                          │      │
+│      │                                                                                                        │      │
+│      │mskd has MSK_LLM_API_KEY                                                                                │      │
+│      │config: C:\Users\cy\MitnickSolve\.msk\showcase2\tui-config.json                                         │      │
+│      │                                                                                                        │      │
+│      │↑/↓ choose · Enter next · Esc back/cancel · Ctrl+U clear input                                          │      │
 │      │                                                                                                        │      │
 │      │                                                                                                        │      │
 │      │                                                                                                        │      │
@@ -367,30 +367,30 @@ Enter/i message  n new  / commands  PgUp/PgDn scroll  v events  j/k task  s inte
 │                                                                                                                      │
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-Enter/i message  n new  / commands  PgUp/PgDn scroll  v events  j/k task  s interrupt  t terminal  ? help  q quit</pre>
+Enter/i message  n new  / commands  Tab sessions  PgUp/PgDn scroll  v events  s interrupt  ? help  q quit</pre>
       </div>
       <div class="term">
         <div class="term-head"><span class="dots"><i></i><i></i><i></i></span>setup · effort · actual --snapshot output</div>
         <pre>┌session───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│MitnickSolve  C:\Users\cy\MitnickSolve\.msk\model-e2e  ·  openai / gpt-5 / effort minimal  ·  1 task(s)               │
+│MitnickSolve  C:\Users\cy\MitnickSolve\.msk\ws-project  ·  openai / gpt-5 / effort minimal  ·  1 session(s)           │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌tasks─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│›   task-1794751127213-1  done         exec echo model                                                                │
-└──────┌setup — provider / model / effort / base URL────────────────────────────────────────────────────────────┐──────┘
-┌conver│Reasoning effort is sent to OpenAI-compatible providers that support it.                                │──────┐
-│tool: │                                                                                                        │      │
-│      │  default  — let the provider decide                                                                    │      │
-│tool: │› minimal  — fastest / least reasoning                                                                  │      │
-│      │  low  — light reasoning                                                                                │      │
-│you: e│  medium  — balanced                                                                                    │      │
-│      │  high  — deep reasoning                                                                                │      │
-│tool: │                                                                                                        │      │
+┌session — Inspect challenge.txt and explain it [done]─────────────────────────────────────────────────────────────────┐
+│tool: ▸ env_create {&quot;kind&quot;:&quot;managed&quot;,&quot;name&quot;:&quot;session&quot;,&quot;profile&quot;:&quot;dev&quot;,&quot;root&quot;:&quot;.&quot;}                                     │
+│      ┌setup — provider / model / effort / base URL────────────────────────────────────────────────────────────┐      │
+│tool: │Reasoning effort is sent to OpenAI-compatible providers that support it.                                │      │
+│      │                                                                                                        │      │
+│you: I│  default  — let the provider decide                                                                    │      │
+│      │› minimal  — fastest / least reasoning                                                                  │      │
+│agent:│  low  — light reasoning                                                                                │      │
+│      │  medium  — balanced                                                                                    │      │
+│turn e│  high  — deep reasoning                                                                                │      │
+│      │                                                                                                        │      │
 │      │mskd has MSK_LLM_API_KEY                                                                                │      │
-│tool: │config: C:\Users\cy\MitnickSolve\.msk\model-e2e\tui-config.json                                         │      │
+│      │config: C:\Users\cy\MitnickSolve\.msk\showcase2\tui-config.json                                         │      │
 │      │                                                                                                        │      │
-│agent:│↑/↓ choose · Enter next · Esc back/cancel · Ctrl+U clear input                                          │      │
+│      │↑/↓ choose · Enter next · Esc back/cancel · Ctrl+U clear input                                          │      │
 │      │                                                                                                        │      │
-│turn e│                                                                                                        │      │
+│      │                                                                                                        │      │
 │      │                                                                                                        │      │
 │      │                                                                                                        │      │
 │      │                                                                                                        │      │
@@ -410,17 +410,17 @@ Enter/i message  n new  / commands  PgUp/PgDn scroll  v events  j/k task  s inte
 │                                                                                                                      │
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-Enter/i message  n new  / commands  PgUp/PgDn scroll  v events  j/k task  s interrupt  t terminal  ? help  q quit</pre>
+Enter/i message  n new  / commands  Tab sessions  PgUp/PgDn scroll  v events  s interrupt  ? help  q quit</pre>
       </div>
       <p class="caption">The provider list distinguishes the offline demo, Chat Completions, Responses and component providers. Model presets include a custom input; effort is sent as <code>reasoning_effort</code> or <code>reasoning.effort</code>. The header shows the active <code>provider / model / effort</code> at all times.</p>
-      <div class="callout"><strong>No key, no fake success:</strong> if the daemon is missing <code>MSK_LLM_API_KEY</code>, the setup screen says so and task creation stops with an actionable message instead of spawning a task that immediately fails.</div>
+      <div class="callout"><strong>No key, no fake success:</strong> if the daemon is missing <code>MSK_LLM_API_KEY</code>, the setup screen says so and session creation stops with an actionable message instead of spawning a task that immediately fails.</div>
     </div>
   </section>
 
   <section id="session">
     <div class="section-head"><div class="section-num">03</div><div>
-      <h2>The conversation is the workbench.</h2>
-      <p>Tool calls, results, user turns and turn boundaries share one timeline. The raw event inspector is hidden unless you press <code>v</code>.</p>
+      <h2>One session, one conversation.</h2>
+      <p>Tool calls, results, user turns and turn boundaries share one timeline. The session list is hidden for a single session (<code>Tab</code> shows it), and the raw event inspector is hidden unless you press <code>v</code>.</p>
     </div></div>
     <div class="body">
       <div class="split">
@@ -428,11 +428,11 @@ Enter/i message  n new  / commands  PgUp/PgDn scroll  v events  j/k task  s inte
           <li><code>tool: ▸ exec …</code> — the agent requested a tool, with compact arguments.</li>
           <li><code>tool: ✓ exec …</code> — exit code, stdout/stderr, or the artifact ID for large output.</li>
           <li><code>you:</code> and <code>agent:</code> — the actual turn, in order.</li>
-          <li><code>turn end:</code> — the task is ready for the next message.</li>
+          <li><code>turn end:</code> — the session is ready for the next message.</li>
         </ul></div>
         <div class="panel"><h3>What stays available</h3><ul>
           <li><code>PgUp</code>/<code>PgDn</code> scrolls; <code>End</code> follows the newest output.</li>
-          <li><code>j</code>/<code>k</code> switches tasks and rehydrates each history.</li>
+          <li><code>j</code>/<code>k</code> switches sessions and rehydrates each history.</li>
           <li><code>v</code> shows the raw events for debugging.</li>
           <li><code>t</code> opens the daemon PTY; <code>Ctrl+Q</code> detaches.</li>
         </ul></div>
@@ -440,23 +440,14 @@ Enter/i message  n new  / commands  PgUp/PgDn scroll  v events  j/k task  s inte
       <div class="term">
         <div class="term-head"><span class="dots"><i></i><i></i><i></i></span>completed turn · mock model · actual --snapshot output</div>
         <pre>┌session───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│MitnickSolve  C:\Users\cy\MitnickSolve\.msk\showcase  ·  provider openai  ·  1 task(s)                                │
+│MitnickSolve  C:\Users\cy\MitnickSolve\.msk\ws-project  ·  openai / gpt-5 / effort minimal  ·  1 session(s)           │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌tasks─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│› ◆ task-1794747375148-1  waiting_input Run exec and show the approved output                                         │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌conversation — task-1794747375148-1 [waiting_input]───────────────────────────────────────────────────────────────────┐
-│tool: ▸ env_create {&quot;kind&quot;:&quot;managed&quot;,&quot;name&quot;:&quot;session&quot;,&quot;profile&quot;:&quot;dev&quot;}                                                │
+┌session — Inspect challenge.txt and explain it [done]─────────────────────────────────────────────────────────────────┐
+│tool: ▸ env_create {&quot;kind&quot;:&quot;managed&quot;,&quot;name&quot;:&quot;session&quot;,&quot;profile&quot;:&quot;dev&quot;,&quot;root&quot;:&quot;.&quot;}                                     │
 │                                                                                                                      │
 │tool: ✓ env_create                                                                                                    │
 │                                                                                                                      │
-│you: exec echo approved                                                                                               │
-│                                                                                                                      │
-│tool: ▸ exec {&quot;argv&quot;:[&quot;cmd&quot;,&quot;/C&quot;,&quot;echo approved&quot;],&quot;env_id&quot;:&quot;env_b22679c854cf9373&quot;}                                    │
-│                                                                                                                      │
-│approval requested: exec                                                                                              │
-│                                                                                                                      │
-│tool: ✓ exec  {&quot;duration_ms&quot;:49,&quot;exit_code&quot;:0,&quot;signal&quot;:0,&quot;stderr&quot;:&quot;&quot;,&quot;stdout&quot;:&quot;approved\r\n&quot;,&quot;truncated&quot;:false}       │
+│you: Inspect challenge.txt and explain it                                                                             │
 │                                                                                                                      │
 │agent: mock complete                                                                                                  │
 │                                                                                                                      │
@@ -472,15 +463,24 @@ Enter/i message  n new  / commands  PgUp/PgDn scroll  v events  j/k task  s inte
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌message to task-1794747375148-1 [waiting_input]───────────────────────────────────────────────────────────────────────┐
+┌message · Inspect challenge.txt and explain it [done]─────────────────────────────────────────────────────────────────┐
 │&gt; press Enter or i to write  ·  / commands                                                                            │
 │                                                                                                                      │
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-Enter/i message  n new  / commands  PgUp/PgDn scroll  v events  j/k task  s interrupt  t terminal  ? help  q quit</pre>
+Enter/i message  n new  / commands  Tab sessions  PgUp/PgDn scroll  v events  s interrupt  ? help  q quit</pre>
       </div>
-      <p class="caption">The task is <code>waiting_input</code>; the tool card carries the exit code and stdout, and the next message can continue the same shell.</p>
+      <p class="caption">The session is <code>waiting_input</code>; the tool card carries the exit code and stdout, and the next message can continue the same shell. <code>/resume</code> restores the latest checkpoint after a daemon restart.</p>
     </div>
   </section>
 
@@ -493,25 +493,25 @@ Enter/i message  n new  / commands  PgUp/PgDn scroll  v events  j/k task  s inte
       <div class="term">
         <div class="term-head"><span class="dots"><i></i><i></i><i></i></span>approval pending · y approve / n deny · actual --snapshot output</div>
         <pre>┌session───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│MitnickSolve  C:\Users\cy\MitnickSolve\.msk\showcase  ·  provider openai  ·  1 task(s)                                │
+│MitnickSolve  C:\Users\cy\MitnickSolve\.msk\ws-project  ·  openai / mock / effort default  ·  1 session(s)            │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌tasks─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│› ◆ task-1794747375148-1  running      Run exec and show the approved output                                          │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌conversation — task-1794747375148-1 [running]─────────────────────────────────────────────────────────────────────────┐
-│tool: ▸ env_create {&quot;kind&quot;:&quot;managed&quot;,&quot;name&quot;:&quot;session&quot;,&quot;profile&quot;:&quot;dev&quot;}                                                │
-│            ┌approval required — task-1794747375148-1 #1  (1/1)──────────────────────────────────────────┐            │
-│tool: ✓ env_│tool: exec                                                                                  │            │
-│            │reason: execute a command                                                                   │            │
-│you: exec ec│                                                                                            │            │
-│            │args:                                                                                       │            │
-│tool: ▸ exec│{                                                                                           │            │
+┌session — Run exec with approval [running]────────────────────────────────────────────────────────────────────────────┐
+│tool: ▸ env_create {&quot;kind&quot;:&quot;managed&quot;,&quot;name&quot;:&quot;session&quot;,&quot;profile&quot;:&quot;dev&quot;,&quot;root&quot;:&quot;.&quot;}                                     │
+│                                                                                                                      │
+│tool: ✓ env_create                                                                                                    │
+│                                                                                                                      │
+│you: exec ec┌approval required · 1/1 · #1────────────────────────────────────────────────────────────────┐            │
+│            │tool: exec                                                                                  │            │
+│tool: ▸ exec│reason: execute a command                                                                   │            │
+│            │                                                                                            │            │
+│approval req│args:                                                                                       │            │
+│            │{                                                                                           │            │
 │            │  &quot;argv&quot;: [                                                                                 │            │
-│approval req│    &quot;cmd&quot;,                                                                                  │            │
+│            │    &quot;cmd&quot;,                                                                                  │            │
 │            │    &quot;/C&quot;,                                                                                   │            │
 │            │    &quot;echo approved&quot;                                                                         │            │
 │            │  ],                                                                                        │            │
-│            │  &quot;env_id&quot;: &quot;env_b22679c854cf9373&quot;                                                          │            │
+│            │  &quot;env_id&quot;: &quot;env_6d4bc74815e4bbf6&quot;                                                          │            │
 │            │}                                                                                           │            │
 │            │                                                                                            │            │
 │            │[y] approve   [n] deny                                                                      │            │
@@ -526,7 +526,7 @@ Enter/i message  n new  / commands  PgUp/PgDn scroll  v events  j/k task  s inte
 │            └────────────────────────────────────────────────────────────────────────────────────────────┘            │
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌message to task-1794747375148-1 [running]─────────────────────────────────────────────────────────────────────────────┐
+┌message · Run exec with approval [running]────────────────────────────────────────────────────────────────────────────┐
 │&gt; press Enter or i to write  ·  / commands                                                                            │
 │                                                                                                                      │
 │                                                                                                                      │
@@ -534,7 +534,7 @@ Enter/i message  n new  / commands  PgUp/PgDn scroll  v events  j/k task  s inte
 APPROVAL PENDING: y approve  n deny</pre>
       </div>
       <div class="callout"><strong>y</strong> approves this request, <strong>n</strong> or <strong>Esc</strong> denies it. Enter is intentionally not an approval shortcut. A TUI that connects after the request still sees it, because approvals are hydrated from <code>approval.list</code>.</div>
-      <p class="caption">Captured while the task was running. After <code>y</code>, the tool executes and the same conversation receives the result.</p>
+      <p class="caption">Captured while the session was running. After <code>y</code>, the tool executes and the same conversation receives the result.</p>
     </div>
   </section>
 
@@ -550,20 +550,25 @@ APPROVAL PENDING: y approve  n deny</pre>
         <div class="key"><kbd>Esc</kbd><span>leave editor / interrupt</span></div>
         <div class="key"><kbd>Ctrl+C</kbd><span>interrupt running turn</span></div>
         <div class="key"><kbd>PgUp/PgDn</kbd><span>scroll conversation</span></div>
-        <div class="key"><kbd>n</kbd><span>new task</span></div>
+        <div class="key"><kbd>n</kbd><span>new session</span></div>
         <div class="key"><kbd>v</kbd><span>raw event inspector</span></div>
         <div class="key"><kbd>q</kbd><span>quit</span></div>
       </div>
       <div class="cmd">
         <div class="cmd-head"><span>slash commands</span><button class="copy" data-copy="slash">Copy</button></div>
-        <pre id="slash">/new challenge notes       start a new task
+        <pre id="slash">/new challenge notes       start a new session
 /demo                     offline scripted tool demo
-/provider openai          next task provider
+/provider openai          next session provider
 /provider openai-responses
-/status                   root, provider, task, state
+/status                   workspace, provider, session, state
 /approvals                pending count
 /terminal                 daemon PTY
-/interrupt  /cancel       stop the turn / task
+/interrupt  /cancel       stop the turn / session
+/resume                   restore the latest checkpoint
+/sessions                 toggle the session list
+/models                   open the model selector
+/model NAME               set the next model
+/effort NAME              set the next effort
 /clear   /help   /quit</pre>
       </div>
       <div class="callout"><strong>Offline:</strong> <code>/demo</code> runs the scripted session — persistent shell, a large output stored as an artifact, an artifact read, and a clean close. No model, no API key, no Python.</div>
@@ -607,16 +612,16 @@ target/debug/msk</pre></div>
   <section id="beyond">
     <div class="section-head"><div class="section-num">07</div><div>
       <h2>What is happening underneath.</h2>
-      <p>The TUI is a frontend only. It speaks the same IPC as <code>mskctl</code>, the web UI, and the eval harness, so the kernel does not know which client is attached.</p>
+      <p>The TUI is a frontend only. It runs in your current directory and speaks the same IPC as <code>mskctl</code>, the web UI, and the eval harness, so the kernel does not know which client is attached.</p>
     </div></div>
     <div class="body">
       <div class="grid">
         <div class="card"><h3>Daemon</h3><p><code>mskd</code> supervises every task, persists events and checkpoints, and serves approvals and the PTY.</p></div>
         <div class="card"><h3>Env</h3><p><code>envd</code> provides the managed workspace. <code>dev</code> is the default; <code>isolated</code> requires a validated deployment launcher.</p></div>
-        <div class="card"><h3>History</h3><p><code>task.history</code> returns structured events. Selecting a task rehydrates the same timeline, not a truncated transcript.</p></div>
+        <div class="card"><h3>History</h3><p><code>task.history</code> returns structured events. Selecting a session rehydrates the same timeline, not a truncated transcript.</p></div>
         <div class="card"><h3>Replay</h3><p>Every turn writes JSONL events and a checkpoint. <code>msk-replay</code> inspects them; <code>--provider replay</code> reruns recorded responses.</p></div>
         <div class="card"><h3>Approvals</h3><p>The daemon owns the request and timeout; any attached client can answer. The modal is a view of that queue.</p></div>
-        <div class="card"><h3>Other clients</h3><p><code>msk-web</code> serves the same tasks over a loopback browser UI; <code>mskctl</code> remains the scriptable path.</p></div>
+        <div class="card"><h3>Other clients</h3><p><code>msk-web</code> serves the same sessions over a loopback browser UI; <code>mskctl</code> remains the scriptable path.</p></div>
       </div>
       <div class="toc">
         <a href="https://github.com/NetAccept/MitnickSolve/blob/main/docs/tui.md">Full TUI reference</a><a href="https://github.com/NetAccept/MitnickSolve/blob/main/README.md">README</a><a href="https://github.com/NetAccept/MitnickSolve/blob/main/docs/design.md">Design</a>

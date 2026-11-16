@@ -89,8 +89,7 @@ jobs:
           mkdir -p .msk
           cat > .msk/envd-launcher.sh <<'EOF'
           #!/bin/sh
-          printf '%s\n' "$@" >> /tmp/envd-launcher.log
-          exec "$@"
+          echo '{"provider":"scripted-demo","model":"","effort":"default","base_url":""}' > .msk/ci/tui-config.json
           EOF
           chmod +x .msk/envd-launcher.sh
           target/debug/envd --service --root .msk/envd-ci2 \
@@ -141,8 +140,9 @@ jobs:
           set -euo pipefail
           rm -rf .msk/ci
           mkdir -p .msk/ci
+          mkdir -p .msk/ci/workspace
           target/debug/mskd --root .msk/ci --store .msk/ci/store.db \
-            --envd target/debug/envd \
+            --envd target/debug/envd --workspace .msk/ci/workspace \
             --tools-dir tools/wasm \
             --component-manifest .msk/component-fixture/manifest.json \
             --component-trust .msk/component-fixture/trust.json \
@@ -235,6 +235,7 @@ jobs:
           [ "$(curl -fsS -H 'Authorization: Bearer web-ci-token' \
             http://127.0.0.1:17820/api/tasks/"$web_task" | jq -r .task.state)" = done ]
           target/debug/msk-eval --root .msk/ci --suite evals/core.json
+          echo '{"provider":"scripted-demo","model":"","effort":"default","base_url":""}' > .msk/ci/tui-config.json
           target/debug/msk-tui --root .msk/ci --snapshot --provider scripted \
             | grep -q "MitnickSolve"
           target/debug/msk-tui --root .msk/ci --snapshot --setup --setup-step effort \
@@ -266,7 +267,9 @@ jobs:
             if curl -kfsS https://localhost:17810/healthz >/dev/null 2>&1; then break; fi
             sleep 0.1
           done
+          mkdir -p .msk/tls-ci/workspace
           target/debug/mskd --root .msk/tls-ci/daemon \
+            --workspace .msk/tls-ci/workspace \
             --envd-url https://localhost:17810 --envd-token tls-ci-token \
             --envd-ca .msk/tls-ci/ca.pem \
             --envd-data-addr 127.0.0.1:17811 --envd-data-tls \

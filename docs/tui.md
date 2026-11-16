@@ -17,6 +17,11 @@ If `msk-tui` is not next to `msk`, run `cargo build --bins` first. The daemon
 state lives in `.msk/`; use `msk-tui --root /path` for a different location
 (`msk` with arguments keeps its headless/agent behavior).
 
+The embedded envd opens the **current directory as the workspace**. The agent's
+file tools and shell therefore see the project you launched from, like a normal
+coding CLI. Use `msk --workspace /path` or `mskd --workspace /path` for a
+different project root; remote envd keeps its operator-configured workspace.
+
 `msk` with arguments keeps its existing headless/session/daemon behavior; only
 the no-argument invocation is the interactive app. `msk-tui` can also be
 launched directly:
@@ -57,23 +62,14 @@ mock-model task asked for `exec` and the approval was granted:
 
 ```text
 ┌session───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│MitnickSolve  C:\Users\cy\MitnickSolve\.msk\showcase  ·  provider openai  ·  1 task(s)                                │
+│MitnickSolve  C:\Users\cy\MitnickSolve\.msk\ws-project  ·  openai / gpt-5 / effort minimal  ·  1 session(s)           │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌tasks─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│› ◆ task-1794747375148-1  waiting_input Run exec and show the approved output                                         │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌conversation — task-1794747375148-1 [waiting_input]───────────────────────────────────────────────────────────────────┐
-│tool: ▸ env_create {"kind":"managed","name":"session","profile":"dev"}                                                │
+┌session — Inspect challenge.txt and explain it [done]─────────────────────────────────────────────────────────────────┐
+│tool: ▸ env_create {"kind":"managed","name":"session","profile":"dev","root":"."}                                     │
 │                                                                                                                      │
 │tool: ✓ env_create                                                                                                    │
 │                                                                                                                      │
-│you: exec echo approved                                                                                               │
-│                                                                                                                      │
-│tool: ▸ exec {"argv":["cmd","/C","echo approved"],"env_id":"env_b22679c854cf9373"}                                    │
-│                                                                                                                      │
-│approval requested: exec                                                                                              │
-│                                                                                                                      │
-│tool: ✓ exec  {"duration_ms":49,"exit_code":0,"signal":0,"stderr":"","stdout":"approved\r\n","truncated":false}       │
+│you: Inspect challenge.txt and explain it                                                                             │
 │                                                                                                                      │
 │agent: mock complete                                                                                                  │
 │                                                                                                                      │
@@ -89,13 +85,22 @@ mock-model task asked for `exec` and the approval was granted:
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌message to task-1794747375148-1 [waiting_input]───────────────────────────────────────────────────────────────────────┐
+┌message · Inspect challenge.txt and explain it [done]─────────────────────────────────────────────────────────────────┐
 │> press Enter or i to write  ·  / commands                                                                            │
 │                                                                                                                      │
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-Enter/i message  n new  / commands  PgUp/PgDn scroll  v events  j/k task  s interrupt  t terminal  ? help  q quit
+Enter/i message  n new  / commands  Tab sessions  PgUp/PgDn scroll  v events  s interrupt  ? help  q quit
 ```
 
 The approval step is a modal over the same conversation, with the tool, reason,

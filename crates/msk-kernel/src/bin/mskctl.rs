@@ -43,6 +43,9 @@ enum Command {
         /// OpenAI-compatible base URL.
         #[arg(long)]
         base_url: Option<String>,
+        /// Resume a previous task checkpoint.
+        #[arg(long)]
+        resume_checkpoint: Option<PathBuf>,
         /// Keep the agent session alive and accept task.message calls.
         #[arg(long)]
         interactive: bool,
@@ -196,6 +199,7 @@ fn main() -> Result<()> {
             model,
             effort,
             base_url,
+            resume_checkpoint,
             interactive,
             stream,
             headless,
@@ -220,6 +224,9 @@ fn main() -> Result<()> {
             }
             if let Some(base_url) = base_url {
                 params["base_url"] = json!(base_url);
+            }
+            if let Some(checkpoint) = resume_checkpoint {
+                params["resume_checkpoint"] = json!(checkpoint.display().to_string());
             }
             if let Some(approvals) = approvals {
                 params["approvals"] = json!(approvals);

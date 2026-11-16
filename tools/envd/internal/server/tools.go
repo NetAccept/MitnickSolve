@@ -175,7 +175,17 @@ func (s *Server) toolEnvCreate(raw json.RawMessage) toolResult {
 
 	id := newID("env")
 	var workspace string
-	if args.Root != "" {
+	if args.Root == "." {
+		// Embedded envd is spawned by the kernel with --root set to the user's
+		// project directory. "." opts into operating there directly, which is
+		// the local, opencode-style default. Service mode keeps the configured
+		// workspace root and never lets a client select the server root.
+		if s.transport != "embedded-stdio" {
+			return errResult(codePermissionDenied, "PERMISSION_DENIED",
+				"workspace root '.' is only available on embedded transport")
+		}
+		workspace = s.opts.Root
+	} else if args.Root != "" {
 		full, err := secureJoin(s.opts.Root, args.Root)
 		if err != nil {
 			return errResult(codePermissionDenied, "PERMISSION_DENIED", err.Error())

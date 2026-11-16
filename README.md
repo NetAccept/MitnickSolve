@@ -157,7 +157,10 @@ target/debug/msk
 ```
 
 `msk` with no arguments opens the interactive terminal app and starts a local
-`mskd` if needed. With no API key it uses the offline `scripted-demo` provider;
+`mskd` if needed. The embedded envd uses the **current directory** as its
+workspace, so the agent sees `./challenge` immediately. Use `--workspace <dir>`
+on `msk`/`mskd` to point it elsewhere. With no API key it uses the offline
+`scripted-demo` provider;
 type a message and press Enter to create a task, or `/demo` for the canned tool
 demo. Press `p` (or `/setup`) to choose provider, model and reasoning effort;
 `/provider openai` is the quick switch. See [`docs/tui.md`](docs/tui.md) for
@@ -565,6 +568,10 @@ into wasmtime's platform-specific precompiled modules (`.cwasm`):
 ```sh
 target/debug/msk --wasm-cache .msk/wasm-cache --envd ... --session
 target/debug/mskd --wasm-cache .msk/wasm-cache --envd ... --tools-dir tools/wasm
+```
+
+The same flags accept `--workspace <dir>`; local sessions default to the current
+directory.
 ```
 
 `MSK_WASM_CACHE` is the environment equivalent and is also honored inside tasks.

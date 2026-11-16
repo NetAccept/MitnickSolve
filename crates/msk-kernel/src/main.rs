@@ -78,6 +78,9 @@ struct Cli {
     /// Kernel state directory (events, envd data).
     #[arg(long, default_value = ".msk")]
     root: PathBuf,
+    /// Project directory used by the embedded envd. Defaults to the current directory.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
     /// Directory containing tool manifests and WAT modules.
     #[arg(long, default_value = "tools/wasm")]
     tools_dir: PathBuf,
@@ -431,6 +434,7 @@ fn connect_backend(
     sink: &dyn EventSink,
     name: &str,
     resume_env: Option<&str>,
+    workspace: Option<&std::path::Path>,
 ) -> Result<Backend> {
     if !cli.tools_dir.exists() {
         bail!("tool directory not found: {}", cli.tools_dir.display());
@@ -572,7 +576,9 @@ fn connect_backend(
             envd_bin.display()
         );
     }
-    let envd_root = cli.root.join("envd");
+    let envd_root = workspace
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| cli.root.join("envd"));
     std::fs::create_dir_all(&envd_root)?;
     let mut embedded = EnvClient::spawn(&envd_bin, &envd_root).context("spawn embedded envd")?;
     let ack = embedded
@@ -600,12 +606,15 @@ fn connect_backend(
         .unwrap_or(0);
     human_line(cli, &format!("envd tools: {tool_count}"));
     emit(sink, "mcp.tools", json!({"count": tool_count}))?;
-    let env = tool_data(
-        &mut embedded,
-        "env_create",
-        json!({"name": name, "kind": "managed", "profile": cli.envd_profile}),
-        sink,
-    )?;
+    let mut env_params = json!({
+        "name": name,
+        "kind": "managed",
+        "profile": cli.envd_profile
+    });
+    if workspace.is_some() {
+        env_params["root"] = json!(".");
+    }
+    let env = tool_data(&mut embedded, "env_create", env_params, sink)?;
     let env_id = env
         .get("env_id")
         .and_then(Value::as_str)
@@ -676,7 +685,7 @@ fn main() -> Result<()> {
         return run_session(&cli, sink, &events_path);
     }
 
-    let backend = connect_backend(&cli, sink.as_ref(), "demo", None)?;
+    let backend = connect_backend(&cli, sink.as_ref(), "demo", None, None)?;
     let env_id = backend.env_id.clone();
     let mut client = backend.client;
 
@@ -966,7 +975,17 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         .as_ref()
         .and_then(|checkpoint| checkpoint.env_id.as_deref())
         .map(str::to_string);
-    let backend = connect_backend(cli, sink.as_ref(), "session", resume_env.as_deref())?;
+    let workspace = cli
+        .workspace
+        .clone()
+        .or_else(|| std::env::current_dir().ok());
+    let backend = connect_backend(
+        cli,
+        sink.as_ref(),
+        "session",
+        resume_env.as_deref(),
+        workspace.as_deref(),
+    )?;
     let env_id = backend.env_id;
     let env_reused = backend.reused_env;
     let client = backend.client;

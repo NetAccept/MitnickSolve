@@ -62,6 +62,9 @@ struct Cli {
     /// Out-of-process component host binary.
     #[arg(long)]
     component_host: Option<PathBuf>,
+    /// Project directory used by embedded envd workspaces. Defaults to the current directory.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
     /// Directory containing tool manifests and WAT modules.
     #[arg(long, default_value = "tools/wasm")]
     tools_dir: PathBuf,
@@ -102,6 +105,7 @@ struct Task {
     model: Option<String>,
     effort: Option<String>,
     base_url: Option<String>,
+    api_key: Option<String>,
     interactive: bool,
     stream: bool,
     approvals: String,
@@ -109,6 +113,7 @@ struct Task {
     agent_depth: u32,
     parent_task: Option<String>,
     forked_from: Option<String>,
+    resume_checkpoint: Option<PathBuf>,
     max_steps: usize,
     max_context_tokens: usize,
     state: TaskState,
@@ -351,6 +356,7 @@ struct Daemon {
     component_manifest: Option<PathBuf>,
     component_trust: Option<PathBuf>,
     component_host: Option<PathBuf>,
+    workspace: PathBuf,
     tools_dir: PathBuf,
     wasm_cache: Option<PathBuf>,
     agent_bin: PathBuf,
@@ -427,6 +433,15 @@ fn main() -> Result<()> {
         .component_host
         .as_ref()
         .map(|path| msk_ipc::normalize_root(path));
+    let workspace = cli
+        .workspace
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .context("workspace directory")?;
+    if !workspace.is_dir() {
+        bail!("workspace is not a directory: {}", workspace.display());
+    }
+    let workspace = msk_ipc::normalize_root(&workspace);
     let tools_dir = msk_ipc::normalize_root(&cli.tools_dir);
     if !tools_dir.exists() {
         bail!("tools directory not found: {}", tools_dir.display());
@@ -475,6 +490,7 @@ fn main() -> Result<()> {
         component_manifest,
         component_trust,
         component_host,
+        workspace,
         tools_dir,
         wasm_cache: cli.wasm_cache.clone(),
         agent_bin,
@@ -606,6 +622,7 @@ impl Daemon {
                             "protocol": msk_ipc::IPC_PROTOCOL_VERSION,
                             "server": "mskd",
                             "capabilities": ["tasks", "events", "sessions", "approvals", "terminal"],
+                            "workspace": self.workspace.display().to_string(),
                             "llm": {
                                 "api_key": std::env::var("MSK_LLM_API_KEY").is_ok(),
                                 "model": std::env::var("MSK_LLM_MODEL").ok(),
@@ -655,6 +672,16 @@ impl Daemon {
                 }
                 let base_url = params
                     .get("base_url")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                let resume_checkpoint = params
+                    .get("resume_checkpoint")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let api_key = params
+                    .get("api_key")
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
@@ -712,6 +739,7 @@ impl Daemon {
                     model,
                     effort,
                     base_url,
+                    api_key,
                     interactive,
                     stream,
                     approvals,
@@ -721,6 +749,7 @@ impl Daemon {
                     max_context_tokens,
                     parent_task,
                     forked_from,
+                    resume_checkpoint,
                 ) {
                     Ok(snapshot) => (RpcResponse::ok(id, snapshot), None),
                     Err(err) => (RpcResponse::err(id, -32000, err.to_string()), None),
@@ -905,6 +934,7 @@ impl Daemon {
         model: Option<String>,
         effort: Option<String>,
         base_url: Option<String>,
+        api_key: Option<String>,
         interactive: bool,
         stream: bool,
         approvals: String,
@@ -914,6 +944,7 @@ impl Daemon {
         max_context_tokens: usize,
         parent_task: Option<String>,
         forked_from: Option<String>,
+        resume_checkpoint: Option<String>,
     ) -> Result<Value> {
         if !matches!(approvals.as_str(), "allow" | "ask") {
             bail!("approvals must be allow or ask");
@@ -928,6 +959,24 @@ impl Daemon {
         );
         let dir = self.root.join("tasks").join(&id);
         fs::create_dir_all(&dir)?;
+        let resume_checkpoint = if let Some(source) = resume_checkpoint {
+            let source = fs::canonicalize(&source)
+                .with_context(|| format!("resume checkpoint {}", source))?;
+            let tasks_root = fs::canonicalize(self.root.join("tasks"))?;
+            if !source.starts_with(&tasks_root) || !source.is_file() {
+                bail!("resume checkpoint must be a file under the task root");
+            }
+            let target = dir.join("checkpoint.json");
+            fs::copy(&source, &target)?;
+            if let Some(source_events) = source.parent().map(|parent| parent.join("events.jsonl"))
+                && source_events.exists()
+            {
+                let _ = fs::copy(source_events, dir.join("events.jsonl"));
+            }
+            Some(target)
+        } else {
+            None
+        };
         let child = Arc::new(Mutex::new(None));
         let input = Arc::new(Mutex::new(None));
         let task = Task {
@@ -938,6 +987,7 @@ impl Daemon {
             model,
             effort,
             base_url,
+            api_key,
             interactive,
             stream,
             approvals,
@@ -945,6 +995,7 @@ impl Daemon {
             agent_depth,
             parent_task,
             forked_from,
+            resume_checkpoint,
             max_steps,
             max_context_tokens,
             state: TaskState::Running,
@@ -1007,12 +1058,14 @@ impl Daemon {
             model,
             effort,
             base_url,
+            api_key,
             interactive,
             stream,
             approvals,
             headless,
             agent_depth,
             forked_from,
+            resume_checkpoint,
             max_steps,
             max_context_tokens,
             child_handle,
@@ -1031,12 +1084,14 @@ impl Daemon {
                     task.model.clone(),
                     task.effort.clone(),
                     task.base_url.clone(),
+                    task.api_key.clone(),
                     task.interactive,
                     task.stream,
                     task.approvals.clone(),
                     task.headless,
                     task.agent_depth,
                     task.forked_from.clone(),
+                    task.resume_checkpoint.clone(),
                     task.max_steps,
                     task.max_context_tokens,
                     task.child.clone(),
@@ -1046,7 +1101,9 @@ impl Daemon {
             }
         };
 
-        let resume_checkpoint = if let Some(source) = &forked_from {
+        let resume_checkpoint = if resume_checkpoint.is_some() {
+            resume_checkpoint
+        } else if let Some(source) = &forked_from {
             let source_dir = self
                 .inner
                 .lock()
@@ -1111,6 +1168,8 @@ impl Daemon {
         command
             .arg("--root")
             .arg(&dir)
+            .arg("--workspace")
+            .arg(&self.workspace)
             .arg("--tools-dir")
             .arg(&self.tools_dir)
             .arg("--wasm")
@@ -1127,6 +1186,9 @@ impl Daemon {
         }
         if let Some(base_url) = &base_url {
             command.arg("--llm-base-url").arg(base_url);
+        }
+        if let Some(api_key) = &api_key {
+            command.env("MSK_LLM_API_KEY", api_key);
         }
         command
             .arg("--approvals")
@@ -1922,7 +1984,7 @@ impl Daemon {
             Box::new(service)
         } else {
             let envd = self.envd.as_ref().context("envd is not configured")?;
-            let envd_root = self.root.join("terminal-envd");
+            let envd_root = self.workspace.clone();
             fs::create_dir_all(&envd_root)?;
             let mut embedded = EnvClient::spawn(envd, &envd_root).context("spawn terminal envd")?;
             embedded.handshake("mskd-terminal")?;
@@ -1930,10 +1992,15 @@ impl Daemon {
             Box::new(embedded)
         };
 
-        let env = client.call_tool(
-            "env_create",
-            json!({"name": "terminal", "kind": "managed", "profile": self.envd_profile}),
-        )?;
+        let mut env_params = json!({
+            "name": "terminal",
+            "kind": "managed",
+            "profile": self.envd_profile
+        });
+        if self.envd_url.is_none() {
+            env_params["root"] = json!(".");
+        }
+        let env = client.call_tool("env_create", env_params)?;
         let env_data = mcp_data(&env)?;
         let env_id = env_data
             .get("env_id")

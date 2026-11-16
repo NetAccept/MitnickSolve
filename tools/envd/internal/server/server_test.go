@@ -285,3 +285,19 @@ func TestEnvOpenReturnsExistingEnvironment(t *testing.T) {
 		t.Fatalf("error = %v", detail)
 	}
 }
+
+func TestEmbeddedWorkspaceRootDot(t *testing.T) {
+	root := t.TempDir()
+	s := New(Options{Root: root, MaxFrame: protocol.EmbeddedMaxFrame})
+	env := mustTool(t, s, "env_create", `{"root":"."}`)
+	if env["workspace"] != root {
+		t.Fatalf("workspace = %v, want %v", env["workspace"], root)
+	}
+
+	service := New(Options{Root: root, MaxFrame: protocol.EmbeddedMaxFrame})
+	service.transport = "service-http"
+	detail := toolError(t, service.callTool("env_create", json.RawMessage(`{"root":"."}`)))
+	if detail["name"] != "PERMISSION_DENIED" {
+		t.Fatalf("service root dot error = %v", detail)
+	}
+}

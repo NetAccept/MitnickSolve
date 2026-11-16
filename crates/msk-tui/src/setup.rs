@@ -7,6 +7,13 @@ impl DaemonApp {
         self.status = "setup: provider → model → effort → base URL".into();
     }
 
+    pub(crate) fn open_setup_at(&mut self, step: SetupStep) {
+        self.open_setup();
+        if let Some(setup) = self.setup.as_mut() {
+            setup.step = step;
+        }
+    }
+
     pub(crate) fn setup_key(&mut self, key: KeyEvent) -> bool {
         let Some(mut setup) = self.setup.take() else {
             return false;
@@ -159,15 +166,25 @@ impl DaemonApp {
 
     fn apply_setup(&mut self, setup: &SetupState) {
         self.provider = setup.selected_provider().to_string();
-        self.model = setup.selected_model();
-        self.effort = EFFORTS[setup.effort.min(EFFORTS.len() - 1)].0.to_string();
-        self.base_url = setup.base_url.trim().to_string();
+        if requires_key(&self.provider) {
+            self.model = setup.selected_model();
+            self.effort = EFFORTS[setup.effort.min(EFFORTS.len() - 1)].0.to_string();
+            self.base_url = setup.base_url.trim().to_string();
+        } else {
+            self.model.clear();
+            self.effort = default_effort();
+            self.base_url.clear();
+        }
         let config = TuiConfig {
             provider: self.provider.clone(),
             model: self.model.clone(),
             effort: self.effort.clone(),
             base_url: self.base_url.clone(),
         };
+        if self.tasks.is_empty() {
+            self.new_task = true;
+            self.composing = true;
+        }
         match config.save(&self.root) {
             Ok(()) => {
                 self.status = if requires_key(&self.provider) && !self.daemon_llm_key {

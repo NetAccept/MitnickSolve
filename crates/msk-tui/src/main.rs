@@ -652,9 +652,9 @@ impl App {
                  PgUp/PgDn  scroll the conversation
                  v          toggle the raw event inspector
                  End        jump to the newest message
-                 j / k      previous / next task
-                 g / G      first / last task
-                 n          start a new task
+                 j / k      previous / next session
+                 g / G      first / last session
+                 n          start a new session
                  s          interrupt the running turn
                  x          cancel the selected task
                  t          open/focus the PTY terminal
@@ -735,6 +735,7 @@ struct DaemonApp {
     base_url: String,
     daemon_llm_key: bool,
     daemon_llm_model: Option<String>,
+    daemon_workspace: Option<String>,
     setup: Option<SetupState>,
     new_task: bool,
     quit_requested: bool,
@@ -745,6 +746,7 @@ struct DaemonApp {
     input_history: Vec<String>,
     history_index: Option<usize>,
     show_events: bool,
+    show_sessions: bool,
 }
 
 impl DaemonApp {
@@ -752,6 +754,10 @@ impl DaemonApp {
         let mut client =
             Client::connect(&root).with_context(|| format!("connect {}", root.display()))?;
         let hello = client.hello().context("kernel.hello")?;
+        let daemon_workspace = hello
+            .get("workspace")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let daemon_llm_key = hello
             .get("llm")
             .and_then(|llm| llm.get("api_key"))
@@ -772,23 +778,26 @@ impl DaemonApp {
         let mut config = TuiConfig::load(&root);
         if let Some(provider) = provider {
             config.provider = provider;
-        } else if !configured
-            && std::env::var("MSK_LLM_MODEL").is_ok()
-            && std::env::var("MSK_LLM_API_KEY").is_ok()
-        {
+        } else if !configured && daemon_llm_key {
             config.provider = "openai".into();
         }
-        if config.model.is_empty() {
-            config.model = std::env::var("MSK_LLM_MODEL")
-                .ok()
-                .or_else(|| daemon_llm_model.clone())
-                .unwrap_or_default();
-        }
-        if config.effort.is_empty() {
-            config.effort = daemon_llm_effort.clone().unwrap_or_else(default_effort);
-        }
-        if config.base_url.is_empty() {
-            config.base_url = std::env::var("MSK_LLM_BASE_URL").unwrap_or_default();
+        if requires_key(&config.provider) {
+            if config.model.is_empty() {
+                config.model = std::env::var("MSK_LLM_MODEL")
+                    .ok()
+                    .or_else(|| daemon_llm_model.clone())
+                    .unwrap_or_default();
+            }
+            if config.effort.is_empty() {
+                config.effort = daemon_llm_effort.clone().unwrap_or_else(default_effort);
+            }
+            if config.base_url.is_empty() {
+                config.base_url = std::env::var("MSK_LLM_BASE_URL").unwrap_or_default();
+            }
+        } else {
+            config.model.clear();
+            config.effort = default_effort();
+            config.base_url.clear();
         }
         let mut app = Self {
             client,
@@ -816,6 +825,7 @@ impl DaemonApp {
             base_url: config.base_url,
             daemon_llm_key,
             daemon_llm_model,
+            daemon_workspace,
             setup: None,
             new_task: false,
             quit_requested: false,
@@ -826,11 +836,15 @@ impl DaemonApp {
             input_history: Vec::new(),
             history_index: None,
             show_events: false,
+            show_sessions: false,
         };
         app.reload_tasks()?;
         let _ = app.reload_approvals();
         if let Some(task_id) = app.selected_task_id() {
             app.load_transcript(&task_id);
+        } else if !configured {
+            app.setup = Some(SetupState::from_app(&app));
+            app.status = "first run: choose a provider; scripted-demo works offline".into();
         } else {
             app.new_task = true;
             app.composing = true;
@@ -1336,6 +1350,15 @@ impl DaemonApp {
             .collect()
     }
 
+    fn selected_task_title(&self) -> String {
+        self.tasks
+            .get(self.selected_task)
+            .and_then(|task| task.get("goal"))
+            .and_then(Value::as_str)
+            .map(|goal| truncate(goal, 64))
+            .unwrap_or_else(|| "new session".into())
+    }
+
     fn selected_state(&self) -> &str {
         self.tasks
             .get(self.selected_task)
@@ -1404,6 +1427,33 @@ impl DaemonApp {
                 self.status = "help".into();
             }
             "/setup" => self.open_setup(),
+            "/resume" => self.resume_latest(),
+            "/sessions" => {
+                self.show_sessions = !self.show_sessions;
+                self.status = if self.show_sessions {
+                    "session list on".into()
+                } else {
+                    "session list off".into()
+                };
+            }
+            "/models" | "/model" if argument.is_empty() => self.open_setup_at(SetupStep::Model),
+            "/model" => {
+                self.model = argument.to_string();
+                self.status = format!("next session model: {}", self.model);
+            }
+            "/effort" => {
+                let effort = if argument.is_empty() {
+                    "default"
+                } else {
+                    argument
+                };
+                if matches!(effort, "default" | "minimal" | "low" | "medium" | "high") {
+                    self.effort = effort.to_string();
+                    self.status = format!("next session effort: {}", self.effort);
+                } else {
+                    self.status = "usage: /effort default|minimal|low|medium|high".into();
+                }
+            }
             "/demo" => {
                 self.provider = "scripted-demo".into();
                 self.create_task_with_goal("run the offline tool demo", true);
@@ -1473,6 +1523,49 @@ impl DaemonApp {
     }
 
     fn create_task_with_goal(&mut self, goal: &str, send_initial: bool) {
+        self.create_task_with_options(goal, send_initial, None);
+    }
+
+    fn resume_latest(&mut self) {
+        let tasks_dir = self.root.join("tasks");
+        let mut latest: Option<(std::time::SystemTime, PathBuf, u64)> = None;
+        if let Ok(entries) = std::fs::read_dir(&tasks_dir) {
+            for entry in entries.flatten() {
+                let checkpoint = entry.path().join("checkpoint.json");
+                let Ok(metadata) = std::fs::metadata(&checkpoint) else {
+                    continue;
+                };
+                let Ok(modified) = metadata.modified() else {
+                    continue;
+                };
+                let turns = std::fs::read(&checkpoint)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .and_then(|value| value.get("turns").and_then(Value::as_u64))
+                    .unwrap_or(0);
+                if latest.as_ref().is_none_or(|(time, _, _)| modified > *time) {
+                    latest = Some((modified, checkpoint, turns));
+                }
+            }
+        }
+        let Some((_, checkpoint, turns)) = latest else {
+            self.status = "no checkpoint to resume; send a message to start a session".into();
+            return;
+        };
+        self.status = format!("resuming checkpoint with {} turns", turns);
+        self.create_task_with_options(
+            &format!("Resumed session ({turns} turns)"),
+            false,
+            Some(&checkpoint),
+        );
+    }
+
+    fn create_task_with_options(
+        &mut self,
+        goal: &str,
+        send_initial: bool,
+        resume_checkpoint: Option<&Path>,
+    ) {
         if requires_key(&self.provider) {
             if !self.daemon_llm_key {
                 self.status =
@@ -1504,6 +1597,9 @@ impl DaemonApp {
             if !self.base_url.trim().is_empty() {
                 params["base_url"] = json!(self.base_url.trim());
             }
+            if let Some(checkpoint) = resume_checkpoint {
+                params["resume_checkpoint"] = json!(checkpoint.display().to_string());
+            }
             params
         });
         match result {
@@ -1524,7 +1620,11 @@ impl DaemonApp {
                 } else {
                     None
                 };
-                self.status = format!("created {task_id} with {}", self.provider);
+                self.status = if resume_checkpoint.is_some() {
+                    format!("resumed {task_id} with {}", self.provider)
+                } else {
+                    format!("created {task_id} with {}", self.provider)
+                };
                 if let Err(err) = self.reload_tasks() {
                     self.status = format!("reload failed: {err}");
                 }
@@ -1825,6 +1925,14 @@ impl DaemonApp {
                 self.scroll_from_bottom = 0;
             }
             KeyCode::Char('f') => self.follow = !self.follow,
+            KeyCode::Tab => {
+                self.show_sessions = !self.show_sessions;
+                self.status = if self.show_sessions {
+                    "session list on".into()
+                } else {
+                    "session list off".into()
+                };
+            }
             KeyCode::Char('v') => {
                 self.show_events = !self.show_events;
                 self.status = if self.show_events {
@@ -1930,7 +2038,12 @@ impl DaemonApp {
     }
 
     fn draw(&self, frame: &mut ratatui::Frame) {
-        let task_height = (self.tasks.len().min(5) as u16 + 2).max(3);
+        let show_task_pane = self.show_sessions || self.tasks.len() > 1;
+        let task_height = if show_task_pane {
+            (self.tasks.len().min(5) as u16 + 2).max(3)
+        } else {
+            0
+        };
         let areas = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1943,8 +2056,15 @@ impl DaemonApp {
             .split(frame.area());
 
         let header = Paragraph::new(format!(
-            "MitnickSolve  {}  ·  {} / {} / effort {}  ·  {} task(s)\n{}",
-            self.root.display(),
+            "MitnickSolve  {}  ·  {} / {} / effort {}  ·  {} session(s)\n{}",
+            self.daemon_workspace
+                .clone()
+                .or_else(|| {
+                    std::env::current_dir()
+                        .ok()
+                        .map(|path| path.display().to_string())
+                })
+                .unwrap_or_else(|| self.root.display().to_string()),
             self.provider,
             if self.model.is_empty() {
                 "-"
@@ -1967,11 +2087,10 @@ impl DaemonApp {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 ListItem::new(format!(
-                    "{} {}  {:<12} {}",
+                    "{} {:<12} {}",
                     if interactive { "◆" } else { " " },
-                    task.get("task_id").and_then(Value::as_str).unwrap_or("?"),
                     task.get("state").and_then(Value::as_str).unwrap_or("?"),
-                    truncate(task.get("goal").and_then(Value::as_str).unwrap_or(""), 60)
+                    truncate(task.get("goal").and_then(Value::as_str).unwrap_or(""), 72)
                 ))
             })
             .collect();
@@ -1980,7 +2099,7 @@ impl DaemonApp {
             task_state.select(Some(self.selected_task.min(items.len() - 1)));
         }
         let tasks = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title("tasks"))
+            .block(Block::default().borders(Borders::ALL).title("sessions"))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
             .highlight_symbol("› ");
         frame.render_stateful_widget(tasks, areas[1], &mut task_state);
@@ -2095,9 +2214,14 @@ impl DaemonApp {
                 )));
             }
         }
-        let transcript_title = match (&task_id, self.selected_state()) {
-            (Some(id), state) => format!("conversation — {id} [{state}]"),
-            (None, _) => "conversation".to_string(),
+        let transcript_title = if task_id.is_some() {
+            format!(
+                "session — {} [{}]",
+                self.selected_task_title(),
+                self.selected_state()
+            )
+        } else {
+            "session".to_string()
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -2141,12 +2265,13 @@ impl DaemonApp {
         }
 
         let input_title = if self.new_task || task_id.is_none() {
-            format!("new task — provider {}", self.provider)
+            format!("new session — provider {}", self.provider)
         } else {
-            match (&task_id, self.selected_state()) {
-                (Some(id), state) => format!("message to {id} [{state}]"),
-                (None, _) => "message".to_string(),
-            }
+            format!(
+                "message · {} [{}]",
+                self.selected_task_title(),
+                self.selected_state()
+            )
         };
         let input_block = Block::default().borders(Borders::ALL).title(input_title);
         let input_inner = input_block.inner(areas[3]);
@@ -2203,7 +2328,7 @@ impl DaemonApp {
         } else if self.selected_state() == "running" {
             "running · Esc interrupt · Enter/i message · / commands · PgUp/PgDn scroll · ? help · q quit"
         } else {
-            "Enter/i message  n new  / commands  PgUp/PgDn scroll  v events  j/k task  s interrupt  t terminal  ? help  q quit"
+            "Enter/i message  n new  / commands  Tab sessions  PgUp/PgDn scroll  v events  s interrupt  ? help  q quit"
         };
         frame.render_widget(Paragraph::new(footer), areas[4]);
 
@@ -2220,8 +2345,8 @@ impl DaemonApp {
                  s          interrupt the running turn\n\
                  a          show pending approvals\n\
                  y / n      approve / deny the modal request\n\
-                 j / k      previous / next task\n\
-                 g / G      first / last task\n\
+                 j / k      previous / next session\n\
+                 g / G      first / last session\n\
                  n          create an interactive scripted task\n\
                  x          cancel the selected task\n\
                  t          open/focus the PTY terminal\n\
@@ -2243,10 +2368,6 @@ impl DaemonApp {
         }
 
         if let Some(pending) = self.approvals.first() {
-            let task_id = pending
-                .get("task_id")
-                .and_then(Value::as_str)
-                .unwrap_or("?");
             let id = pending.get("id").and_then(Value::as_u64).unwrap_or(0);
             let tool = pending.get("tool").and_then(Value::as_str).unwrap_or("?");
             let reason = pending
@@ -2262,8 +2383,9 @@ impl DaemonApp {
             );
             let paragraph = Paragraph::new(text)
                 .block(Block::default().borders(Borders::ALL).title(format!(
-                    "approval required — {task_id} #{id}  (1/{})",
-                    self.approvals.len()
+                    "approval required · 1/{} · #{}",
+                    self.approvals.len(),
+                    id
                 )))
                 .wrap(Wrap { trim: false });
             frame.render_widget(paragraph, area);
@@ -3008,6 +3130,35 @@ mod tests {
         assert_eq!(app.model, "gpt-5");
         assert_eq!(app.effort, "minimal");
         assert!(app.root.join("tui-config.json").exists());
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn daemon_resume_loads_history() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app = DaemonApp::connect(PathBuf::from(root), 100, Some("openai".into())).unwrap();
+        let before = app.tasks.len();
+        app.resume_latest();
+        for _ in 0..200 {
+            let _ = app.refresh();
+            let _ = app.reload_tasks();
+            if app.tasks.len() > before && !app.chat.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(app.tasks.len() > before);
+        assert!(
+            app.chat
+                .iter()
+                .any(|line| line.text.contains("mock complete")
+                    || line.text.contains("session demo complete")),
+            "resumed history was empty: {:?}",
+            app.status
+        );
+        app.cancel_task();
     }
 
     #[test]
