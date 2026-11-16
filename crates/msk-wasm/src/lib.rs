@@ -146,6 +146,25 @@ pub struct WasmtimeRuntime {
     fuel: u64,
 }
 
+/// Runs a WAT module that must not import any host functions. The module gets
+/// the normal input-at-0 / output-at-4096 ABI, fuel and memory limits, but no
+/// way to reach envd, files or the network.
+pub fn run_pure_wat(wat: &str, input: &[u8]) -> Result<Vec<u8>, WasmError> {
+    struct DenyHost;
+    impl ToolHost for DenyHost {
+        fn call(&self, _ctx: &ToolContext, _input: &[u8]) -> Result<Vec<u8>, String> {
+            Err("pure wasm_eval modules cannot import host functions".into())
+        }
+    }
+    let runtime = WasmtimeRuntime::from_wat(Arc::new(DenyHost), wat)?;
+    if runtime.module.imports().count() != 0 {
+        return Err(WasmError::Unsupported(
+            "wasm_eval modules must not import host functions".into(),
+        ));
+    }
+    runtime.run(input)
+}
+
 impl WasmtimeRuntime {
     pub fn from_file(host: Arc<dyn ToolHost>, path: impl AsRef<Path>) -> Result<Self, WasmError> {
         let cache = std::env::var_os("MSK_WASM_CACHE").map(PathBuf::from);
@@ -451,6 +470,16 @@ mod tests {
     fn host_import_roundtrip() {
         let runtime = WasmtimeRuntime::from_wat(Arc::new(PrefixHost), HOST_CALL_WAT).unwrap();
         assert_eq!(runtime.run(b"abc").unwrap(), b"host:abc");
+    }
+
+    #[test]
+    fn pure_wat_runs_without_host_access() {
+        assert_eq!(run_pure_wat(ECHO_WAT, b"pure").unwrap(), b"pure");
+    }
+
+    #[test]
+    fn pure_wat_rejects_host_imports() {
+        assert!(run_pure_wat(HOST_CALL_WAT, b"host").is_err());
     }
 
     #[test]

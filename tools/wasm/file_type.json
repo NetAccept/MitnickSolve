@@ -1,0 +1,24 @@
+{
+  "name": "file_type",
+  "description": "Identify a workspace file from its magic bytes and MIME type.",
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "env_id",
+      "path"
+    ],
+    "properties": {
+      "env_id": {
+        "type": "string",
+        "description": "Environment identifier returned by envd."
+      },
+      "path": {
+        "type": "string",
+        "description": "Workspace-relative file path."
+      }
+    }
+  },
+  "capabilities": [
+    "fs.workspace"
+  ]
+}

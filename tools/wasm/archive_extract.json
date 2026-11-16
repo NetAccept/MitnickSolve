@@ -1,0 +1,48 @@
+{
+  "name": "archive_extract",
+  "description": "Extract zip, tar, tar.gz or gzip members into the workspace with zip-slip and size guards.",
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "env_id",
+      "path"
+    ],
+    "properties": {
+      "env_id": {
+        "type": "string",
+        "description": "Environment identifier returned by envd."
+      },
+      "path": {
+        "type": "string",
+        "description": "Workspace-relative file path."
+      },
+      "dest": {
+        "type": "string",
+        "description": "Workspace-relative destination directory.",
+        "default": "extract"
+      },
+      "overwrite": {
+        "type": "boolean",
+        "description": "Overwrite existing regular files.",
+        "default": false
+      },
+      "max_entries": {
+        "type": "integer",
+        "description": "Maximum files to extract.",
+        "minimum": 1,
+        "maximum": 1000,
+        "default": 1000
+      },
+      "max_total_bytes": {
+        "type": "integer",
+        "description": "Maximum total uncompressed bytes to write.",
+        "minimum": 1,
+        "default": 536870912,
+        "maximum": 536870912
+      }
+    }
+  },
+  "capabilities": [
+    "fs.workspace"
+  ]
+}

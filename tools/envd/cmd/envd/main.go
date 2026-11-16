@@ -30,6 +30,7 @@ func main() {
 		sandboxCmd string
 	)
 	var sandboxArgs stringList
+	var netAllow stringList
 	flag.BoolVar(&embedded, "embedded", false, "serve the frame protocol over stdin/stdout")
 	flag.BoolVar(&service, "service", false, "serve MCP over HTTP and MSDP over TCP")
 	flag.StringVar(&root, "root", ".msk-envd", "envd data root")
@@ -41,6 +42,7 @@ func main() {
 	flag.StringVar(&tlsKey, "tls-key", "", "TLS private key for service mode")
 	flag.StringVar(&sandboxCmd, "sandbox-command", "", "executable prefix for the isolated profile")
 	flag.Var(&sandboxArgs, "sandbox-arg", "argument for --sandbox-command (repeatable; use --sandbox-arg=value)")
+	flag.Var(&netAllow, "net-allow", "egress allowlist entry: CIDR or domain suffix (repeatable/comma-separated; empty allows all)")
 	flag.Parse()
 
 	if embedded && service {
@@ -75,6 +77,7 @@ func main() {
 			Root:     absRoot,
 			MaxFrame: maxFrame,
 			Sandbox:  sandbox,
+			NetAllow: netAllow,
 		}); err != nil {
 			fmt.Fprintln(os.Stderr, "envd:", err)
 			os.Exit(1)
@@ -101,6 +104,7 @@ func main() {
 			Root:     absRoot,
 			MaxFrame: maxFrame,
 			Sandbox:  sandbox,
+			NetAllow: netAllow,
 		},
 		Addr:     listen,
 		DataAddr: dataListen,

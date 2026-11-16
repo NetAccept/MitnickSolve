@@ -1,0 +1,61 @@
+{
+  "name": "file_strings",
+  "description": "Extract printable ASCII and/or UTF-16LE strings from a file range.",
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "env_id",
+      "path"
+    ],
+    "properties": {
+      "env_id": {
+        "type": "string",
+        "description": "Environment identifier returned by envd."
+      },
+      "path": {
+        "type": "string",
+        "description": "Workspace-relative file path."
+      },
+      "min_len": {
+        "type": "integer",
+        "description": "Minimum string length in bytes.",
+        "minimum": 4,
+        "maximum": 64,
+        "default": 4
+      },
+      "encoding": {
+        "type": "string",
+        "description": "String encoding to extract.",
+        "enum": [
+          "ascii",
+          "utf16le",
+          "both"
+        ],
+        "default": "ascii"
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum strings to return.",
+        "minimum": 1,
+        "maximum": 500,
+        "default": 200
+      },
+      "offset": {
+        "type": "integer",
+        "description": "Byte offset to start reading from.",
+        "minimum": 0,
+        "default": 0
+      },
+      "length": {
+        "type": "integer",
+        "description": "Maximum bytes to scan from offset.",
+        "minimum": 1,
+        "maximum": 16777216,
+        "default": 4194304
+      }
+    }
+  },
+  "capabilities": [
+    "fs.workspace"
+  ]
+}

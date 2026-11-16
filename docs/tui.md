@@ -1,9 +1,10 @@
 # Terminal app
 
-`msk` with no arguments is the normal entry point. It opens the conversational
-TUI and starts a local `mskd` daemon if one is not already listening. The TUI
-is a client of the same daemon used by `mskctl`, the web UI, and the eval
-harness, so nothing in the kernel changes when you use it.
+`msk` with no arguments opens the conversational app. It is a semi-graphical
+terminal UI: a pixel wordmark, rounded composer, status chips, live tool cards,
+modal approvals and a command palette. It starts a local `mskd` daemon if one is
+not already listening, and it is a normal client of that daemon — the same one
+used by `mskctl`, the browser UI and the eval harness.
 
 ## Build and launch
 
@@ -13,186 +14,281 @@ cargo build --bins
 target/debug/msk
 ```
 
-If `msk-tui` is not next to `msk`, run `cargo build --bins` first. The daemon
-state lives in `.msk/`; use `msk-tui --root /path` for a different location
-(`msk` with arguments keeps its headless/agent behavior).
+`msk-tui` lives next to `msk`. The daemon state is under `.msk/` by default. The
+app uses the **current directory as the workspace**, so the agent's file tools
+and shell see the project you launched from. Use `msk --workspace /path` or
+`mskd --workspace /path` for another project root.
 
-The embedded envd opens the **current directory as the workspace**. The agent's
-file tools and shell therefore see the project you launched from, like a normal
-coding CLI. Use `msk --workspace /path` or `mskd --workspace /path` for a
-different project root; remote envd keeps its operator-configured workspace.
-
-`msk` with arguments keeps its existing headless/session/daemon behavior; only
-the no-argument invocation is the interactive app. `msk-tui` can also be
-launched directly:
+`msk` with arguments keeps its headless/agent/daemon behavior. You can also run
+the app directly:
 
 ```sh
 target/debug/msk-tui                 # auto-start/connect .msk
 target/debug/msk-tui --root .msk/demo
-target/debug/msk-tui --connect .msk # do not auto-start
-target/debug/msk-tui --events .msk/events.jsonl  # read-only event viewer
+target/debug/msk-tui --connect .msk  # do not auto-start
+target/debug/msk-tui --events .msk/events.jsonl   # read-only event viewer
 ```
 
 ## First screen
 
-With no tasks the composer is focused. Type a challenge and press Enter; the
-first message creates an interactive task, starts it, and sends the same text
-as the first turn.
+This is an actual `--snapshot` frame (120×40):
 
 ```text
-MitnickSolve  .msk  ·  provider scripted-demo  ·  0 task(s)
-conversation
-  Welcome. Describe the challenge below and press Enter to start a task.
-  Examples: inspect ./challenge and find the flag
-  Commands: /new /provider openai /terminal /approvals /help
-  Offline demo provider: replies are canned. Use /provider openai for a real model.
-new task — provider scripted-demo
-  > Describe the challenge…
+                         █   █ █████ █████ █   █ █████  ████ █   █  ████  ███  █     █   █ █████
+                         ██ ██   █     █   ██  █   █   █     █  █  █     █   █ █     █   █ █
+                         █ █ █   █     █   █ █ █   █   █     █ █   █     █   █ █     █   █ █
+                         █ █ █   █     █   █ █ █   █   █     ██     ███  █   █ █     █   █ ████
+                         █   █   █     █   █  ██   █   █     █ █       █ █   █ █     █   █ █
+                         █   █   █     █   █   █   █   █     █  █      █ █   █ █      █ █  █
+                         █   █ █████   █   █   █ █████  ████ █   █ ████   ███  █████   █   █████
+
+                                                    ~   scripted-demo
+
+                ╭──────────────────────────────────────────────────────────────────────────────────────╮
+                │ Ask anything…  "inspect ./challenge and find the flag"                               │
+                │                                                                                      │
+                │  Build · scripted-demo                                                               │
+                ╰──────────────────────────────────────────────────────────────────────────────────────╯
+                                                               tab sessions   ctrl+p commands   F1 help
+
+  ~                                                                                 MitnickSolve 0.1.0
 ```
 
-With no API key, the offline `scripted-demo` provider replays a complete tool
-session (persistent shell, large output → artifact, artifact read, close). It is
-for showing the UI; it does not reason about the goal. `/provider openai` (with
-the environment below) switches to a real model.
+- The large wordmark is drawn from Unicode blocks with a left-to-right gradient.
+- The chips under it show the workspace, provider, model and effort.
+- The rounded composer is always the focused input. Just start typing; Enter
+  sends. `Shift+Enter` inserts a newline, bracketed paste inserts whole scripts.
+- `Build · provider · model · effort` is always visible inside the composer.
+- `Tab` opens the session switcher, `Ctrl+P` opens the command palette, `F1`
+  shows every shortcut.
+- The footer shows the workspace on the left and the version on the right.
 
-## What a completed turn looks like
+With no configured provider, a full-screen setup card opens first. Choose
+`scripted-demo` to try the app offline with no key, or `openai` /
+`openai-responses` for a real model.
 
-This is an actual `msk-tui --root .msk/showcase --snapshot` frame after a
-mock-model task asked for `exec` and the approval was granted:
+## Setup: provider, model and effort
+
+`Ctrl+P` → **Provider and model**, or `/setup`, or `msk-tui --setup`.
 
 ```text
-┌session───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│MitnickSolve  C:\Users\cy\MitnickSolve\.msk\ws-project  ·  openai / gpt-5 / effort minimal  ·  1 session(s)           │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌session — Inspect challenge.txt and explain it [done]─────────────────────────────────────────────────────────────────┐
-│tool: ▸ env_create {"kind":"managed","name":"session","profile":"dev","root":"."}                                     │
-│                                                                                                                      │
-│tool: ✓ env_create                                                                                                    │
-│                                                                                                                      │
-│you: Inspect challenge.txt and explain it                                                                             │
-│                                                                                                                      │
-│agent: mock complete                                                                                                  │
-│                                                                                                                      │
-│turn end: awaiting_input                                                                                              │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌message · Inspect challenge.txt and explain it [done]─────────────────────────────────────────────────────────────────┐
-│> press Enter or i to write  ·  / commands                                                                            │
-│                                                                                                                      │
-│                                                                                                                      │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-Enter/i message  n new  / commands  Tab sessions  PgUp/PgDn scroll  v events  s interrupt  ? help  q quit
+                  ╭ setup ───────────────────────────────────────────────────────────────────────────╮
+                  │ MitnickSolve   connect a model                                                   │
+                  │ You can change all of this later with ctrl+p.                                    │
+                  │                                                                                  │
+                  │ ● provider  ›  ○ model  ›  ○ effort  ›  ○ endpoint                               │
+                  │                                                                                  │
+                  │ Choose how the agent reaches a model                                             │
+                  │ scripted-demo needs no key and works offline.                                    │
+                  │                                                                                  │
+                  │   scripted-demo       offline canned tool session, no model or key               │
+                  │ ❯ openai              OpenAI-compatible Chat Completions                         │
+                  │   openai-responses    OpenAI Responses API function calls                        │
+                  │   component           signed llm.provider component configured on mskd          │
+                  │                                                                                  │
+                  │ mskd is missing MSK_LLM_API_KEY (export it before starting mskd)                 │
+                  │ config  C:\Users\cy\MitnickSolve\.msk\ui-home2\tui-config.json                   │
+                  │ ↑/↓ choose   Enter next   Esc back/close   Ctrl+U clear input                    │
+                  ╰──────────────────────────────────────────────────────────────────────────────────╯
 ```
-
-The approval step is a modal over the same conversation, with the tool, reason,
-arguments, and `1/N` pending count. Press `y` to approve or `n` to deny.
-
-## Provider, model and effort
-
-Press `p` (or `/setup`) for the guided setup. It saves
-`<root>/tui-config.json` and applies to new tasks:
 
 1. **Provider** — `scripted-demo` (offline), `openai` (Chat Completions),
-   `openai-responses`, or `component`.
-2. **Model** — presets (`gpt-5`, `gpt-5-mini`, `o3`, `o4-mini`) or a custom
-   model name.
-3. **Effort** — `default`, `minimal`, `low`, `medium`, `high`. This is sent as
-   `reasoning_effort` (Chat Completions) or `reasoning.effort` (Responses) to
-   models that support it.
-4. **Base URL** — optional; empty uses `MSK_LLM_BASE_URL` or the provider
-   default.
+   `openai-responses`, or a signed `component`.
+2. **Model** — presets (`gpt-5`, `gpt-5-mini`, `o3`, `o4-mini`) or any custom
+   model id.
+3. **Effort** — `default`, `minimal`, `low`, `medium`, `high`. It is sent as
+   `reasoning_effort` (Chat Completions) or `reasoning.effort` (Responses).
+4. **Endpoint** — optional OpenAI-compatible base URL. Empty uses
+   `MSK_LLM_BASE_URL` or the provider default.
 
-The header always shows `provider / model / effort`. The API key is never
-stored in the config or sent over IPC; export it where `mskd` starts. The setup
-screen reports whether the daemon sees `MSK_LLM_API_KEY`. Run
-`msk-tui --setup` to open the wizard directly, or `msk-tui --doctor` to check
-paths and key presence.
+The choice is saved to `<root>/tui-config.json` and applies to new sessions.
+The API key is never stored in that file or sent over IPC; export
+`MSK_LLM_API_KEY` where `mskd` starts. The setup card reports whether the daemon
+sees it. `msk-tui --doctor` checks daemon, envd, tools and key presence.
+
+## Command palette and sessions
+
+`Ctrl+P` opens a fuzzy-filtered command palette. Type to filter, `↑/↓` to move,
+Enter to run, Esc to close.
+
+```text
+                      ╭ commands ────────────────────────────────────────────────────────────────╮
+                      │ ❯ ▌  type a command                                                      │
+                      │                                                                          │
+                      │ › New session               start a fresh conversation                    │
+                      │   Sessions                  switch to another session (tab)               │
+                      │   Resume latest             restore the newest checkpoint                 │
+                      │   Provider and model        choose provider, model, effort                │
+                      │   Model                     pick a model preset                           │
+                      │   Reasoning effort          minimal, low, medium, high                    │
+                      │   Agent mode                plan, investigate, exploit, harden, auto       │
+                      │   Offline demo              run a canned tool session                     │
+                      │   Terminal                  open the PTY workspace                        │
+                      │   Event inspector           show the raw event stream                     │
+                      │   Pending approvals         check queued tool approvals                   │
+                      │   Assessment findings       review severity-ranked findings              │
+                      │   Clear transcript          hide messages in this view                    │
+                      │   Keyboard shortcuts        open the help overlay                         │
+                      │   Quit                      leave MitnickSolve                            │
+                      ╰──────────────────────────────────────────────────────────────────────────╯
+```
+
+`Tab` opens the session switcher. Sessions are titled by their goal; internal
+task ids stay out of the way. Up/down selects, Enter switches, Esc closes.
+
+```text
+                      ╭ sessions ────────────────────────────────────────────────────────────────╮
+                      │ › ● ready     Find the flag in ./challenge                                │
+                      │   ✗ cancelled Interactive session                                         │
+                      │                                    ↑/↓ select · Enter switch · Esc close │
+                      ╰──────────────────────────────────────────────────────────────────────────╯
+```
+
+## Conversation
+
+A real frame after a turn, with the header rule, role glyphs, tool cards and the
+composer at the bottom:
+
+```text
+  ▌ Find the flag in ./challenge  ● ready                                                scripted · - · effort default
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    ▸ env_create {"kind":"managed","name":"session","profile":"dev","root":"."}
+
+    ✓ env_create
+
+  ❯ inspect ./challenge and find the flag
+
+    echo: inspect ./challenge and find the flag
+
+        ╭──────────────────────────────────────────────────────────────────────────────────────────────────────╮
+        │ Reply…   Shift+Enter for a new line                                                                  │
+        │                                                                                                      │
+        │  Build · scripted                                                                                    │
+        ╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯
+                                                                       tab sessions   ctrl+p commands   F1 help
+  ~/.msk/ui-chat/ws                                                                                 MitnickSolve 0.1.0
+```
+
+- `▌` and `❯` mark the active session and your messages; agent text is plain.
+- Tool calls appear as `▸ tool args`, results as `✓ tool` (green) or `✗ tool`
+  (red). Streaming text ends with a blinking block.
+- The header shows the session goal, a live state (`⠋ running`, `● ready`,
+  `✗ failed`, `✓ done`), and provider/model/effort.
+- `PgUp` / `PgDn` or `↑` / `↓` scroll; `End` follows new output.
+- The event inspector (`Ctrl+P` → Event inspector, or `/events`) opens a dimmed
+  sidebar with the raw kernel event stream.
+
+## Approvals
+
+When policy is `ask`, the turn pauses on the first risky tool and a modal opens
+over the dimmed conversation:
+
+```text
+  ▌ run exec echo approved  ⠋ running                                                  openai · gpt-5 · effort minimal
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    ❯ please exec echo approved
+
+    ▸ exec {"argv":["cmd","/C","echo approved"],"env_id":"env_..."}
+
+            ╭ approval required · 1 of 1 · #1 ─────────────────────────────────────────────────────────────╮
+            │tool  exec                                                                                    │
+            │why   execute a command                                                                       │
+            │                                                                                              │
+            │arguments                                                                                     │
+            │  {                                                                                           │
+            │    "argv": [                                                                                 │
+            │      "cmd",                                                                                  │
+            │      "/C",                                                                                   │
+            │      "echo approved"                                                                         │
+            │    ],                                                                                        │
+            │    "env_id": "env_..."                                                                       │
+            │  }                                                                                           │
+            │                                                                                              │
+            │y allow     n deny                                                                            │
+            ╰──────────────────────────────────────────────────────────────────────────────────────────────╯
+```
+
+Press `y` to approve or `n`/`Esc` to deny. Approvals are also hydrated from
+`approval.list` every second, so a TUI attached after the request can answer it.
 
 ## Keys and commands
 
 | Key | Action |
 | --- | --- |
-| `Enter` / `i` | write a message, or describe a new task |
-| `Enter` in the editor | send, or start the task |
+| any printable key | focus the composer and type |
+| `Enter` | send, or start a new session |
 | `Shift+Enter` / `Alt+Enter` / `Ctrl+J` | insert a newline |
-| `Esc` | leave the editor; while running, interrupt the turn |
-| `Ctrl+C` | interrupt a running turn; otherwise show the quit hint |
-| `PgUp` / `PgDn` | scroll the conversation |
-| `End` | jump to the newest message |
-| `j` / `k`, `g` / `G` | previous/next task, first/last task |
-| `n` | start a new task |
-| `p` | provider / model / effort setup |
-| `s` / `Esc` | interrupt the running turn |
-| `x` | cancel the selected task |
-| `a` | show the approval inbox |
-| `y` / `n` | approve / deny when an approval modal is open |
-| `t` | open/focus the daemon PTY; `Ctrl+Q` detaches |
-| `v` | toggle the raw event inspector (off by default) |
-| `?` | help |
-| `q` | quit |
+| `Esc` | interrupt a running turn, or close the editor / overlay |
+| `Ctrl+C` | interrupt a running turn; when idle, quit |
+| `Tab` | session switcher |
+| `Ctrl+P` | command palette |
+| `F1` | keyboard shortcuts |
+| `PgUp` / `PgDn`, `↑` / `↓` | scroll the conversation |
+| `End` | jump to the newest output |
+| `y` / `n` | approve / deny a pending approval |
+| `Ctrl+Q` | detach from the PTY terminal |
+| `Ctrl+U` | clear the composer |
 
-Slash commands work in the editor:
+Slash commands still work if you prefer typing them:
 
 ```text
-/new [goal]      /demo           /provider NAME
-/terminal        /approvals      /interrupt
-/cancel          /clear          /status
-/help            /quit
+/new [goal]   /demo        /provider NAME   /models      /model NAME
+/effort NAME  /setup       /resume          /sessions    /terminal
+/events       /approvals   /findings      /interrupt   /cancel      /clear
+/mode         /mode NAME   /status        /help        /quit
 ```
 
 Providers: `scripted`, `scripted-demo`, `openai`, `openai-responses`
-(`responses` is accepted as an alias), `component`.
+(`responses` is an alias), `component`.
 
 Bracketed paste is enabled. Pasting a multi-line script inserts it rather than
-executing each line, and pasted text never triggers `q`/`n`/`x` shortcuts.
+running each line, and pasted text never triggers a shortcut.
 
-## Tool activity and approvals
+## Agent modes
 
-The conversation renders tool calls inline:
+`Ctrl+P` → **Agent mode** (or `/mode`) opens the mode picker. The mode is shown
+in exactly one place: the leading slot of the composer, where opencode shows
+`Build` — for example `自动 · openai · gpt-5 · effort high`. Enter applies the
+selected mode (the configured label changes in that slot) and saves it. The list
+comes from the daemon's `modes.json`, so custom modes appear automatically.
 
-```text
-tool: ▸ session_exec {"command":"echo session-one", ...}
-tool: ✓ session_exec  {"stdout":"session-one"}
-agent: session-one
-```
+The mode is a tool-level boundary, not a label: `plan`/`investigate` cannot call
+`exec`, `write_file`, `session_*`, `net_dial` or `archive_extract`, and subagents
+cannot escalate. See [`docs/modes.md`](docs/modes.md) for the configurable
+definitions, the full matrix and auto-routing rules.
 
-When policy is `ask`, the turn pauses on the first risky tool and a modal shows
-the tool, reason, arguments and the pending count (`1/N`). Press `y` to approve
-or `n`/`Esc` to deny. Approvals are also loaded from `approval.list` on connect,
-so a TUI attached after the request can still answer it. Enter is deliberately
-not an approval shortcut.
+## Permission modes
+
+`Ctrl+P` → **Permission mode** (or `/permissions`) opens `auto`, `manual`, and
+`bypass`. This is separate from the agent mode: the agent mode decides which
+tools exist, the permission mode decides which calls pause for approval. The
+footer shows `权限 自动`, `手动`, or `放行`. Changing it while a session is open
+starts a fresh session on the next message. See
+[`docs/permissions.md`](docs/permissions.md).
+
+## Findings and reports
+
+The agent records assessment findings with the `finding_add` tool. They live in
+the daemon blackboard, survive restarts, and are visible to every attached
+client. `Ctrl+P` → **Assessment findings** (or `/findings`) opens a
+severity-ranked overlay: `j`/`k` scroll, `r` reloads, Esc closes. Each row shows
+severity, title, asset, status, tags and a short description.
+
+Use `Ctrl+P` → **Terminal** for the PTY, and ask the agent for `report_generate`
+when you want a Markdown report assembled from the finding ledger and captured
+flags; it saves with `write_file`.
 
 ## History and resume
 
-Selecting a task hydrates its conversation from `task.history` (structured
-events), not from a truncated transcript string. Switching tasks, attaching a
-second TUI, or finishing a turn all reload the same timeline. `PgUp`/`PgDn`
-scrolls it; `End` follows the newest output.
+Selecting a session hydrates its conversation from `task.history` (structured
+events), not from a truncated transcript string. Switching sessions, attaching a
+second TUI, or finishing a turn all reload the same timeline.
 
-Tasks are in-memory in `mskd`, but their event logs and checkpoints remain under
-`.msk/tasks/<task>/`. `msk --root ... --resume-checkpoint ...` can reopen a
-checkpoint; in service mode it reopens the original envd environment when
-possible, otherwise it creates a fresh one and marks old session IDs stale.
-Forks always use a fresh environment.
+Tasks are in-memory in `mskd`, but event logs and checkpoints stay under
+`.msk/tasks/<task>/`. `Ctrl+P` → **Resume latest** (`/resume`) restores the
+newest checkpoint after a daemon restart. In service mode it reopens the
+original envd environment when possible; otherwise it creates a fresh one and
+marks old session ids stale. Forks always use a fresh environment.
 
 ## Real models
 
@@ -205,46 +301,60 @@ export MSK_LLM_API_KEY=...
 target/debug/msk
 ```
 
-The TUI auto-selects `openai` when `MSK_LLM_MODEL` and `MSK_LLM_API_KEY` are
-present. Otherwise it stays on the offline demo. `MSK_PROVIDER` overrides the
-selection for one shell.
+The setup card auto-selects `openai` when the daemon already has a key and model.
+`MSK_PROVIDER` overrides the selection for one shell. If the key is missing, the
+composer shows `missing MSK_LLM_API_KEY` in amber instead of failing silently.
 
-## One-command demo
+## Demos
 
-The demo starts the mock OpenAI-compatible server and opens the TUI with a
-clean daemon:
+**Offline, no server or key:**
+
+```sh
+target/debug/msk --provider scripted-demo
+```
+
+Then press `Ctrl+P` → Offline demo, or type `/demo`. The daemon replays a full
+tool session (persistent shell, large output → artifact, artifact read, close).
+
+**Real model against a local mock:**
 
 ```powershell
-# Windows
-./scripts/demo.ps1
+./scripts/demo.ps1     # Windows
 ```
 
 ```sh
-# Linux/macOS
-./scripts/demo.sh
+./scripts/demo.sh      # Linux/macOS
 ```
 
-Then type `exec` and press Enter. The first model response asks the kernel to
-run an `exec` tool; approve it with `y`. You should see the tool card, the
-command output, and the final model text. Try `file`, `secret`, `flag`,
-`board`, `spawn`, or `/help` for the other mock branches.
+Type `exec` and press Enter, then approve with `y`. You should see the tool
+card, command output and final model text. Try `file`, `secret`, `flag`,
+`board`, `spawn` for other mock branches.
 
-No Python/API key? Run the TUI with the offline provider and use `/demo`:
+## Browser UI
+
+If you want a real graphical window instead of a terminal, the daemon also
+serves a browser UI:
 
 ```sh
-target/debug/msk-tui --root .msk/offline --provider scripted-demo
+target/debug/msk-web --root .msk --listen 127.0.0.1:8787 --token dev
+# open http://127.0.0.1:8787/?token=dev
 ```
+
+It uses the same tasks, approvals and blackboard over the same IPC protocol.
 
 ## Diagnostics
 
 ```sh
 target/debug/msk-tui --doctor
 target/debug/msk-tui --root .msk --snapshot
+target/debug/msk-tui --root .msk --snapshot --snapshot-palette
+target/debug/msk-tui --root .msk --snapshot --snapshot-sessions
 ```
 
 `--doctor` reports the daemon, envd, tools directory, provider, model and key
-presence. `--snapshot` renders one real TUI frame to stdout (no alternate
-screen); it is useful for CI or for pasting a screen into a bug report.
+presence. `--snapshot` renders one real frame to stdout (no alternate screen);
+it is useful for CI and bug reports. The two hidden snapshot flags render the
+overlays for documentation screenshots.
 
 The raw event viewer remains available without a daemon:
 
@@ -259,10 +369,9 @@ target/debug/msk-tui --events .msk/events.jsonl
 - **`tools directory not found`** — run from the repository root, set
   `MSK_TOOLS_DIR`, or keep `tools/wasm` under an executable ancestor.
 - **OpenAI task fails immediately** — run `--doctor`; check `MSK_LLM_MODEL`,
-  `MSK_LLM_API_KEY`, and `MSK_LLM_BASE_URL`. See `.msk/mskd.log` and the task's
+  `MSK_LLM_API_KEY` and `MSK_LLM_BASE_URL`. See `.msk/mskd.log` and the task's
   `agent.stderr.log`.
-- **Approval modal does not appear** — the daemon may have been started before
-  the request; approvals are hydrated every second, so it should appear shortly.
-  If it does not, run `mskctl --root .msk approvals`.
+- **Approval modal does not appear** — approvals are hydrated every second. If
+  it still does not, run `mskctl --root .msk approvals`.
 - **Stale daemon** — stop `mskd`, or use `--no-autostart` and start it manually
   with `mskd --root ... --envd ... --tools-dir ...`.

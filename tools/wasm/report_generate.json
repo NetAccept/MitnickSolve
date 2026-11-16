@@ -1,0 +1,11 @@
+{
+  "name": "report_generate",
+  "description": "Generate a Markdown security assessment report from the shared findings and flag ledger, plus the structured data used to build it.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "title": {"type": "string", "default": "Security assessment"}
+    }
+  },
+  "capabilities": ["state.shared"]
+}

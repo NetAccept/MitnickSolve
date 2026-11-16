@@ -1,0 +1,87 @@
+{
+  "name": "transform",
+  "description": "CTF data transforms: base64/base64url, hex, URL, HTML, hashes, HMAC, JWT decode, gzip, ROT13, XOR, UUID, random bytes. Output is capped at 64 KiB.",
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "op"
+    ],
+    "properties": {
+      "op": {
+        "type": "string",
+        "description": "Transform operation.",
+        "enum": [
+          "base64_encode",
+          "base64_decode",
+          "base64url_encode",
+          "base64url_decode",
+          "hex_encode",
+          "hex_decode",
+          "url_encode",
+          "url_decode",
+          "html_escape",
+          "html_unescape",
+          "hash",
+          "hmac",
+          "jwt_decode",
+          "gzip",
+          "gunzip",
+          "rot13",
+          "xor",
+          "uuid",
+          "random_bytes"
+        ]
+      },
+      "data": {
+        "type": "string",
+        "description": "Text input for the operation."
+      },
+      "data_base64": {
+        "type": "string",
+        "description": "Base64 binary input; takes precedence over data."
+      },
+      "key": {
+        "type": "string",
+        "description": "Text key for hmac."
+      },
+      "key_base64": {
+        "type": "string",
+        "description": "Base64 key for hmac; takes precedence over key."
+      },
+      "algorithm": {
+        "type": "string",
+        "description": "Hash or HMAC algorithm (hmac accepts sha1, sha256 and sha512).",
+        "enum": [
+          "md5",
+          "sha1",
+          "sha256",
+          "sha512"
+        ]
+      },
+      "algorithms": {
+        "type": "array",
+        "description": "Algorithms for the hash operation.",
+        "items": {
+          "type": "string",
+          "enum": [
+            "md5",
+            "sha1",
+            "sha256",
+            "sha512"
+          ]
+        }
+      },
+      "length": {
+        "type": "integer",
+        "description": "Byte count for random_bytes.",
+        "minimum": 1,
+        "maximum": 4096
+      },
+      "xor_key": {
+        "type": "string",
+        "description": "Repeating key for the xor operation."
+      }
+    }
+  },
+  "capabilities": []
+}

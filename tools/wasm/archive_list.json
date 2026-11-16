@@ -1,0 +1,24 @@
+{
+  "name": "archive_list",
+  "description": "List zip, tar, tar.gz or gzip archive entries with sizes and metadata.",
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "env_id",
+      "path"
+    ],
+    "properties": {
+      "env_id": {
+        "type": "string",
+        "description": "Environment identifier returned by envd."
+      },
+      "path": {
+        "type": "string",
+        "description": "Workspace-relative file path."
+      }
+    }
+  },
+  "capabilities": [
+    "fs.workspace"
+  ]
+}

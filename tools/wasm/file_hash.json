@@ -1,0 +1,40 @@
+{
+  "name": "file_hash",
+  "description": "Hash a workspace file with MD5, SHA-1, SHA-256 and/or SHA-512.",
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "env_id",
+      "path"
+    ],
+    "properties": {
+      "env_id": {
+        "type": "string",
+        "description": "Environment identifier returned by envd."
+      },
+      "path": {
+        "type": "string",
+        "description": "Workspace-relative file path."
+      },
+      "algorithms": {
+        "type": "array",
+        "description": "Hash algorithms to compute; defaults to SHA-256.",
+        "default": [
+          "sha256"
+        ],
+        "items": {
+          "type": "string",
+          "enum": [
+            "md5",
+            "sha1",
+            "sha256",
+            "sha512"
+          ]
+        }
+      }
+    }
+  },
+  "capabilities": [
+    "fs.workspace"
+  ]
+}

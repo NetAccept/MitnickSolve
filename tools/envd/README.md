@@ -11,6 +11,16 @@ Execution environment. Two transports are implemented from
 
 Tools: `agent_info`, `env_create`, `env_open`, `exec`, `read_file`, `write_file`,
 `list_dir`, `stat_file`, `session_create/exec/write/read/resize/list/close`.
+
+Security and network operations add: `net_info`, `net_dns`, `net_dial`,
+`net_tls`, `net_scan`, `web_request`; `file_hash`, `file_type`, `file_strings`,
+`file_hexdump`, `file_entropy`, `file_search`, `archive_list`,
+`archive_extract`, `binary_info`, `secret_scan`; and `transform` for
+base64/hex/URL/hash/HMAC/JWT/gzip/XOR operations. All are exposed over the same
+MCP control plane and bounded by explicit host/port lists, byte limits and
+timeouts. `net_scan`, `net_dial`, `web_request` and `archive_extract` are
+approval-gated in the kernel's `ask` policy.
+
 PTY sessions use raw `session_write`/`session_read`/`session_resize`;
 `session_exec` is pipe-only.
 
@@ -48,8 +58,14 @@ without a client will wait for a HELLO frame.
 ```sh
 export ENVD_TOKEN=change-me
 ./envd --service --root .msk-envd \
-  --listen 127.0.0.1:7800 --data-listen 127.0.0.1:7801
+  --listen 127.0.0.1:7800 --data-listen 127.0.0.1:7801 \
+  --net-allow 10.0.0.0/8 --net-allow example.test
 ```
+
+`--net-allow` is an optional deployment egress allowlist: CIDR blocks and
+domain suffixes (repeatable or comma-separated). When present, every DNS, TCP,
+TLS, scan, HTTP and custom-resolver target is checked before any packet is
+sent; an empty list allows every target.
 
 ```sh
 curl http://127.0.0.1:7800/healthz

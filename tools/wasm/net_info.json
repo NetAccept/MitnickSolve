@@ -1,0 +1,19 @@
+{
+  "name": "net_info",
+  "description": "Report hostname, OS/arch, network interfaces and DNS servers for an environment.",
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "env_id"
+    ],
+    "properties": {
+      "env_id": {
+        "type": "string",
+        "description": "Environment identifier returned by envd."
+      }
+    }
+  },
+  "capabilities": [
+    "net.egress"
+  ]
+}

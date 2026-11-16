@@ -43,6 +43,9 @@ enum Command {
         /// OpenAI-compatible base URL.
         #[arg(long)]
         base_url: Option<String>,
+        /// Agent mode id from modes.json; auto routes by goal.
+        #[arg(long, default_value = "auto")]
+        mode: String,
         /// Resume a previous task checkpoint.
         #[arg(long)]
         resume_checkpoint: Option<PathBuf>,
@@ -59,6 +62,9 @@ enum Command {
         /// Defaults to ask for interactive tasks and allow otherwise.
         #[arg(long, value_parser = ["allow", "ask"])]
         approvals: Option<String>,
+        /// Permission posture: auto, manual, or bypass.
+        #[arg(long, value_parser = ["auto", "manual", "bypass"])]
+        permission: Option<String>,
         /// Context token budget for the task (default 100000).
         #[arg(long)]
         max_context_tokens: Option<u64>,
@@ -199,11 +205,13 @@ fn main() -> Result<()> {
             model,
             effort,
             base_url,
+            mode,
             resume_checkpoint,
             interactive,
             stream,
             headless,
             approvals,
+            permission,
             max_context_tokens,
             parent_task,
             fork_from,
@@ -214,7 +222,8 @@ fn main() -> Result<()> {
                 "provider": provider,
                 "interactive": interactive,
                 "stream": stream,
-                "headless": headless
+                "headless": headless,
+                "mode": mode
             });
             if let Some(model) = model {
                 params["model"] = json!(model);
@@ -230,6 +239,9 @@ fn main() -> Result<()> {
             }
             if let Some(approvals) = approvals {
                 params["approvals"] = json!(approvals);
+            }
+            if let Some(permission) = permission {
+                params["permission"] = json!(permission);
             }
             if let Some(max_context_tokens) = max_context_tokens {
                 params["max_context_tokens"] = json!(max_context_tokens);

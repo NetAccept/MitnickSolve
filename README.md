@@ -1,8 +1,11 @@
 # MitnickSolve
 
-CTF agent with a lightweight Rust kernel, WASM-only tools, and a uniform execution
-backend (`envd`). Design documents live in [`docs/`](docs/). Performance notes and benchmark
-results are in [`docs/performance.md`](docs/performance.md).
+MitnickSolve is a security engineering and network operations workbench: an
+autonomous agent for CTF challenges, authorized penetration tests, host and web
+triage, incident response, and day-to-day network operations. It pairs a
+lightweight Rust kernel with WASM-only tools and a uniform execution backend
+(`envd`). Design documents live in [`docs/`](docs/); the structured toolset is
+documented in [`docs/tools.md`](docs/tools.md).
 
 ## Status
 
@@ -91,9 +94,11 @@ M0 scaffold plus the P1 session/turn slice:
   broadcasts it as `approval.request` and writes `approval.respond` back to the
   agent's stdin. `mskctl approvals/approve/deny` and the TUI modal (`y`/`n`)
   resolve it. `--approvals allow` restores unattended execution.
-- Conversational daemon TUI: task list, transcript, message editor, streamed
-  assistant text, cooperative interrupt, and a live event pane. `n` creates an
-  interactive task; `Enter`/`i` writes, `s` interrupts, `t` opens the PTY.
+- Semi-graphical conversational TUI: pixel wordmark, rounded composer, status
+  chips, borderless transcript, streamed assistant text, tool cards, dimmed
+  approval/setup/palette layers, cooperative interrupt and a toggleable event
+  sidebar. `Ctrl+P` opens the command palette; `Tab` switches sessions; `y`/`n`
+  answer approvals; `Ctrl+Q` detaches from the PTY.
 - SQLite event index: `msk-store` indexes events by id/task/kind/seq. Start
   mskd with `--store <path>` and query via `mskctl events` or
   `msk-replay --db <path>`; duplicate ids from log replay are ignored.
@@ -160,11 +165,11 @@ target/debug/msk
 `mskd` if needed. The embedded envd uses the **current directory** as its
 workspace, so the agent sees `./challenge` immediately. Use `--workspace <dir>`
 on `msk`/`mskd` to point it elsewhere. With no API key it uses the offline
-`scripted-demo` provider;
-type a message and press Enter to create a task, or `/demo` for the canned tool
-demo. Press `p` (or `/setup`) to choose provider, model and reasoning effort;
-`/provider openai` is the quick switch. See [`docs/tui.md`](docs/tui.md) for
-keys, slash commands, approvals, history, diagnostics, and troubleshooting.
+`scripted-demo` provider; type a message and press Enter to create a task, or
+`/demo` for the canned tool demo. Press `Ctrl+P` (or `/setup`) to choose
+provider, model and reasoning effort; `/provider openai` is the quick switch.
+See [`docs/tui.md`](docs/tui.md) for keys, slash commands, approvals, history,
+diagnostics, and troubleshooting.
 
 For a guided mock-model demo:
 
@@ -177,6 +182,54 @@ For a guided mock-model demo:
 
 Both start a local OpenAI-compatible mock and open the TUI; type `exec`, press
 Enter, and approve with `y` to see a real tool round trip.
+
+## Security and network toolset
+
+The agent ships with structured tools, not just a shell. All of them execute
+inside the selected `envd` environment; the kernel only grants the capabilities
+declared by each manifest.
+
+- **Recon** — `net_info` (hostname, interfaces, DNS), `net_dns`
+  (A/AAAA/CNAME/MX/NS/TXT/SRV/PTR), `net_dial` (TCP/TLS connect, send bytes,
+  banner), `net_tls` (version, cipher, ALPN, full certificate chain),
+  `net_scan` (bounded explicit-host TCP connect scan with optional banners).
+- **Web** — `web_request`: methods, headers, JSON/form/base64 bodies, cookie
+  jar, redirect tracing, proxy, insecure-TLS option, and TLS summary.
+- **Files and forensics** — `file_hash`, `file_type`, `file_strings`,
+  `file_hexdump`, `file_entropy`, `file_search`, `archive_list`,
+  `archive_extract`, `secret_scan`.
+- **Binary** — `binary_info` for ELF/PE/Mach-O architecture, sections, imports,
+  and hardening flags (NX, PIE, RELRO, canary, ASLR, CFG).
+- **Data** — `transform` for base64/base64url, hex, URL, HTML, hashes, HMAC,
+  JWT decode, gzip, ROT13, XOR, UUID, and random bytes.
+- **Findings and reporting** — `finding_add`/`finding_list` maintain a
+  severity-ranked assessment ledger in the daemon blackboard;
+  `report_generate` builds an evidence-backed Markdown report from findings and
+  captured flags.
+- **Collaboration** — persistent PTY/pipe sessions, `blackboard_*` for shared
+  findings, `flag_*` for the flag ledger, and `spawn_agent`/`agent_result` for
+  subagents.
+
+- **Agent modes** — `plan` (read-only plan), `investigate` (read-only recon and
+  evidence), `exploit` (authorized active testing), `harden` (defensive
+  remediation), and `auto` (deterministic routing to the least-invasive mode).
+  Mode controls both the system prompt and the tool set; subagents cannot
+  escalate modes. The built-ins can be overridden or extended in
+  `modes.json`, and the active mode is shown in the composer's leading slot.
+  See [`docs/modes.md`](docs/modes.md).
+
+- **Permission modes** — `auto` (prompt only for commands, raw dials, archive
+  extraction and delegation), `manual` (prompt for every gated tool), and
+  `bypass` (no prompts; hard policy denials and envd deployment policy remain).
+  Independent of agent modes; shown in the footer. See
+  [`docs/permissions.md`](docs/permissions.md).
+
+`net_scan`, `net_dial`, `web_request`, `archive_extract`, `exec`,
+`session_write`, `write_file`, `http_request` and `spawn_agent` are
+approval-gated under the `ask` policy. For deployment-level scope control,
+start envd with `--net-allow <CIDR|domain>...`; every network target is checked
+before a packet is sent. See [`docs/tools.md`](docs/tools.md) for schemas, hard
+limits, approval behavior, and end-to-end workflows.
 
 ## Build
 
@@ -483,16 +536,16 @@ pass `--approvals allow` to `create` for unattended execution. Use
 `--provider openai` on `create` together with `MSK_LLM_*` in the daemon
 environment for a real model.
 
-The TUI in daemon mode is a conversational workbench: a task list, a transcript,
-and a message editor. `Enter` or `i` starts writing; `Enter` sends, `Esc` leaves
-the editor, and `←`/`→`, `Home`/`End`, `Backspace`, and `Ctrl+U` edit the line.
-`s` interrupts the running turn, `n` creates an interactive scripted task,
-`x` cancels, `a` shows pending approvals, and a pending approval opens a modal
-where `y` approves and `n`/`Esc` denies. `t` opens/focuses the daemon-managed
-PTY terminal (`Ctrl+Q` detaches), `j`/`k` select tasks, `r` reloads, and `?`
-shows help. Assistant text streams into the transcript as `agent.text` deltas;
-errors and interrupts appear as system lines. The right pane keeps the live
-event stream for debugging.
+The TUI in daemon mode is a semi-graphical conversational app: a pixel wordmark
+on the home screen, a rounded composer, status chips, a borderless transcript,
+live tool cards and dimmed modal layers. The composer is always focused — just
+type. `Enter` sends, `Shift+Enter` inserts a newline, `Tab` opens the session
+switcher, `Ctrl+P` opens the command palette, and `F1` lists every shortcut.
+`Esc` interrupts a running turn or closes an overlay; `Ctrl+C` interrupts, then
+quits when idle. A pending approval opens a modal where `y` approves and
+`n`/`Esc` denies. Assistant text streams into the transcript as `agent.text`
+deltas. The event inspector and PTY terminal are available from the palette
+(`Ctrl+Q` detaches from the terminal). See [`docs/tui.md`](docs/tui.md).
 
 Terminal scripting:
 

@@ -1,0 +1,44 @@
+{
+  "name": "file_entropy",
+  "description": "Compute Shannon entropy overall and per chunk to spot packing or encryption.",
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "env_id",
+      "path"
+    ],
+    "properties": {
+      "env_id": {
+        "type": "string",
+        "description": "Environment identifier returned by envd."
+      },
+      "path": {
+        "type": "string",
+        "description": "Workspace-relative file path."
+      },
+      "offset": {
+        "type": "integer",
+        "description": "Byte offset to start reading from.",
+        "minimum": 0,
+        "default": 0
+      },
+      "length": {
+        "type": "integer",
+        "description": "Maximum bytes to analyze.",
+        "minimum": 1,
+        "maximum": 4194304,
+        "default": 262144
+      },
+      "chunk_size": {
+        "type": "integer",
+        "description": "Chunk size in bytes for per-chunk entropy.",
+        "minimum": 4096,
+        "maximum": 65536,
+        "default": 4096
+      }
+    }
+  },
+  "capabilities": [
+    "fs.workspace"
+  ]
+}

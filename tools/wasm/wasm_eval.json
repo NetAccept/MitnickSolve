@@ -1,0 +1,19 @@
+{
+  "name": "wasm_eval",
+  "description": "Compile and run a pure WAT WebAssembly module with no host imports. The module receives input bytes at offset 0 and exports run(ptr,len) -> (out_ptr<<32)|out_len; output is read at out_ptr. Use it to write small parsers or computations on demand. No filesystem, network, envd or host calls are available.",
+  "input_schema": {
+    "type": "object",
+    "required": ["wat"],
+    "properties": {
+      "wat": {
+        "type": "string",
+        "description": "WebAssembly text module (1-64 KiB) exporting memory and run(ptr,len)->i64. Imports are rejected."
+      },
+      "input_base64": {
+        "type": "string",
+        "description": "Optional input bytes, at most 64 KiB, written at offset 0 before run is called."
+      }
+    }
+  },
+  "capabilities": []
+}

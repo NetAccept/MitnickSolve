@@ -15,7 +15,8 @@ use msk_core::ToolCall;
 use msk_core::context::{ContextLimits, ContextManager, Role, summarize_output};
 use msk_data::{FileObjectStore, ObjectStore};
 use msk_events::{Event, EventSink, JsonlSink};
-use msk_kernel::policy;
+use msk_kernel::mode::ModeRegistry;
+use msk_kernel::policy::{self, PermissionMode};
 use msk_llm::{
     EchoProvider, LlmDelta, LlmError, LlmProvider, LlmResponse, OpenAiConfig, OpenAiProvider,
     OpenAiResponsesProvider, ScriptedProvider,
@@ -148,8 +149,18 @@ struct Cli {
     #[arg(long)]
     component_host: Option<PathBuf>,
     /// Ask before executing commands in a session; allow runs them directly.
-    #[arg(long, value_enum, default_value_t = Approvals::Ask)]
-    approvals: Approvals,
+    #[arg(long, value_enum)]
+    approvals: Option<Approvals>,
+    /// Permission posture: auto (prompt for commands/raw actions), manual
+    /// (prompt for all gated tools), or bypass (no prompts; hard denials stay).
+    #[arg(long)]
+    permission: Option<String>,
+    /// Agent mode id from modes.json. 'auto' routes by goal.
+    #[arg(long, default_value = "auto")]
+    mode: String,
+    /// Optional modes.json file. Defaults to $MSK_MODES or <root>/modes.json.
+    #[arg(long)]
+    modes_file: Option<PathBuf>,
     /// Goal handed to a real model.
     #[arg(
         long,
@@ -744,6 +755,9 @@ fn main() -> Result<()> {
         agent_depth: 0,
         task_id: cli.task_id.clone(),
         default_provider: "scripted".into(),
+        mode: "investigate".into(),
+        modes: Arc::new(ModeRegistry::builtin()?),
+        permission: PermissionMode::Bypass,
     });
     let host: Arc<dyn ToolHost> = env_host.clone();
 
@@ -770,7 +784,7 @@ fn main() -> Result<()> {
     emit(
         sink.as_ref(),
         "tool.registry",
-        json!({"tools": tool_names, "dir": cli.tools_dir.display().to_string()}),
+        json!({"tools": tool_names.to_vec(), "mode": "investigate", "dir": cli.tools_dir.display().to_string()}),
     )?;
 
     let context_limits = ContextLimits::default()
@@ -1001,6 +1015,46 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
                 .with_context(|| format!("connect control plane {}", root.display()))
         })
         .transpose()?;
+    let modes = Arc::new(
+        ModeRegistry::load(&cli.root, cli.modes_file.as_deref()).context("load agent modes")?,
+    );
+    let permission = if let Some(value) = &cli.permission {
+        PermissionMode::parse(value).with_context(|| format!("unknown permission mode {value}"))?
+    } else {
+        match cli.approvals {
+            Some(Approvals::Ask) => PermissionMode::Manual,
+            Some(Approvals::Allow) => PermissionMode::Bypass,
+            None => PermissionMode::Auto,
+        }
+    };
+    let requested_mode = if cli.mode.trim().is_empty() {
+        "auto".to_string()
+    } else {
+        cli.mode.trim().to_string()
+    };
+    let decision = modes
+        .resolve(&requested_mode, &cli.goal)
+        .with_context(|| format!("resolve mode {requested_mode}"))?;
+    let agent_mode = decision.mode.clone();
+    if requested_mode == "auto" {
+        emit(
+            sink.as_ref(),
+            "mode.route",
+            json!({
+                "requested": requested_mode,
+                "mode": decision.mode,
+                "reason": decision.reason,
+                "scores": decision.scores,
+                "permission": permission.as_str()
+            }),
+        )?;
+    } else {
+        emit(
+            sink.as_ref(),
+            "mode.select",
+            json!({"mode": agent_mode, "requested": requested_mode, "permission": permission.as_str()}),
+        )?;
+    }
     let env_host = Arc::new(EnvHost {
         client,
         artifacts: object_store.clone(),
@@ -1009,32 +1063,13 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         agent_depth: cli.agent_depth,
         task_id: cli.task_id.clone(),
         default_provider: provider_kind_str(cli.provider).into(),
+        mode: agent_mode.clone(),
+        modes: modes.clone(),
+        permission,
     });
     let host: Arc<dyn ToolHost> = env_host.clone();
-    let tool_names = [
-        "exec",
-        "session_create",
-        "session_exec",
-        "session_write",
-        "session_read",
-        "session_resize",
-        "session_close",
-        "artifact_read",
-        "read_file",
-        "write_file",
-        "list_dir",
-        "stat_file",
-        "http_request",
-        "spawn_agent",
-        "agent_result",
-        "blackboard_get",
-        "blackboard_set",
-        "blackboard_list",
-        "flag_add",
-        "flag_list",
-        "echo",
-    ];
-    let registry_policy = policy::policy_with_approvals(cli.approvals == Approvals::Ask);
+    let tool_names = modes.tool_names(&agent_mode);
+    let registry_policy = policy::policy_for_permission(permission);
     let registry = load_registry_with_policy(
         &cli.tools_dir,
         &cli.wasm,
@@ -1046,7 +1081,7 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
     emit(
         sink.as_ref(),
         "tool.registry",
-        json!({"tools": tool_names, "dir": cli.tools_dir.display().to_string()}),
+        json!({"tools": tool_names.to_vec(), "mode": agent_mode, "dir": cli.tools_dir.display().to_string()}),
     )?;
 
     let limits = ContextLimits::default()
@@ -1085,13 +1120,39 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         let mut context = ContextManager::new(limits.clone());
         context.push_pinned(
             Role::System,
-            "You are MitnickSolve, a CTF agent. Use the provided tools for all machine access. \
-             Prefer persistent sessions for multi-command work. Tool output over 2 KiB is stored \
-             as an artifact; use artifact_read to inspect it. Keep responses concise.",
+            "You are MitnickSolve, an autonomous security engineering and network operations agent. \
+             Work only on the authorized challenge, target, or infrastructure in front of you; never \
+             scan or attack hosts outside that scope. Use the provided tools for all machine access. \
+             Prefer structured tools before raw commands: net_info/net_dns/net_tls/net_dial/net_scan \
+             for recon, web_request for HTTP(S), file_*/binary_info/secret_scan for forensics, \
+             transform for encoding and crypto, and exec/session for everything else. Prefer \
+             persistent sessions for multi-command work. Tool output over 2 KiB is stored as an \
+             artifact; use artifact_read to inspect it. Record durable findings with blackboard_set \
+             and flags with flag_add. Keep responses concise and evidence-driven.",
         );
         context.push_pinned(Role::System, format!("env_id={env_id}"));
         (context, 0)
     };
+    context.push_pinned(
+        Role::System,
+        format!(
+            "Current agent mode: {} ({}). {}",
+            agent_mode,
+            modes.label(&agent_mode),
+            modes.prompt(&agent_mode)
+        ),
+    );
+    context.push_pinned(
+        Role::System,
+        "CTF playbook: identify the category first (web, pwn, reversing, crypto, forensics, misc, OSINT). \
+         Inventory the supplied files with file_type/file_hash/file_strings/binary_info before running \
+         anything. Keep a short hypothesis list and test one variable at a time. Use net_* and \
+         web_request for services, transform for encodings/crypto, file_* for artifacts, and \
+         wasm_eval for small pure parsers. Capture flags with flag_add and preserve the evidence that \
+         proves them. Do not fabricate a flag; if a value is uncertain, say so. Avoid brute force or \
+         destructive actions unless the challenge explicitly calls for them, and never attack hosts \
+         outside the challenge scope.",
+    );
     if let Some(path) = &cli.resume {
         let events =
             msk_events::read_events(path).with_context(|| format!("read {}", path.display()))?;
@@ -1118,7 +1179,7 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
 
     let provider = build_provider(cli, false)?;
     let gate = ApprovalGate::new(cli.stdio_json, Duration::from_secs(300));
-    let approvals: Option<Box<dyn ApprovalHandler>> = if cli.approvals == Approvals::Ask {
+    let approvals: Option<Box<dyn ApprovalHandler>> = if permission.asks() {
         Some(Box::new(gate.clone()))
     } else {
         None

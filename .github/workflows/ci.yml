@@ -65,7 +65,7 @@ jobs:
           mkdir -p .msk
           target/debug/envd --service --root .msk/envd-ci \
             --listen 127.0.0.1:17800 --data-listen 127.0.0.1:17801 \
-            --token ci-token >.msk/envd-ci.log 2>&1 &
+            --token ci-token --net-allow 127.0.0.0/8 >.msk/envd-ci.log 2>&1 &
           envd_pid=$!
           trap 'kill "$envd_pid" 2>/dev/null || true' EXIT
           for _ in $(seq 1 100); do
@@ -82,6 +82,35 @@ jobs:
             -H 'Authorization: Bearer ci-token' -H 'Content-Type: application/json' \
             -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"env_create","arguments":{"profile":"isolated"}}}' \
             | jq -e '.result.isError == true and .result.structuredContent.error.code == 6'
+          env_id=$(curl -fsS -X POST http://127.0.0.1:17800/mcp \
+            -H 'Authorization: Bearer ci-token' -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"env_create","arguments":{"profile":"dev"}}}' \
+            | jq -r '.result.structuredContent.data.env_id')
+          test -n "$env_id"
+          curl -fsS -X POST http://127.0.0.1:17800/mcp \
+            -H 'Authorization: Bearer ci-token' -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"transform","arguments":{"op":"base64_encode","data":"flag"}}}' \
+            | jq -e '.result.structuredContent.data.result == "ZmxhZw=="'
+          curl -fsS -X POST http://127.0.0.1:17800/mcp \
+            -H 'Authorization: Bearer ci-token' -H 'Content-Type: application/json' \
+            -d "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"net_dns\",\"arguments\":{\"env_id\":\"$env_id\",\"name\":\"localhost\",\"type\":\"A\"}}}" \
+            | jq -e '.result.structuredContent.data.values | length > 0'
+          curl -fsS -X POST http://127.0.0.1:17800/mcp \
+            -H 'Authorization: Bearer ci-token' -H 'Content-Type: application/json' \
+            -d "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"write_file\",\"arguments\":{\"env_id\":\"$env_id\",\"path\":\"note.txt\",\"data\":\"aGVsbG8K\"}}}" \
+            | jq -e '.result.structuredContent.ok == true'
+          curl -fsS -X POST http://127.0.0.1:17800/mcp \
+            -H 'Authorization: Bearer ci-token' -H 'Content-Type: application/json' \
+            -d "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"file_type\",\"arguments\":{\"env_id\":\"$env_id\",\"path\":\"note.txt\"}}}" \
+            | jq -e '.result.structuredContent.data.kind == "text"'
+          curl -fsS -X POST http://127.0.0.1:17800/mcp \
+            -H 'Authorization: Bearer ci-token' -H 'Content-Type: application/json' \
+            -d "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"file_hash\",\"arguments\":{\"env_id\":\"$env_id\",\"path\":\"note.txt\"}}}" \
+            | jq -e '.result.structuredContent.data.hashes.sha256 | length == 64'
+          curl -fsS -X POST http://127.0.0.1:17800/mcp \
+            -H 'Authorization: Bearer ci-token' -H 'Content-Type: application/json' \
+            -d "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"net_dial\",\"arguments\":{\"env_id\":\"$env_id\",\"host\":\"192.0.2.1\",\"port\":80}}}" \
+            | jq -e '.result.isError == true and .result.structuredContent.error.name == "PERMISSION_DENIED"'
       - name: envd isolated launcher smoke
         run: |
           set -euo pipefail
@@ -190,6 +219,19 @@ jobs:
           [ "$(target/debug/mskctl --root .msk/ci state "$component_task" | jq -r .state)" = done ]
           target/debug/mskctl --root .msk/ci result "$component_task" \
             | jq -r .transcript | grep -q "component hello"
+          plan_task=$(target/debug/mskctl --root .msk/ci create --headless \
+            --demo echo --provider scripted-demo --mode plan \
+            --goal "plan the smoke assessment" | jq -r .task_id)
+          for _ in $(seq 1 100); do
+            state=$(target/debug/mskctl --root .msk/ci state "$plan_task" | jq -r .state)
+            if [ "$state" = done ] || [ "$state" = failed ]; then break; fi
+            sleep 0.1
+          done
+          [ "$(target/debug/mskctl --root .msk/ci state "$plan_task" | jq -r .mode)" = plan ]
+          auto_task=$(target/debug/mskctl --root .msk/ci create --headless \
+            --demo echo --provider scripted-demo --mode auto \
+            --goal "harden ssh and patch the firewall" | jq -r .task_id)
+          [ "$(target/debug/mskctl --root .msk/ci state "$auto_task" | jq -r .mode)" = harden ]
           target/debug/mskctl --root .msk/ci events --task "$task" --limit 5 \
             | jq -e '.count > 0'
           for _ in 1 2; do
@@ -238,6 +280,16 @@ jobs:
           echo '{"provider":"scripted-demo","model":"","effort":"default","base_url":""}' > .msk/ci/tui-config.json
           target/debug/msk-tui --root .msk/ci --snapshot --provider scripted \
             | grep -q "MitnickSolve"
+          target/debug/msk-tui --root .msk/ci --snapshot --provider scripted \
+            --snapshot-palette | grep -q "commands"
+          target/debug/msk-tui --root .msk/ci --snapshot --provider scripted \
+            --snapshot-sessions | grep -q "sessions"
+          target/debug/msk-tui --root .msk/ci --snapshot --provider scripted \
+            --snapshot-findings | grep -q "assessment findings"
+          target/debug/msk-tui --root .msk/ci --snapshot --provider scripted \
+            --snapshot-modes | grep -q "agent mode"
+          target/debug/msk-tui --root .msk/ci --snapshot --provider scripted \
+            --snapshot-permissions | grep -q "permissions"
           target/debug/msk-tui --root .msk/ci --snapshot --setup --setup-step effort \
             --provider openai | grep -q "Reasoning effort"
       - name: TLS service and data plane smoke

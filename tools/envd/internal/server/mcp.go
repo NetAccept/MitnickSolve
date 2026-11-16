@@ -89,6 +89,15 @@ func (s *Server) capabilities() []string {
 		"env.managed",
 		"exec",
 		"files",
+		"files.analysis",
+		"binary.analysis",
+		"data.transform",
+		"net.dns",
+		"net.tcp",
+		"net.tls",
+		"net.scan",
+		"net.http",
+		"net.info",
 		"session.pipe",
 		"session.pty",
 	}
@@ -97,6 +106,9 @@ func (s *Server) capabilities() []string {
 	}
 	if s.isolatedAvailable() {
 		caps = append(caps, "sandbox.launcher")
+	}
+	if len(s.opts.NetAllow) > 0 {
+		caps = append(caps, "net.allowlist")
 	}
 	if runtime.GOOS == "windows" {
 		caps = append(caps, "process.job")
@@ -109,7 +121,14 @@ func (s *Server) capabilities() []string {
 func toolDefinitions(profiles []string) []map[string]any {
 	stringProp := func() map[string]any { return map[string]any{"type": "string"} }
 	intProp := func() map[string]any { return map[string]any{"type": "integer"} }
-
+	boolProp := func() map[string]any { return map[string]any{"type": "boolean"} }
+	stringArrayProp := func() map[string]any {
+		return map[string]any{"type": "array", "items": stringProp()}
+	}
+	intArrayProp := func() map[string]any {
+		return map[string]any{"type": "array", "items": intProp()}
+	}
+	anyProp := func() map[string]any { return map[string]any{} }
 	return []map[string]any{
 		{
 			"name":        "agent_info",
@@ -240,6 +259,209 @@ func toolDefinitions(profiles []string) []map[string]any {
 			"inputSchema": objectSchema(map[string]any{
 				"session_id": stringProp(),
 			}, "session_id"),
+		},
+		{
+			"name":        "net_info",
+			"description": "Return hostname, OS/arch, interfaces, addresses and DNS servers for the environment host.",
+			"inputSchema": objectSchema(map[string]any{
+				"env_id": stringProp(),
+			}, "env_id"),
+		},
+		{
+			"name":        "net_dns",
+			"description": "Resolve DNS records (A, AAAA, CNAME, MX, NS, TXT, SRV, PTR) with an optional custom resolver.",
+			"inputSchema": objectSchema(map[string]any{
+				"env_id":     stringProp(),
+				"name":       stringProp(),
+				"type":       map[string]any{"type": "string", "enum": []string{"A", "AAAA", "CNAME", "MX", "NS", "TXT", "SRV", "PTR"}},
+				"server":     stringProp(),
+				"timeout_ms": intProp(),
+			}, "env_id", "name"),
+		},
+		{
+			"name":        "net_dial",
+			"description": "Connect TCP or TLS, optionally send bytes and read a banner. Refused connections return connected=false.",
+			"inputSchema": objectSchema(map[string]any{
+				"env_id":       stringProp(),
+				"host":         stringProp(),
+				"port":         intProp(),
+				"send_base64":  stringProp(),
+				"read_bytes":   intProp(),
+				"timeout_ms":   intProp(),
+				"tls":          boolProp(),
+				"server_name":  stringProp(),
+				"insecure_tls": boolProp(),
+				"alpn":         stringArrayProp(),
+			}, "env_id", "host", "port"),
+		},
+		{
+			"name":        "net_tls",
+			"description": "Inspect a TLS endpoint: negotiated version/cipher/ALPN and the full peer certificate chain.",
+			"inputSchema": objectSchema(map[string]any{
+				"env_id":      stringProp(),
+				"host":        stringProp(),
+				"port":        intProp(),
+				"server_name": stringProp(),
+				"timeout_ms":  intProp(),
+				"alpn":        stringArrayProp(),
+			}, "env_id", "host"),
+		},
+		{
+			"name":        "net_scan",
+			"description": "Bounded TCP connect scan of explicit hosts and ports with optional banner capture. Max 8192 probes per call.",
+			"inputSchema": objectSchema(map[string]any{
+				"env_id":      stringProp(),
+				"targets":     stringArrayProp(),
+				"ports":       intArrayProp(),
+				"port_range":  stringProp(),
+				"timeout_ms":  intProp(),
+				"concurrency": intProp(),
+				"banner":      boolProp(),
+			}, "env_id", "targets"),
+		},
+		{
+			"name":        "web_request",
+			"description": "Environment-scoped HTTP(S) request with methods, headers, JSON/form bodies, cookie jar, redirect tracing, proxy and TLS options.",
+			"inputSchema": objectSchema(map[string]any{
+				"env_id":           stringProp(),
+				"url":              stringProp(),
+				"method":           stringProp(),
+				"headers":          map[string]any{"type": "object", "additionalProperties": stringProp()},
+				"body_base64":      stringProp(),
+				"json":             anyProp(),
+				"form":             map[string]any{"type": "object", "additionalProperties": stringProp()},
+				"timeout_ms":       intProp(),
+				"max_bytes":        intProp(),
+				"follow_redirects": boolProp(),
+				"max_redirects":    intProp(),
+				"insecure_tls":     boolProp(),
+				"proxy":            stringProp(),
+				"user_agent":       stringProp(),
+			}, "env_id", "url"),
+		},
+		{
+			"name":        "file_hash",
+			"description": "Hash a workspace file with md5, sha1, sha256 and/or sha512 using streaming I/O.",
+			"inputSchema": objectSchema(map[string]any{
+				"env_id":     stringProp(),
+				"path":       stringProp(),
+				"algorithms": stringArrayProp(),
+			}, "env_id", "path"),
+		},
+		{
+			"name":        "file_type",
+			"description": "Identify a workspace file from magic bytes: ELF, PE, Mach-O, archives, documents, images, SQLite, WASM, text.",
+			"inputSchema": objectSchema(map[string]any{
+				"env_id": stringProp(),
+				"path":   stringProp(),
+			}, "env_id", "path"),
+		},
+		{
+			"name":        "file_strings",
+			"description": "Extract printable ASCII and UTF-16LE strings with offsets from a file.",
+			"inputSchema": objectSchema(map[string]any{
+				"env_id":   stringProp(),
+				"path":     stringProp(),
+				"min_len":  intProp(),
+				"encoding": map[string]any{"type": "string", "enum": []string{"ascii", "utf16le", "both"}},
+				"limit":    intProp(),
+				"offset":   intProp(),
+				"length":   intProp(),
+			}, "env_id", "path"),
+		},
+		{
+			"name":        "file_hexdump",
+			"description": "Hex and ASCII dump of a byte range in a workspace file.",
+			"inputSchema": objectSchema(map[string]any{
+				"env_id": stringProp(),
+				"path":   stringProp(),
+				"offset": intProp(),
+				"length": intProp(),
+				"width":  intProp(),
+			}, "env_id", "path"),
+		},
+		{
+			"name":        "file_entropy",
+			"description": "Entropy analysis with per-chunk values to spot packed, compressed or encrypted data.",
+			"inputSchema": objectSchema(map[string]any{
+				"env_id":     stringProp(),
+				"path":       stringProp(),
+				"offset":     intProp(),
+				"length":     intProp(),
+				"chunk_size": intProp(),
+			}, "env_id", "path"),
+		},
+		{
+			"name":        "file_search",
+			"description": "Search workspace file names or contents (literal or regex) with bounded walking and file reads.",
+			"inputSchema": objectSchema(map[string]any{
+				"env_id":           stringProp(),
+				"root":             stringProp(),
+				"pattern":          stringProp(),
+				"mode":             map[string]any{"type": "string", "enum": []string{"name", "content"}},
+				"glob":             stringProp(),
+				"case_sensitive":   boolProp(),
+				"regex":            boolProp(),
+				"max_results":      intProp(),
+				"max_file_bytes":   intProp(),
+				"include_hidden":   boolProp(),
+				"max_files_walked": intProp(),
+			}, "env_id", "pattern"),
+		},
+		{
+			"name":        "archive_list",
+			"description": "List entries in a zip, tar, tar.gz or gzip archive under the workspace.",
+			"inputSchema": objectSchema(map[string]any{
+				"env_id": stringProp(),
+				"path":   stringProp(),
+			}, "env_id", "path"),
+		},
+		{
+			"name":        "archive_extract",
+			"description": "Safely extract a zip/tar/tar.gz/gz archive into the workspace with traversal and size protection.",
+			"inputSchema": objectSchema(map[string]any{
+				"env_id":          stringProp(),
+				"path":            stringProp(),
+				"dest":            stringProp(),
+				"overwrite":       boolProp(),
+				"max_entries":     intProp(),
+				"max_total_bytes": intProp(),
+			}, "env_id", "path"),
+		},
+		{
+			"name":        "binary_info",
+			"description": "Inspect ELF, PE or Mach-O binaries: architecture, sections, imports and exploit mitigations.",
+			"inputSchema": objectSchema(map[string]any{
+				"env_id": stringProp(),
+				"path":   stringProp(),
+			}, "env_id", "path"),
+		},
+		{
+			"name":        "secret_scan",
+			"description": "Scan workspace text files for keys, tokens, JWTs, private key blocks and connection strings. Previews are redacted.",
+			"inputSchema": objectSchema(map[string]any{
+				"env_id":         stringProp(),
+				"root":           stringProp(),
+				"glob":           stringProp(),
+				"max_files":      intProp(),
+				"max_file_bytes": intProp(),
+				"include_hidden": boolProp(),
+			}, "env_id"),
+		},
+		{
+			"name":        "transform",
+			"description": "CTF data transforms: base64/base64url, hex, URL, HTML, hashes, HMAC, JWT decode, gzip, ROT13, XOR, UUID, random bytes.",
+			"inputSchema": objectSchema(map[string]any{
+				"op":          map[string]any{"type": "string", "enum": []string{"base64_encode", "base64_decode", "base64url_encode", "base64url_decode", "hex_encode", "hex_decode", "url_encode", "url_decode", "html_escape", "html_unescape", "hash", "hmac", "jwt_decode", "gzip", "gunzip", "rot13", "xor", "uuid", "random_bytes"}},
+				"data":        stringProp(),
+				"data_base64": stringProp(),
+				"key":         stringProp(),
+				"key_base64":  stringProp(),
+				"algorithm":   stringProp(),
+				"algorithms":  stringArrayProp(),
+				"length":      intProp(),
+				"xor_key":     stringProp(),
+			}, "op"),
 		},
 	}
 }

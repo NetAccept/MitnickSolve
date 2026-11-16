@@ -1,0 +1,50 @@
+{
+  "name": "net_dns",
+  "description": "Resolve A/AAAA/CNAME/MX/NS/TXT/SRV/PTR records, optionally through an explicit DNS server.",
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "env_id",
+      "name"
+    ],
+    "properties": {
+      "env_id": {
+        "type": "string",
+        "description": "Environment identifier returned by envd."
+      },
+      "name": {
+        "type": "string",
+        "description": "Hostname or address to query."
+      },
+      "type": {
+        "type": "string",
+        "description": "DNS record type to resolve.",
+        "enum": [
+          "A",
+          "AAAA",
+          "CNAME",
+          "MX",
+          "NS",
+          "TXT",
+          "SRV",
+          "PTR"
+        ],
+        "default": "A"
+      },
+      "server": {
+        "type": "string",
+        "description": "Optional DNS server as host:port; the environment resolver is used when omitted."
+      },
+      "timeout_ms": {
+        "type": "integer",
+        "description": "Query timeout in milliseconds.",
+        "minimum": 100,
+        "maximum": 30000,
+        "default": 5000
+      }
+    }
+  },
+  "capabilities": [
+    "net.egress"
+  ]
+}

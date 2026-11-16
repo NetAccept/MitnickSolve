@@ -1,0 +1,89 @@
+{
+  "name": "web_request",
+  "description": "Perform an environment-scoped HTTP(S) request with headers, JSON/form or base64 bodies, cookies, redirects, proxy and TLS controls.",
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "env_id",
+      "url"
+    ],
+    "properties": {
+      "env_id": {
+        "type": "string",
+        "description": "Environment identifier returned by envd."
+      },
+      "url": {
+        "type": "string",
+        "description": "Absolute http or https URL."
+      },
+      "method": {
+        "type": "string",
+        "description": "HTTP method; defaults to GET.",
+        "default": "GET"
+      },
+      "headers": {
+        "type": "object",
+        "description": "Request headers; Host is applied specially.",
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "body_base64": {
+        "type": "string",
+        "description": "Base64 request body (maximum 64 KiB; use exec/curl for larger uploads)."
+      },
+      "json": {
+        "description": "JSON value serialized as an application/json body; takes precedence over form and body_base64."
+      },
+      "form": {
+        "type": "object",
+        "description": "Form fields encoded as application/x-www-form-urlencoded.",
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "timeout_ms": {
+        "type": "integer",
+        "description": "Total request timeout in milliseconds.",
+        "minimum": 100,
+        "maximum": 120000,
+        "default": 30000
+      },
+      "max_bytes": {
+        "type": "integer",
+        "description": "Maximum response bytes to return (capped at 64 KiB so the base64 body fits one control frame).",
+        "minimum": 1,
+        "maximum": 65536,
+        "default": 65536
+      },
+      "follow_redirects": {
+        "type": "boolean",
+        "description": "Follow HTTP redirects.",
+        "default": true
+      },
+      "max_redirects": {
+        "type": "integer",
+        "description": "Maximum redirects to follow when enabled.",
+        "minimum": 0,
+        "maximum": 20,
+        "default": 10
+      },
+      "insecure_tls": {
+        "type": "boolean",
+        "description": "Skip TLS certificate verification.",
+        "default": false
+      },
+      "proxy": {
+        "type": "string",
+        "description": "Optional http or https proxy URL."
+      },
+      "user_agent": {
+        "type": "string",
+        "description": "User-Agent header to send."
+      }
+    }
+  },
+  "capabilities": [
+    "net.egress"
+  ]
+}

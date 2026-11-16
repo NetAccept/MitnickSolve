@@ -1,0 +1,27 @@
+{
+  "name": "finding_add",
+  "description": "Record or update a structured security finding in the shared assessment ledger: severity, asset, description, evidence, status, tags. Idempotent for the same title and asset.",
+  "input_schema": {
+    "type": "object",
+    "required": ["title"],
+    "properties": {
+      "title": {"type": "string", "description": "Short finding title (1-200 characters)."},
+      "severity": {
+        "type": "string",
+        "enum": ["info", "low", "medium", "high", "critical"],
+        "default": "info"
+      },
+      "asset": {"type": "string", "description": "Host, URL, file or service the finding applies to."},
+      "description": {"type": "string", "description": "What was observed and why it matters."},
+      "evidence": {"type": "string", "description": "Commands, responses, hashes or other evidence."},
+      "status": {
+        "type": "string",
+        "enum": ["open", "confirmed", "fixed", "false_positive"],
+        "default": "open"
+      },
+      "tags": {"type": "array", "items": {"type": "string"}},
+      "source": {"type": "string", "description": "Tool or workflow that produced the finding."}
+    }
+  },
+  "capabilities": ["state.shared"]
+}

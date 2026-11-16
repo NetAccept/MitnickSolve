@@ -21,7 +21,7 @@ use msk_ipc::{Client, methods};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap};
@@ -34,6 +34,188 @@ mod setup;
 const MAX_EVENTS: usize = 5000;
 const MAX_DETAIL_LINES: usize = 400;
 const MAX_CHAT_LINES: usize = 4000;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const BG: Color = Color::Rgb(12, 12, 14);
+const PANEL: Color = Color::Rgb(22, 22, 25);
+const ACCENT: Color = Color::Rgb(96, 165, 250);
+const TEXT: Color = Color::Rgb(228, 228, 231);
+const DIM: Color = Color::Rgb(128, 128, 138);
+const FAINT: Color = Color::Rgb(72, 72, 82);
+const GREEN: Color = Color::Rgb(74, 222, 128);
+const YELLOW: Color = Color::Rgb(250, 204, 21);
+const RED: Color = Color::Rgb(248, 113, 113);
+
+struct CommandEntry {
+    label: &'static str,
+    hint: &'static str,
+    command: &'static str,
+}
+
+const COMMANDS: &[CommandEntry] = &[
+    CommandEntry {
+        label: "New session",
+        hint: "start a fresh conversation",
+        command: "/new",
+    },
+    CommandEntry {
+        label: "Sessions",
+        hint: "switch to another session (tab)",
+        command: "/sessions",
+    },
+    CommandEntry {
+        label: "Resume latest",
+        hint: "restore the newest checkpoint",
+        command: "/resume",
+    },
+    CommandEntry {
+        label: "Provider and model",
+        hint: "choose provider, model, effort",
+        command: "/setup",
+    },
+    CommandEntry {
+        label: "Model",
+        hint: "pick a model preset",
+        command: "/models",
+    },
+    CommandEntry {
+        label: "Reasoning effort",
+        hint: "minimal, low, medium, high",
+        command: "/effort",
+    },
+    CommandEntry {
+        label: "Agent mode",
+        hint: "plan, investigate, exploit, harden, auto",
+        command: "/mode",
+    },
+    CommandEntry {
+        label: "Permission mode",
+        hint: "auto, manual, bypass",
+        command: "/permissions",
+    },
+    CommandEntry {
+        label: "Offline demo",
+        hint: "run a canned tool session",
+        command: "/demo",
+    },
+    CommandEntry {
+        label: "Terminal",
+        hint: "open the PTY workspace",
+        command: "/terminal",
+    },
+    CommandEntry {
+        label: "Event inspector",
+        hint: "show the raw event stream",
+        command: "/events",
+    },
+    CommandEntry {
+        label: "Pending approvals",
+        hint: "check queued tool approvals",
+        command: "/approvals",
+    },
+    CommandEntry {
+        label: "Assessment findings",
+        hint: "review severity-ranked findings",
+        command: "/findings",
+    },
+    CommandEntry {
+        label: "Clear transcript",
+        hint: "hide messages in this view",
+        command: "/clear",
+    },
+    CommandEntry {
+        label: "Keyboard shortcuts",
+        hint: "open the help overlay",
+        command: "/help",
+    },
+    CommandEntry {
+        label: "Quit",
+        hint: "leave MitnickSolve",
+        command: "/quit",
+    },
+];
+
+/// Seven-row pixel glyphs for the home wordmark. `1` is an inked cell.
+const WORDMARK: &[(&str, [&str; 7])] = &[
+    (
+        "M",
+        [
+            "10001", "11011", "10101", "10101", "10001", "10001", "10001",
+        ],
+    ),
+    (
+        "I",
+        [
+            "11111", "00100", "00100", "00100", "00100", "00100", "11111",
+        ],
+    ),
+    (
+        "T",
+        [
+            "11111", "00100", "00100", "00100", "00100", "00100", "00100",
+        ],
+    ),
+    (
+        "N",
+        [
+            "10001", "11001", "10101", "10101", "10011", "10001", "10001",
+        ],
+    ),
+    (
+        "I",
+        [
+            "11111", "00100", "00100", "00100", "00100", "00100", "11111",
+        ],
+    ),
+    (
+        "C",
+        [
+            "01111", "10000", "10000", "10000", "10000", "10000", "01111",
+        ],
+    ),
+    (
+        "K",
+        [
+            "10001", "10010", "10100", "11000", "10100", "10010", "10001",
+        ],
+    ),
+    (
+        "S",
+        [
+            "01111", "10000", "10000", "01110", "00001", "00001", "11110",
+        ],
+    ),
+    (
+        "O",
+        [
+            "01110", "10001", "10001", "10001", "10001", "10001", "01110",
+        ],
+    ),
+    (
+        "L",
+        [
+            "10000", "10000", "10000", "10000", "10000", "10000", "11111",
+        ],
+    ),
+    (
+        "V",
+        [
+            "10001", "10001", "10001", "10001", "10001", "01010", "00100",
+        ],
+    ),
+    (
+        "E",
+        [
+            "11111", "10000", "10000", "11110", "10000", "10000", "11111",
+        ],
+    ),
+];
+
+#[derive(Debug, Clone, Default)]
+struct PaletteState {
+    query: String,
+    selected: usize,
+}
 
 const PROVIDERS: &[(&str, &str)] = &[
     (
@@ -49,6 +231,45 @@ const PROVIDERS: &[(&str, &str)] = &[
 ];
 
 const MODELS: &[&str] = &["gpt-5", "gpt-5-mini", "o3", "o4-mini", "custom…"];
+const PERMISSIONS: &[(&str, &str)] = &[
+    (
+        "auto",
+        "自动：写入/扫描/HTTP 自动放行，命令和原始连接需审批",
+    ),
+    ("manual", "手动：所有受控工具都询问"),
+    ("bypass", "放行：不弹审批；硬性策略拒绝仍然有效"),
+];
+
+#[derive(Debug, Clone, Deserialize)]
+struct ModeInfo {
+    id: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    description: String,
+}
+
+fn fallback_modes() -> Vec<ModeInfo> {
+    [
+        ("auto", "自动", "route to the least-invasive mode that fits"),
+        ("plan", "计划", "read-only: produce a plan, execute nothing"),
+        (
+            "investigate",
+            "调查",
+            "read-only recon and evidence collection",
+        ),
+        ("exploit", "攻击", "authorized active testing, approvals on"),
+        ("harden", "加固", "defensive remediation and verification"),
+    ]
+    .into_iter()
+    .map(|(id, label, description)| ModeInfo {
+        id: id.into(),
+        label: label.into(),
+        description: description.into(),
+    })
+    .collect()
+}
+
 const EFFORTS: &[(&str, &str)] = &[
     ("default", "let the provider decide"),
     ("minimal", "fastest / least reasoning"),
@@ -65,6 +286,48 @@ fn default_effort() -> String {
     "default".into()
 }
 
+fn default_mode() -> String {
+    "auto".into()
+}
+
+fn default_permission() -> String {
+    "auto".into()
+}
+
+fn permission_index(permission: &str) -> usize {
+    PERMISSIONS
+        .iter()
+        .position(|(id, _)| *id == permission)
+        .unwrap_or(0)
+}
+
+fn permission_label(permission: &str) -> &'static str {
+    match permission {
+        "manual" => "手动",
+        "bypass" => "放行",
+        _ => "自动",
+    }
+}
+
+fn permission_color(permission: &str) -> Color {
+    match permission {
+        "manual" => YELLOW,
+        "bypass" => RED,
+        _ => GREEN,
+    }
+}
+
+fn mode_color(mode: &str) -> Color {
+    match mode {
+        "plan" => ACCENT,
+        "investigate" => GREEN,
+        "exploit" | "attack" => RED,
+        "harden" => YELLOW,
+        "auto" => DIM,
+        _ => Color::Rgb(167, 139, 250),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TuiConfig {
     #[serde(default = "default_provider")]
@@ -75,6 +338,10 @@ struct TuiConfig {
     effort: String,
     #[serde(default)]
     base_url: String,
+    #[serde(default = "default_mode")]
+    mode: String,
+    #[serde(default = "default_permission")]
+    permission: String,
 }
 
 impl Default for TuiConfig {
@@ -84,6 +351,8 @@ impl Default for TuiConfig {
             model: String::new(),
             effort: default_effort(),
             base_url: String::new(),
+            mode: default_mode(),
+            permission: default_permission(),
         }
     }
 }
@@ -292,6 +561,21 @@ struct Cli {
     /// Diagnostic: open the setup wizard at provider, model, effort, or base.
     #[arg(long, value_parser = ["provider", "model", "effort", "base"])]
     setup_step: Option<String>,
+    /// Diagnostic: render the command palette in a snapshot.
+    #[arg(long, hide = true)]
+    snapshot_palette: bool,
+    /// Diagnostic: render the session switcher in a snapshot.
+    #[arg(long, hide = true)]
+    snapshot_sessions: bool,
+    /// Diagnostic: render the assessment findings overlay in a snapshot.
+    #[arg(long, hide = true)]
+    snapshot_findings: bool,
+    /// Diagnostic: render the agent mode picker in a snapshot.
+    #[arg(long, hide = true)]
+    snapshot_modes: bool,
+    /// Diagnostic: render the permission picker in a snapshot.
+    #[arg(long, hide = true)]
+    snapshot_permissions: bool,
     /// Print environment/daemon diagnostics and exit.
     #[arg(long)]
     doctor: bool,
@@ -724,7 +1008,6 @@ struct DaemonApp {
     terminal_data: Option<DataClient>,
     terminal_size: Cell<(u16, u16)>,
     terminal_focus: bool,
-    follow: bool,
     show_help: bool,
     status: String,
     refresh_ms: u64,
@@ -733,6 +1016,9 @@ struct DaemonApp {
     model: String,
     effort: String,
     base_url: String,
+    mode: String,
+    modes: Vec<ModeInfo>,
+    permission: String,
     daemon_llm_key: bool,
     daemon_llm_model: Option<String>,
     daemon_workspace: Option<String>,
@@ -747,6 +1033,15 @@ struct DaemonApp {
     history_index: Option<usize>,
     show_events: bool,
     show_sessions: bool,
+    palette: Option<PaletteState>,
+    spin: Cell<usize>,
+    findings: Vec<Value>,
+    show_findings: bool,
+    findings_scroll: usize,
+    show_modes: bool,
+    mode_selection: usize,
+    show_permissions: bool,
+    permission_selection: usize,
 }
 
 impl DaemonApp {
@@ -773,9 +1068,26 @@ impl DaemonApp {
             .and_then(|llm| llm.get("effort"))
             .and_then(Value::as_str)
             .map(str::to_string);
+        let modes: Vec<ModeInfo> = hello
+            .get("modes")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| serde_json::from_value::<ModeInfo>(item.clone()).ok())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|modes| !modes.is_empty())
+            .unwrap_or_else(fallback_modes);
         client.subscribe(None)?;
         let configured = root.join("tui-config.json").exists();
         let mut config = TuiConfig::load(&root);
+        if !modes.iter().any(|mode| mode.id == config.mode) {
+            config.mode = default_mode();
+        }
+        if !PERMISSIONS.iter().any(|(id, _)| *id == config.permission) {
+            config.permission = default_permission();
+        }
         if let Some(provider) = provider {
             config.provider = provider;
         } else if !configured && daemon_llm_key {
@@ -814,15 +1126,17 @@ impl DaemonApp {
             terminal_data: None,
             terminal_size: Cell::new((0, 0)),
             terminal_focus: false,
-            follow: true,
             show_help: false,
-            status: "connected".into(),
+            status: String::new(),
             refresh_ms,
             last_refresh: Instant::now(),
             provider: config.provider,
             model: config.model,
             effort: config.effort,
             base_url: config.base_url,
+            mode: config.mode,
+            modes,
+            permission: config.permission,
             daemon_llm_key,
             daemon_llm_model,
             daemon_workspace,
@@ -837,18 +1151,30 @@ impl DaemonApp {
             history_index: None,
             show_events: false,
             show_sessions: false,
+            palette: None,
+            spin: Cell::new(0),
+            findings: Vec::new(),
+            show_findings: false,
+            findings_scroll: 0,
+            show_modes: false,
+            mode_selection: 0,
+            show_permissions: false,
+            permission_selection: 0,
         };
         app.reload_tasks()?;
         let _ = app.reload_approvals();
+        if !app.tasks.is_empty() {
+            app.selected_task = app.tasks.len() - 1;
+        }
         if let Some(task_id) = app.selected_task_id() {
             app.load_transcript(&task_id);
         } else if !configured {
             app.setup = Some(SetupState::from_app(&app));
-            app.status = "first run: choose a provider; scripted-demo works offline".into();
+            app.status = "welcome · pick a provider, or Esc to try the offline demo".into();
         } else {
             app.new_task = true;
             app.composing = true;
-            app.status = "describe a challenge to start".into();
+            app.status = String::new();
         }
         Ok(app)
     }
@@ -879,6 +1205,57 @@ impl DaemonApp {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        Ok(())
+    }
+
+    fn save_config(&mut self) {
+        let config = TuiConfig {
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            base_url: self.base_url.clone(),
+            mode: self.mode.clone(),
+            permission: self.permission.clone(),
+        };
+        if let Err(err) = config.save(&self.root) {
+            self.status = format!("save config failed: {err}");
+        }
+    }
+
+    fn load_findings(&mut self) -> Result<()> {
+        let result = self.client.request(methods::BLACKBOARD_LIST, json!({}))?;
+        let mut findings: Vec<Value> = result
+            .get("entries")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| {
+                        entry
+                            .get("key")
+                            .and_then(Value::as_str)
+                            .is_some_and(|key| key.starts_with("finding:"))
+                    })
+                    .filter_map(|entry| entry.get("value").cloned())
+                    .filter(Value::is_object)
+                    .collect()
+            })
+            .unwrap_or_default();
+        findings.sort_by(|left, right| {
+            let left_key = (
+                finding_rank(left.get("severity").and_then(Value::as_str).unwrap_or("")),
+                left.get("recorded_ms").and_then(Value::as_u64).unwrap_or(0),
+            );
+            let right_key = (
+                finding_rank(right.get("severity").and_then(Value::as_str).unwrap_or("")),
+                right
+                    .get("recorded_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            );
+            right_key.cmp(&left_key)
+        });
+        self.findings = findings;
         Ok(())
     }
 
@@ -980,7 +1357,7 @@ impl DaemonApp {
                             ) {
                                 Ok(_) => {
                                     self.pending_initial = None;
-                                    self.status = "initial prompt sent".into();
+                                    self.status.clear();
                                 }
                                 Err(err) => {
                                     self.status = format!("initial prompt failed: {err}");
@@ -1324,7 +1701,7 @@ impl DaemonApp {
         ) {
             Ok(_) => {
                 self.pending_initial = None;
-                self.status = "initial prompt sent".into();
+                self.status.clear();
             }
             Err(err) => {
                 self.status = format!("initial prompt failed: {err}");
@@ -1367,6 +1744,65 @@ impl DaemonApp {
             .unwrap_or("?")
     }
 
+    fn selected_mode(&self) -> String {
+        self.tasks
+            .get(self.selected_task)
+            .and_then(|task| task.get("mode"))
+            .and_then(Value::as_str)
+            .unwrap_or(&self.mode)
+            .to_string()
+    }
+
+    fn display_mode(&self) -> String {
+        if self.new_task || self.selected_task_id().is_none() {
+            self.mode.clone()
+        } else {
+            self.selected_mode()
+        }
+    }
+
+    fn display_permission(&self) -> String {
+        if self.new_task || self.selected_task_id().is_none() {
+            self.permission.clone()
+        } else {
+            self.tasks
+                .get(self.selected_task)
+                .and_then(|task| task.get("permission"))
+                .and_then(Value::as_str)
+                .unwrap_or(&self.permission)
+                .to_string()
+        }
+    }
+
+    fn mode_index(&self, mode: &str) -> usize {
+        self.modes
+            .iter()
+            .position(|entry| entry.id == mode)
+            .unwrap_or(0)
+    }
+
+    fn mode_label(&self, mode: &str) -> String {
+        self.modes
+            .iter()
+            .find(|entry| entry.id == mode)
+            .map(|entry| entry.label.clone())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| mode.to_string())
+    }
+
+    fn find_mode(&self, value: &str) -> Option<String> {
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        self.modes
+            .iter()
+            .find(|entry| {
+                entry.id.eq_ignore_ascii_case(value) || entry.label.eq_ignore_ascii_case(value)
+            })
+            .map(|entry| entry.id.clone())
+    }
+
     fn trim_chat(&mut self) {
         if self.chat.len() > MAX_CHAT_LINES {
             let excess = self.chat.len() - MAX_CHAT_LINES;
@@ -1378,9 +1814,6 @@ impl DaemonApp {
         self.composing = true;
         if self.selected_task_id().is_none() {
             self.new_task = true;
-            self.status = "new task: describe the challenge, Enter starts it".into();
-        } else {
-            self.status = "message: Enter sends, Esc leaves the editor".into();
         }
     }
 
@@ -1409,7 +1842,7 @@ impl DaemonApp {
                 self.remember_history(&text);
                 self.input.clear();
                 self.input_cursor = 0;
-                self.status = "message sent".into();
+                self.status.clear();
             }
             Err(err) => self.status = format!("send failed: {err}"),
         }
@@ -1431,9 +1864,9 @@ impl DaemonApp {
             "/sessions" => {
                 self.show_sessions = !self.show_sessions;
                 self.status = if self.show_sessions {
-                    "session list on".into()
+                    "sessions · ↑/↓ select · Enter switch · Esc close".into()
                 } else {
-                    "session list off".into()
+                    String::new()
                 };
             }
             "/models" | "/model" if argument.is_empty() => self.open_setup_at(SetupStep::Model),
@@ -1441,6 +1874,7 @@ impl DaemonApp {
                 self.model = argument.to_string();
                 self.status = format!("next session model: {}", self.model);
             }
+            "/effort" if argument.is_empty() => self.open_setup_at(SetupStep::Effort),
             "/effort" => {
                 let effort = if argument.is_empty() {
                     "default"
@@ -1449,9 +1883,58 @@ impl DaemonApp {
                 };
                 if matches!(effort, "default" | "minimal" | "low" | "medium" | "high") {
                     self.effort = effort.to_string();
+                    self.save_config();
                     self.status = format!("next session effort: {}", self.effort);
                 } else {
                     self.status = "usage: /effort default|minimal|low|medium|high".into();
+                }
+            }
+            "/mode" if argument.is_empty() => {
+                self.mode_selection = self.mode_index(&self.mode);
+                self.show_modes = true;
+                self.status = "agent mode · ↑/↓ choose · Enter apply · Esc cancel".into();
+            }
+            "/mode" => {
+                if let Some(mode) = self.find_mode(argument) {
+                    self.mode = mode;
+                    self.save_config();
+                    if self.selected_task_id().is_some() {
+                        self.new_task = true;
+                        self.composing = true;
+                        self.status =
+                            format!("new session mode: {} (send a message to start)", self.mode);
+                    } else {
+                        self.status = format!("next session mode: {}", self.mode);
+                    }
+                } else {
+                    self.status = "unknown mode; open /mode to list configured modes".into();
+                }
+            }
+            "/permissions" if argument.is_empty() => {
+                self.permission_selection = permission_index(&self.permission);
+                self.show_permissions = true;
+                self.status = "permissions · ↑/↓ choose · Enter apply · Esc cancel".into();
+            }
+            "/permissions" => {
+                let value = argument.trim();
+                let found = PERMISSIONS.iter().find(|(id, _)| {
+                    id.eq_ignore_ascii_case(value) || permission_label(id) == value
+                });
+                if let Some((id, _)) = found {
+                    self.permission = (*id).to_string();
+                    self.save_config();
+                    if self.selected_task_id().is_some() {
+                        self.new_task = true;
+                        self.composing = true;
+                        self.status = format!(
+                            "new session permission: {} (send a message to start)",
+                            self.permission
+                        );
+                    } else {
+                        self.status = format!("next session permission: {}", self.permission);
+                    }
+                } else {
+                    self.status = "usage: /permissions auto|manual|bypass".into();
                 }
             }
             "/demo" => {
@@ -1473,6 +1956,14 @@ impl DaemonApp {
             "/cancel" => self.cancel_task(),
             "/interrupt" => self.interrupt_task(),
             "/terminal" => self.toggle_terminal(),
+            "/events" => {
+                self.show_events = !self.show_events;
+                self.status = if self.show_events {
+                    "event inspector on".into()
+                } else {
+                    String::new()
+                };
+            }
             "/approvals" => {
                 self.status = if self.approvals.is_empty() {
                     "no pending approvals".into()
@@ -1480,6 +1971,17 @@ impl DaemonApp {
                     format!("{} pending approval(s)", self.approvals.len())
                 };
             }
+            "/findings" => match self.load_findings() {
+                Ok(()) => {
+                    self.show_findings = true;
+                    self.findings_scroll = 0;
+                    self.status = format!(
+                        "{} finding(s) · j/k scroll · r reload · Esc close",
+                        self.findings.len()
+                    );
+                }
+                Err(err) => self.status = format!("findings failed: {err}"),
+            },
             "/provider" => {
                 let canonical = match argument {
                     "responses" => "openai-responses",
@@ -1490,6 +1992,7 @@ impl DaemonApp {
                     "scripted" | "scripted-demo" | "openai" | "openai-responses" | "component"
                 ) {
                     self.provider = canonical.to_string();
+                    self.save_config();
                     self.status = format!("next task provider: {}", self.provider);
                 } else {
                     self.status =
@@ -1584,6 +2087,8 @@ impl DaemonApp {
                 "goal": goal,
                 "demo": "session",
                 "provider": self.provider,
+                "mode": self.mode,
+                "permission": self.permission,
                 "interactive": true,
                 "stream": true,
                 "approvals": "ask"
@@ -1621,9 +2126,9 @@ impl DaemonApp {
                     None
                 };
                 self.status = if resume_checkpoint.is_some() {
-                    format!("resumed {task_id} with {}", self.provider)
+                    format!("session resumed · {}", self.provider)
                 } else {
-                    format!("created {task_id} with {}", self.provider)
+                    format!("session started · {}", self.provider)
                 };
                 if let Err(err) = self.reload_tasks() {
                     self.status = format!("reload failed: {err}");
@@ -1652,9 +2157,9 @@ impl DaemonApp {
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
                 {
-                    self.status = format!("interrupt sent to {task_id}");
+                    self.status = "interrupt sent".into();
                 } else {
-                    self.status = format!("{task_id} is not running a turn");
+                    self.status = "not running a turn".into();
                 }
             }
             Err(err) => self.status = format!("interrupt failed: {err}"),
@@ -1681,9 +2186,9 @@ impl DaemonApp {
                         || approval.get("id").and_then(Value::as_u64) != Some(id)
                 });
                 self.status = if approved {
-                    format!("approved {id} for {task_id}")
+                    "approved tool call".into()
                 } else {
-                    format!("denied {id} for {task_id}")
+                    "denied tool call".into()
                 };
             }
             Err(err) => self.status = format!("approval response failed: {err}"),
@@ -1849,6 +2354,182 @@ impl DaemonApp {
         false
     }
 
+    fn open_palette(&mut self) {
+        self.composing = false;
+        self.palette = Some(PaletteState::default());
+        self.status = "commands · type to filter · Enter run · Esc close".into();
+    }
+
+    fn palette_key(&mut self, key: KeyEvent) -> bool {
+        let Some(mut palette) = self.palette.take() else {
+            return false;
+        };
+        let filtered = filtered_commands(&palette.query);
+        match key.code {
+            KeyCode::Esc => {
+                self.status.clear();
+                return false;
+            }
+            KeyCode::Up => palette.selected = palette.selected.saturating_sub(1),
+            KeyCode::Down => {
+                if !filtered.is_empty() {
+                    palette.selected = (palette.selected + 1).min(filtered.len() - 1);
+                }
+            }
+            KeyCode::Enter => {
+                let Some(index) = filtered
+                    .get(palette.selected.min(filtered.len().saturating_sub(1)))
+                    .copied()
+                else {
+                    return false;
+                };
+                self.palette = None;
+                self.show_sessions = false;
+                self.run_command(COMMANDS[index].command);
+                return false;
+            }
+            KeyCode::Backspace => {
+                palette.query.pop();
+                palette.selected = 0;
+            }
+            KeyCode::Char(character)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !character.is_control() =>
+            {
+                palette.query.push(character);
+                palette.selected = 0;
+            }
+            _ => {}
+        }
+        let count = filtered_commands(&palette.query).len();
+        palette.selected = palette.selected.min(count.saturating_sub(1));
+        self.palette = Some(palette);
+        false
+    }
+
+    fn sessions_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc | KeyCode::Tab => {
+                self.show_sessions = false;
+                self.status.clear();
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.select_task(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.select_task(1),
+            KeyCode::Home | KeyCode::Char('g') => self.select_task_to(0),
+            KeyCode::End | KeyCode::Char('G') => {
+                let last = self.tasks.len().saturating_sub(1);
+                self.select_task_to(last);
+            }
+            KeyCode::Enter => {
+                self.show_sessions = false;
+                self.status.clear();
+                if let Some(task_id) = self.selected_task_id() {
+                    self.load_transcript(&task_id);
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn findings_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc | KeyCode::Tab => {
+                self.show_findings = false;
+                self.status.clear();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.findings_scroll = self.findings_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.findings_scroll = self
+                    .findings_scroll
+                    .saturating_add(1)
+                    .min(self.findings.len().saturating_sub(1));
+            }
+            KeyCode::Home | KeyCode::Char('g') => self.findings_scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => {
+                self.findings_scroll = self.findings.len().saturating_sub(1);
+            }
+            KeyCode::Char('r') => match self.load_findings() {
+                Ok(()) => {
+                    self.status = format!("{} finding(s)", self.findings.len());
+                }
+                Err(err) => self.status = format!("findings failed: {err}"),
+            },
+            _ => {}
+        }
+        false
+    }
+
+    fn mode_key(&mut self, key: KeyEvent) -> bool {
+        if self.modes.is_empty() {
+            self.show_modes = false;
+            return false;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.show_modes = false;
+                self.status.clear();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.mode_selection = self.mode_selection.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.mode_selection = (self.mode_selection + 1).min(self.modes.len() - 1);
+            }
+            KeyCode::Enter => {
+                self.mode = self.modes[self.mode_selection].id.clone();
+                self.save_config();
+                self.show_modes = false;
+                if self.selected_task_id().is_some() {
+                    self.new_task = true;
+                    self.composing = true;
+                    self.status =
+                        format!("new session mode: {} (send a message to start)", self.mode);
+                } else {
+                    self.status = format!("next session mode: {}", self.mode);
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn permission_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                self.show_permissions = false;
+                self.status.clear();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.permission_selection = self.permission_selection.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.permission_selection =
+                    (self.permission_selection + 1).min(PERMISSIONS.len() - 1);
+            }
+            KeyCode::Enter => {
+                self.permission = PERMISSIONS[self.permission_selection].0.to_string();
+                self.save_config();
+                self.show_permissions = false;
+                if self.selected_task_id().is_some() {
+                    self.new_task = true;
+                    self.composing = true;
+                    self.status = format!(
+                        "new session permission: {} (send a message to start)",
+                        self.permission
+                    );
+                } else {
+                    self.status = format!("next session permission: {}", self.permission);
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         if self.setup.is_some() {
             return self.setup_key(key);
@@ -1869,12 +2550,38 @@ impl DaemonApp {
             return false;
         }
 
+        if self.palette.is_some() {
+            return self.palette_key(key);
+        }
+
         if !self.approvals.is_empty() {
             match key.code {
                 KeyCode::Char('y') => self.respond_approval(true),
                 KeyCode::Char('n') | KeyCode::Esc => self.respond_approval(false),
-                KeyCode::Char('?') => self.show_help = !self.show_help,
                 _ => {}
+            }
+            return false;
+        }
+
+        if self.show_findings {
+            return self.findings_key(key);
+        }
+
+        if self.show_modes {
+            return self.mode_key(key);
+        }
+
+        if self.show_permissions {
+            return self.permission_key(key);
+        }
+
+        if self.show_sessions {
+            return self.sessions_key(key);
+        }
+
+        if self.show_help {
+            if matches!(key.code, KeyCode::Esc | KeyCode::F(1)) {
+                self.show_help = false;
             }
             return false;
         }
@@ -1883,39 +2590,48 @@ impl DaemonApp {
             return self.compose_key(key);
         }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            if self.selected_state() == "running" {
-                self.interrupt_task();
-            } else {
-                self.status = "press q to quit, or Enter to write".into();
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if control {
+            match key.code {
+                KeyCode::Char('p') => self.open_palette(),
+                KeyCode::Char('c') => {
+                    if self.selected_state() == "running" {
+                        self.interrupt_task();
+                    } else {
+                        self.close_terminal();
+                        return true;
+                    }
+                }
+                _ => {}
             }
-            return false;
-        }
-        if key.code == KeyCode::Esc && self.selected_state() == "running" {
-            self.interrupt_task();
             return false;
         }
 
         match key.code {
-            KeyCode::Char('q') => {
-                self.close_terminal();
-                return true;
+            KeyCode::Esc => {
+                if self.selected_state() == "running" {
+                    self.interrupt_task();
+                } else {
+                    self.show_help = false;
+                    self.status.clear();
+                }
             }
-            KeyCode::Enter | KeyCode::Char('i') => self.enter_compose(),
-            KeyCode::Char('?') => self.show_help = !self.show_help,
-            KeyCode::Char('j') | KeyCode::Down => self.select_task(1),
-            KeyCode::Char('k') | KeyCode::Up => self.select_task(-1),
-            KeyCode::Char('g') => self.select_task_to(0),
-            KeyCode::Char('G') => {
-                let last = self.tasks.len().saturating_sub(1);
-                self.select_task_to(last);
+            KeyCode::Tab => {
+                self.show_sessions = !self.show_sessions;
+                self.status = if self.show_sessions {
+                    "sessions · ↑/↓ select · Enter switch · Esc close".into()
+                } else {
+                    String::new()
+                };
             }
-            KeyCode::PageUp => {
+            KeyCode::F(1) => self.show_help = !self.show_help,
+            KeyCode::PageUp | KeyCode::Up => {
                 self.auto_scroll = false;
-                self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(10);
+                self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(5);
             }
-            KeyCode::PageDown => {
-                self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(10);
+            KeyCode::PageDown | KeyCode::Down => {
+                self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(5);
                 if self.scroll_from_bottom == 0 {
                     self.auto_scroll = true;
                 }
@@ -1924,54 +2640,11 @@ impl DaemonApp {
                 self.auto_scroll = true;
                 self.scroll_from_bottom = 0;
             }
-            KeyCode::Char('f') => self.follow = !self.follow,
-            KeyCode::Tab => {
-                self.show_sessions = !self.show_sessions;
-                self.status = if self.show_sessions {
-                    "session list on".into()
-                } else {
-                    "session list off".into()
-                };
-            }
-            KeyCode::Char('v') => {
-                self.show_events = !self.show_events;
-                self.status = if self.show_events {
-                    "event inspector on".into()
-                } else {
-                    "event inspector off".into()
-                };
-            }
-            KeyCode::Char('r') => {
-                if let Err(err) = self.reload_tasks() {
-                    self.status = format!("reload failed: {err}");
-                }
-            }
-            KeyCode::Char('n') => {
-                self.new_task = true;
-                self.composing = true;
-                self.input.clear();
-                self.input_cursor = 0;
-                self.status = "new task: describe the challenge, Enter starts it".into();
-            }
-            KeyCode::Char('p') => self.open_setup(),
-            KeyCode::Char('/') => {
-                self.composing = true;
-                self.input = "/".into();
-                self.input_cursor = 1;
-                self.status = "command: /new /provider /terminal /approvals /help".into();
-            }
-            KeyCode::Char('x') => self.cancel_task(),
-            KeyCode::Char('s') => self.interrupt_task(),
-            KeyCode::Char('a') => {
-                self.status = if self.approvals.is_empty() {
-                    "no pending approvals".into()
-                } else {
-                    format!("{} pending approval(s)", self.approvals.len())
-                };
-            }
-            KeyCode::Char('t') => {
-                self.composing = false;
-                self.toggle_terminal();
+            KeyCode::Enter => self.enter_compose(),
+            KeyCode::Char(character) if !alt && !character.is_control() => {
+                self.enter_compose();
+                self.input.insert(self.input_cursor, character);
+                self.input_cursor += character.len_utf8();
             }
             _ => {}
         }
@@ -1995,7 +2668,7 @@ impl DaemonApp {
                     streaming: false,
                 });
                 self.trim_chat();
-                self.status = format!("cancelled {task_id}");
+                self.status = "session cancelled".into();
             }
             Err(err) => self.status = format!("cancel failed: {err}"),
         }
@@ -2037,115 +2710,311 @@ impl DaemonApp {
         self.terminal = None;
     }
 
-    fn draw(&self, frame: &mut ratatui::Frame) {
-        let show_task_pane = self.show_sessions || self.tasks.len() > 1;
-        let task_height = if show_task_pane {
-            (self.tasks.len().min(5) as u16 + 2).max(3)
-        } else {
-            0
-        };
-        let areas = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Length(task_height),
-                Constraint::Min(1),
-                Constraint::Length(5),
-                Constraint::Length(1),
-            ])
-            .split(frame.area());
+    fn input_height(&self) -> u16 {
+        if !self.composing {
+            return 5;
+        }
+        let lines = self.input.matches('\n').count() as u16 + 1;
+        (lines + 4).clamp(5, 12)
+    }
 
-        let header = Paragraph::new(format!(
-            "MitnickSolve  {}  ·  {} / {} / effort {}  ·  {} session(s)\n{}",
-            self.daemon_workspace
-                .clone()
-                .or_else(|| {
-                    std::env::current_dir()
-                        .ok()
-                        .map(|path| path.display().to_string())
-                })
-                .unwrap_or_else(|| self.root.display().to_string()),
+    fn workspace_label(&self) -> String {
+        let path = self
+            .daemon_workspace
+            .clone()
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|path| path.display().to_string())
+            })
+            .unwrap_or_else(|| self.root.display().to_string());
+        let workspace = Path::new(&path);
+        if let Ok(cwd) = std::env::current_dir() {
+            if workspace == cwd {
+                return "~".into();
+            }
+            if let Ok(rest) = workspace.strip_prefix(&cwd) {
+                let rest = rest.display().to_string().replace('\\', "/");
+                if !rest.is_empty() {
+                    return format!("~/{rest}");
+                }
+            }
+        }
+        workspace
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&path)
+            .to_string()
+    }
+
+    fn draw(&self, frame: &mut ratatui::Frame) {
+        let area = frame.area();
+        frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
+
+        if self.terminal_focus {
+            self.draw_terminal(frame, area);
+            return;
+        }
+
+        let task_id = self.selected_task_id();
+        let has_messages = task_id
+            .as_ref()
+            .is_some_and(|task_id| self.chat.iter().any(|line| &line.task_id == task_id));
+        let home = self.new_task || task_id.is_none() || !has_messages;
+        let input_height = self.input_height();
+
+        let footer_area = Rect {
+            x: area.x,
+            y: area.bottom().saturating_sub(1),
+            width: area.width,
+            height: 1,
+        };
+        let input_width = if home {
+            88.min(area.width.saturating_sub(6)).max(24)
+        } else {
+            104.min(area.width.saturating_sub(4)).max(24)
+        };
+        let input_x = area.x + area.width.saturating_sub(input_width) / 2;
+        let (input_area, hints_area) = if home {
+            let target = area.y + ((area.height as u32 * 52 / 100) as u16);
+            let input_y = target
+                .min(area.bottom().saturating_sub(input_height + 2))
+                .max(area.y + 1);
+            (
+                Rect {
+                    x: input_x,
+                    y: input_y,
+                    width: input_width,
+                    height: input_height,
+                },
+                Rect {
+                    x: input_x,
+                    y: input_y + input_height,
+                    width: input_width,
+                    height: 1,
+                },
+            )
+        } else {
+            let hints_y = footer_area.y.saturating_sub(1);
+            (
+                Rect {
+                    x: input_x,
+                    y: hints_y.saturating_sub(input_height).max(area.y + 1),
+                    width: input_width,
+                    height: input_height,
+                },
+                Rect {
+                    x: input_x,
+                    y: hints_y,
+                    width: input_width,
+                    height: 1,
+                },
+            )
+        };
+
+        if home {
+            self.draw_home(frame, area, input_area);
+        } else {
+            self.draw_chat(frame, area, input_area);
+        }
+
+        let focused = self.setup.is_none()
+            && self.palette.is_none()
+            && self.approvals.is_empty()
+            && !self.show_sessions
+            && !self.show_findings
+            && !self.show_modes
+            && !self.show_permissions
+            && !self.show_help;
+        let modal = !focused;
+        if !modal {
+            self.draw_prompt(frame, input_area, focused);
+            self.draw_hints(frame, input_area, hints_area);
+        }
+        self.draw_footer(frame, footer_area);
+
+        if self.show_events {
+            let width = (area.width / 3).max(24).min(area.width);
+            let event_area = Rect {
+                x: area.right().saturating_sub(width + 1),
+                y: area.y + 1,
+                width,
+                height: input_area.y.saturating_sub(area.y + 2),
+            };
+            self.draw_events(frame, event_area);
+        }
+
+        if !focused {
+            dim_background(frame);
+        }
+        if self.show_help {
+            self.draw_help(frame, area);
+        }
+        if self.palette.is_some() {
+            self.draw_palette(frame, area);
+        }
+        if self.show_sessions {
+            self.draw_sessions(frame, area);
+        }
+        if self.show_findings {
+            self.draw_findings(frame, area);
+        }
+        if self.show_modes {
+            self.draw_modes(frame, area);
+        }
+        if self.show_permissions {
+            self.draw_permissions(frame, area);
+        }
+        if self.setup.is_some() {
+            self.draw_setup(frame);
+        }
+        if let Some(pending) = self.approvals.first() {
+            self.draw_approval(frame, area, pending);
+        }
+    }
+
+    fn draw_home(&self, frame: &mut ratatui::Frame, area: Rect, input_area: Rect) {
+        let mark = wordmark(area.width);
+        let mark_height = mark.len() as u16;
+        let group = mark_height + 3;
+        if input_area.y <= area.y + group {
+            return;
+        }
+        let mark_y = input_area.y.saturating_sub(group).max(area.y);
+        if mark_y + mark_height >= input_area.y {
+            return;
+        }
+        let mark_area = Rect {
+            x: area.x,
+            y: mark_y,
+            width: area.width,
+            height: mark_height,
+        };
+        frame.render_widget(
+            Paragraph::new(Text::from(mark)).alignment(Alignment::Center),
+            mark_area,
+        );
+
+        let mut chips: Vec<Span> = Vec::new();
+        chips.push(chip(
+            format!(" {} ", self.workspace_label()),
+            BG,
+            Color::Rgb(49, 49, 56),
+        ));
+        chips.push(Span::raw(" "));
+        chips.push(chip(
+            format!(" {} ", self.provider),
+            ACCENT,
+            Color::Rgb(24, 38, 58),
+        ));
+        if !self.model.is_empty() {
+            chips.push(Span::raw(" "));
+            chips.push(chip(
+                format!(" {} ", self.model),
+                GREEN,
+                Color::Rgb(20, 42, 30),
+            ));
+        }
+        if self.effort != "default" && !self.effort.is_empty() {
+            chips.push(Span::raw(" "));
+            chips.push(chip(
+                format!(" {} ", self.effort),
+                YELLOW,
+                Color::Rgb(43, 37, 20),
+            ));
+        }
+        let chip_area = Rect {
+            x: area.x,
+            y: mark_area.y + mark_height + 1,
+            width: area.width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(chips)).alignment(Alignment::Center),
+            chip_area,
+        );
+    }
+
+    fn draw_chat(&self, frame: &mut ratatui::Frame, area: Rect, input_area: Rect) {
+        let header_area = Rect {
+            x: area.x + 2,
+            y: area.y,
+            width: area.width.saturating_sub(4),
+            height: 1,
+        };
+        let state = self.selected_state();
+        let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let (state_text, state_color) = match state {
+            "running" => (
+                format!("{} running", spinner[(self.spin.get() / 2) % spinner.len()]),
+                ACCENT,
+            ),
+            "waiting_input" => ("● ready".to_string(), GREEN),
+            "failed" => ("✗ failed".to_string(), RED),
+            "cancelled" => ("✗ cancelled".to_string(), RED),
+            "done" => ("✓ done".to_string(), DIM),
+            other => (format!("● {other}"), DIM),
+        };
+        self.spin.set(self.spin.get().wrapping_add(1));
+        let right_text = format!(
+            "{} · {} · effort {}",
             self.provider,
             if self.model.is_empty() {
                 "-"
             } else {
                 &self.model
             },
-            self.effort,
-            self.tasks.len(),
-            self.status
-        ))
-        .block(Block::default().borders(Borders::ALL).title("session"));
-        frame.render_widget(header, areas[0]);
+            self.effort
+        );
+        let right_width = right_text.chars().count() as u16;
+        let left_width = header_area.width.saturating_sub(right_width + 2).max(12);
+        let left = Line::from(vec![
+            Span::styled("▌ ", Style::default().fg(ACCENT)),
+            Span::styled(
+                truncate(
+                    &self.selected_task_title(),
+                    left_width.saturating_sub(15) as usize,
+                ),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {state_text}"), Style::default().fg(state_color)),
+        ]);
+        frame.render_widget(
+            Paragraph::new(left),
+            Rect {
+                x: header_area.x,
+                y: header_area.y,
+                width: left_width,
+                height: 1,
+            },
+        );
+        let right = Line::from(Span::styled(right_text, Style::default().fg(FAINT)));
+        frame.render_widget(
+            Paragraph::new(right).alignment(Alignment::Right),
+            header_area,
+        );
+        let rule = Rect {
+            x: area.x + 2,
+            y: area.y + 1,
+            width: area.width.saturating_sub(4),
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new("─".repeat(rule.width as usize))
+                .style(Style::default().fg(Color::Rgb(38, 38, 44))),
+            rule,
+        );
 
-        let items: Vec<ListItem> = self
-            .tasks
-            .iter()
-            .map(|task| {
-                let interactive = task
-                    .get("interactive")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                ListItem::new(format!(
-                    "{} {:<12} {}",
-                    if interactive { "◆" } else { " " },
-                    task.get("state").and_then(Value::as_str).unwrap_or("?"),
-                    truncate(task.get("goal").and_then(Value::as_str).unwrap_or(""), 72)
-                ))
-            })
-            .collect();
-        let mut task_state = ListState::default();
-        if !items.is_empty() {
-            task_state.select(Some(self.selected_task.min(items.len() - 1)));
-        }
-        let tasks = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title("sessions"))
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-            .highlight_symbol("› ");
-        frame.render_stateful_widget(tasks, areas[1], &mut task_state);
-
-        if self.terminal_focus {
-            if let Some(terminal) = &self.terminal {
-                let area = areas[2];
-                let title = format!(
-                    "terminal {} {}x{}  [Ctrl+Q] detach",
-                    terminal.session_id, terminal.cols, terminal.rows
-                );
-                let block = Block::default().borders(Borders::ALL).title(title);
-                let inner = block.inner(area);
-                frame.render_widget(block, area);
-                self.terminal_size.set((inner.width, inner.height));
-                frame.render_widget(
-                    TerminalWidget {
-                        screen: terminal.screen(),
-                    },
-                    inner,
-                );
-                let screen = terminal.screen();
-                if !screen.hide_cursor() {
-                    let (row, col) = screen.cursor_position();
-                    if col < inner.width && row < inner.height {
-                        frame.set_cursor_position((inner.x + col, inner.y + row));
-                    }
-                }
-            }
-            frame.render_widget(
-                Paragraph::new("terminal focused: Ctrl+Q detach").style(Style::default()),
-                areas[3],
-            );
-            frame.render_widget(Paragraph::new("Ctrl+Q detach  q quit  ? help"), areas[4]);
+        let transcript_area = Rect {
+            x: area.x + 2,
+            y: area.y + 2,
+            width: area.width.saturating_sub(4),
+            height: input_area.y.saturating_sub(area.y + 3),
+        };
+        if transcript_area.width == 0 || transcript_area.height == 0 {
             return;
         }
-
-        let (conversation_area, event_area) = if self.show_events {
-            let panes = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(66), Constraint::Percentage(34)])
-                .split(areas[2]);
-            (panes[0], Some(panes[1]))
-        } else {
-            (areas[2], None)
-        };
 
         let task_id = self.selected_task_id();
         let mut transcript: Vec<Line> = Vec::new();
@@ -2154,241 +3023,881 @@ impl DaemonApp {
             .iter()
             .filter(|line| Some(line.task_id.as_str()) == task_id.as_deref())
         {
-            let (label, style) = match line.role {
-                ChatRole::User => ("you: ", Style::default().fg(Color::Cyan)),
-                ChatRole::Assistant => ("agent: ", Style::default().fg(Color::White)),
-                ChatRole::Tool => ("tool: ", Style::default().fg(Color::Yellow)),
-                ChatRole::System => (
-                    "",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
-                ),
-            };
             let parts: Vec<&str> = line.text.split('\n').collect();
-            for (index, part) in parts.iter().enumerate() {
-                let prefix = if index == 0 {
-                    label.to_string()
-                } else {
-                    " ".repeat(label.len())
-                };
-                let suffix = if line.streaming && index + 1 == parts.len() {
-                    "▍"
-                } else {
-                    ""
-                };
-                transcript.push(Line::from(vec![Span::styled(
-                    format!("{prefix}{part}{suffix}"),
-                    style,
-                )]));
+            match line.role {
+                ChatRole::User => {
+                    for (index, part) in parts.iter().enumerate() {
+                        let prefix = if index == 0 { "❯ " } else { "  " };
+                        transcript.push(Line::from(vec![
+                            Span::styled(prefix, Style::default().fg(ACCENT)),
+                            Span::styled((*part).to_string(), Style::default().fg(TEXT)),
+                        ]));
+                    }
+                }
+                ChatRole::Assistant => {
+                    for (index, part) in parts.iter().enumerate() {
+                        let suffix = if line.streaming && index + 1 == parts.len() {
+                            "▍"
+                        } else {
+                            ""
+                        };
+                        transcript.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled((*part).to_string(), Style::default().fg(TEXT)),
+                            Span::styled(suffix.to_string(), Style::default().fg(ACCENT)),
+                        ]));
+                    }
+                }
+                ChatRole::Tool => {
+                    let color = if line.text.starts_with('✓') {
+                        GREEN
+                    } else if line.text.starts_with('✗') {
+                        RED
+                    } else {
+                        DIM
+                    };
+                    transcript.push(Line::from(Span::styled(
+                        format!("  {}", line.text),
+                        Style::default().fg(color),
+                    )));
+                }
+                ChatRole::System => {
+                    if line.text.starts_with("turn end:") {
+                        continue;
+                    }
+                    for part in parts {
+                        transcript.push(Line::from(Span::styled(
+                            format!("  {part}"),
+                            Style::default().fg(FAINT).add_modifier(Modifier::ITALIC),
+                        )));
+                    }
+                }
             }
             transcript.push(Line::from(""));
         }
+
         if transcript.is_empty() {
-            let hint = if self.tasks.is_empty() {
-                "Welcome. Describe the challenge below and press Enter to start a task."
-            } else {
-                "No messages yet. Press Enter or i to write the first turn."
-            };
             transcript.push(Line::from(Span::styled(
-                hint,
-                Style::default().fg(Color::DarkGray),
+                "No messages yet. Type below to start.",
+                Style::default().fg(DIM),
             )));
-            transcript.push(Line::from(""));
-            transcript.push(Line::from(Span::styled(
-                "Examples:  inspect ./challenge and find the flag  ·  run the binary and explain the exploit",
-                Style::default().fg(Color::DarkGray),
-            )));
-            transcript.push(Line::from(Span::styled(
-                "Commands:  /new  /provider openai  /terminal  /approvals  /help",
-                Style::default().fg(Color::DarkGray),
-            )));
-            transcript.push(Line::from(Span::styled(
-                "Press p to choose provider, model and effort; /setup does the same.",
-                Style::default().fg(Color::DarkGray),
-            )));
-            if self.provider == "scripted-demo" {
-                transcript.push(Line::from(Span::styled(
-                    "Offline demo provider: replies are canned. Use /provider openai for a real model.",
-                    Style::default().fg(Color::Yellow),
-                )));
-            }
         }
-        let transcript_title = if task_id.is_some() {
-            format!(
-                "session — {} [{}]",
-                self.selected_task_title(),
-                self.selected_state()
-            )
+
+        let paragraph = Paragraph::new(Text::from(transcript)).wrap(Wrap { trim: false });
+        let line_count = paragraph.line_count(transcript_area.width);
+        let max_scroll = line_count.saturating_sub(transcript_area.height as usize);
+        let scroll = if self.auto_scroll {
+            max_scroll
         } else {
-            "session".to_string()
+            max_scroll.saturating_sub(self.scroll_from_bottom as usize)
         };
+        frame.render_widget(
+            paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+            transcript_area,
+        );
+    }
+
+    fn draw_prompt(&self, frame: &mut ratatui::Frame, area: Rect, focused: bool) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(transcript_title);
-        let inner = block.inner(conversation_area);
-        frame.render_widget(block, conversation_area);
-        let paragraph = Paragraph::new(Text::from(transcript)).wrap(Wrap { trim: false });
-        if inner.width > 0 && inner.height > 0 {
-            let line_count = paragraph.line_count(inner.width);
-            let max_scroll = line_count.saturating_sub(inner.height as usize);
-            let scroll = if self.auto_scroll {
-                max_scroll
-            } else {
-                max_scroll.saturating_sub(self.scroll_from_bottom as usize)
-            };
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().fg(FAINT))
+            .style(Style::default().bg(PANEL));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if area.height > 2 {
+            let rows = area.height - 2;
+            let bar = std::iter::repeat("│")
+                .take(rows as usize)
+                .collect::<Vec<_>>()
+                .join("\n");
             frame.render_widget(
-                paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
-                inner,
+                Paragraph::new(bar).style(Style::default().fg(ACCENT).bg(PANEL)),
+                Rect {
+                    x: area.x,
+                    y: area.y + 1,
+                    width: 1,
+                    height: rows,
+                },
             );
         }
-
-        if let Some(event_area) = event_area {
-            let visible = self.selected_events();
-            let event_items: Vec<ListItem> = visible
-                .iter()
-                .rev()
-                .take(400)
-                .map(|index| {
-                    let (_, event) = &self.events[*index];
-                    ListItem::new(format!(
-                        "{}  {:<18} {}",
-                        short_time(&event.ts),
-                        event.kind,
-                        summarize(event, 60)
-                    ))
-                })
-                .collect();
-            let event_list = List::new(event_items)
-                .block(Block::default().borders(Borders::ALL).title("events"));
-            frame.render_widget(event_list, event_area);
+        if inner.width < 2 || inner.height < 3 {
+            return;
         }
 
-        let input_title = if self.new_task || task_id.is_none() {
-            format!("new session — provider {}", self.provider)
-        } else {
-            format!(
-                "message · {} [{}]",
-                self.selected_task_title(),
-                self.selected_state()
-            )
+        let meta_y = inner.y + inner.height - 1;
+        let input_rows = inner.height.saturating_sub(2).max(1);
+        let input_area = Rect {
+            x: inner.x + 1,
+            y: inner.y,
+            width: inner.width.saturating_sub(1),
+            height: input_rows,
         };
-        let input_block = Block::default().borders(Borders::ALL).title(input_title);
-        let input_inner = input_block.inner(areas[3]);
-        frame.render_widget(input_block, areas[3]);
-        if self.composing {
+
+        if self.input.is_empty() {
+            let placeholder = if self.new_task || self.selected_task_id().is_none() {
+                "Ask anything…  \"inspect ./challenge and find the flag\""
+            } else {
+                "Reply…   Shift+Enter for a new line"
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    placeholder,
+                    Style::default().fg(DIM).bg(PANEL),
+                ))),
+                input_area,
+            );
+            if focused {
+                frame.set_cursor_position((input_area.x, input_area.y));
+            }
+        } else {
             let before = &self.input[..self.input_cursor];
             let row = before.matches('\n').count();
             let line_start = before.rfind('\n').map(|index| index + 1).unwrap_or(0);
             let cursor_cols = UnicodeWidthStr::width(&self.input[line_start..self.input_cursor]);
             let lines: Vec<&str> = self.input.split('\n').collect();
-            let visible_rows = input_inner.height.max(1) as usize;
-            let start_line = row.saturating_sub(visible_rows.saturating_sub(1));
+            let start_line = row.saturating_sub(input_rows.saturating_sub(1) as usize);
             let display = lines
                 .iter()
                 .skip(start_line)
-                .take(visible_rows)
+                .take(input_rows as usize)
                 .copied()
                 .collect::<Vec<_>>()
                 .join("\n");
-            let display = if display.is_empty() {
-                "Describe the challenge…".to_string()
-            } else {
-                display
-            };
-            frame.render_widget(Paragraph::new(format!("> {display}")), input_inner);
-            if input_inner.width > 2 && input_inner.height > 0 {
-                let x = input_inner.x + 2 + (cursor_cols as u16);
-                let y = input_inner.y + (row - start_line) as u16;
+            frame.render_widget(
+                Paragraph::new(display).style(Style::default().fg(TEXT).bg(PANEL)),
+                input_area,
+            );
+            if focused {
+                let x = input_area.x + cursor_cols as u16;
+                let y = input_area.y + (row - start_line) as u16;
                 frame.set_cursor_position((
-                    x.min(input_inner.right().saturating_sub(1)),
-                    y.min(input_inner.bottom().saturating_sub(1)),
+                    x.min(input_area.right().saturating_sub(1)),
+                    y.min(input_area.bottom().saturating_sub(1)),
                 ));
             }
-        } else {
-            let hint = if self.new_task || task_id.is_none() {
-                "Describe the challenge…  (Enter starts a task, / commands)"
+        }
+
+        let display_mode = self.display_mode();
+        let mut meta = vec![Span::styled(
+            format!(" {}", self.mode_label(&display_mode)),
+            Style::default()
+                .fg(mode_color(&display_mode))
+                .bg(PANEL)
+                .add_modifier(Modifier::BOLD),
+        )];
+        meta.push(Span::styled(" · ", Style::default().fg(FAINT).bg(PANEL)));
+        meta.push(Span::styled(
+            self.provider.clone(),
+            Style::default().fg(TEXT).bg(PANEL),
+        ));
+        if !self.model.is_empty() {
+            meta.push(Span::styled(" · ", Style::default().fg(FAINT).bg(PANEL)));
+            meta.push(Span::styled(
+                self.model.clone(),
+                Style::default().fg(GREEN).bg(PANEL),
+            ));
+        }
+        if self.effort != "default" && !self.effort.is_empty() {
+            meta.push(Span::styled(" · ", Style::default().fg(FAINT).bg(PANEL)));
+            meta.push(Span::styled(
+                format!("effort {}", self.effort),
+                Style::default().fg(DIM).bg(PANEL),
+            ));
+        }
+        if requires_key(&self.provider) && !self.daemon_llm_key {
+            meta.push(Span::styled("  ·  ", Style::default().fg(FAINT).bg(PANEL)));
+            meta.push(Span::styled(
+                "missing MSK_LLM_API_KEY",
+                Style::default().fg(YELLOW).bg(PANEL),
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(meta)),
+            Rect {
+                x: inner.x + 1,
+                y: meta_y,
+                width: inner.width.saturating_sub(1),
+                height: 1,
+            },
+        );
+    }
+
+    fn draw_hints(&self, frame: &mut ratatui::Frame, input_area: Rect, hints_area: Rect) {
+        let hints_width = 40.min(hints_area.width).max(1);
+        let hints = Line::from(vec![
+            Span::styled(
+                "tab",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" sessions   ", Style::default().fg(DIM)),
+            Span::styled(
+                "ctrl+p",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" commands   ", Style::default().fg(DIM)),
+            Span::styled("F1", Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+            Span::styled(" help", Style::default().fg(DIM)),
+        ]);
+        let hint_area = Rect {
+            x: input_area.right().saturating_sub(hints_width + 1),
+            y: hints_area.y,
+            width: hints_width,
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(hints), hint_area);
+
+        if !self.status.is_empty() {
+            let width = input_area.width.saturating_sub(hints_width + 5).max(1);
+            let color = if self.status.contains("failed") || self.status.contains("error") {
+                RED
+            } else if self.status.contains("missing") || self.status.contains("needs") {
+                YELLOW
             } else {
-                "press Enter or i to write  ·  / commands"
+                DIM
             };
             frame.render_widget(
-                Paragraph::new(format!("> {hint}")).style(Style::default().fg(Color::DarkGray)),
-                input_inner,
+                Paragraph::new(truncate(&self.status, width as usize))
+                    .style(Style::default().fg(color)),
+                Rect {
+                    x: input_area.x + 2,
+                    y: hints_area.y,
+                    width,
+                    height: 1,
+                },
             );
         }
+    }
 
-        let footer = if !self.approvals.is_empty() {
-            "APPROVAL PENDING: y approve  n deny"
-        } else if self.composing {
-            if self.new_task || task_id.is_none() {
-                "Enter start task  Esc cancel  Shift+Enter newline  / commands"
-            } else {
-                "Enter send  Shift+Enter newline  Esc close editor  Ctrl+U clear  / commands"
-            }
-        } else if self.selected_state() == "running" {
-            "running · Esc interrupt · Enter/i message · / commands · PgUp/PgDn scroll · ? help · q quit"
-        } else {
-            "Enter/i message  n new  / commands  Tab sessions  PgUp/PgDn scroll  v events  s interrupt  ? help  q quit"
+    fn draw_footer(&self, frame: &mut ratatui::Frame, area: Rect) {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(self.workspace_label(), Style::default().fg(FAINT)),
+                Span::styled("  ·  ", Style::default().fg(FAINT)),
+                Span::styled(
+                    format!("权限 {}", permission_label(&self.display_permission())),
+                    Style::default().fg(permission_color(&self.display_permission())),
+                ),
+            ])),
+            Rect {
+                x: area.x + 2,
+                y: area.y,
+                width: area.width.saturating_sub(4),
+                height: 1,
+            },
+        );
+        let right = format!("MitnickSolve {VERSION}");
+        let width = right.chars().count() as u16;
+        if area.width > width + 4 {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(right, Style::default().fg(FAINT))))
+                    .alignment(Alignment::Right),
+                Rect {
+                    x: area.x + 2,
+                    y: area.y,
+                    width: area.width.saturating_sub(4),
+                    height: 1,
+                },
+            );
+        }
+    }
+
+    fn draw_events(&self, frame: &mut ratatui::Frame, area: Rect) {
+        if area.width < 8 || area.height < 3 {
+            return;
+        }
+        let visible = self.selected_events();
+        let items: Vec<ListItem> = visible
+            .iter()
+            .rev()
+            .take(area.height as usize)
+            .map(|index| {
+                let (_, event) = &self.events[*index];
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{} ", short_time(&event.ts)),
+                        Style::default().fg(FAINT),
+                    ),
+                    Span::styled(event.kind.clone(), Style::default().fg(DIM)),
+                    Span::styled(
+                        format!("  {}", summarize(event, 48)),
+                        Style::default().fg(FAINT),
+                    ),
+                ]))
+            })
+            .collect();
+        frame.render_widget(Clear, area);
+        let list = List::new(items).block(panel_block("events", DIM));
+        frame.render_widget(list, area);
+    }
+
+    fn draw_help(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let area = centered_rect(70, 66, area);
+        frame.render_widget(Clear, area);
+        let lines = vec![
+            help_line("Enter", "write a message / send"),
+            help_line("Shift+Enter", "insert a newline"),
+            help_line("Esc", "interrupt a running turn or close the editor"),
+            help_line("Tab", "open the session switcher"),
+            help_line("Ctrl+P", "command palette"),
+            help_line("F1", "toggle this help"),
+            help_line("↑ / ↓", "scroll the transcript"),
+            help_line("PgUp / PgDn", "scroll faster"),
+            help_line("y / n", "approve or deny a pending tool call"),
+            help_line("Ctrl+Q", "detach from the terminal"),
+            help_line("Ctrl+C", "interrupt the turn, or quit when idle"),
+            Line::from(""),
+            Line::from(Span::styled(
+                "The agent runs in the daemon. Every tool call goes through envd;",
+                Style::default().fg(DIM),
+            )),
+            Line::from(Span::styled(
+                "the working directory is your project unless --workspace says otherwise.",
+                Style::default().fg(DIM),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(panel_block("keyboard shortcuts", ACCENT))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    fn draw_palette(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let Some(palette) = &self.palette else {
+            return;
         };
-        frame.render_widget(Paragraph::new(footer), areas[4]);
-
-        if self.show_help {
-            let area = centered_rect(70, 62, frame.area());
-            frame.render_widget(Clear, area);
-            let help = Paragraph::new(
-                "mskd conversational workbench\n\n\
-                 Enter / i  write a message to the selected task\n\
-                 Enter      send (in the editor)\n\
-                 Esc        leave the editor without sending\n\
-                 ← / →      move the input cursor\n\
-                 Ctrl+U     clear the input\n\
-                 s          interrupt the running turn\n\
-                 a          show pending approvals\n\
-                 y / n      approve / deny the modal request\n\
-                 j / k      previous / next session\n\
-                 g / G      first / last session\n\
-                 n          create an interactive scripted task\n\
-                 x          cancel the selected task\n\
-                 t          open/focus the PTY terminal\n\
-                 Ctrl+Q     detach from terminal focus\n\
-                 r          reload the task list\n\
-                 f          follow new events\n\
-                 a          show pending approvals\n\
-                 ?          toggle this help\n\n\
-                 ◆ marks an interactive task. Messages are accepted while the\n\
-                 task is waiting_input; agent.text and turn.end stream over IPC.",
-            )
-            .block(Block::default().borders(Borders::ALL).title("help"))
-            .wrap(Wrap { trim: false });
-            frame.render_widget(help, area);
+        let width = 76.min(area.width.saturating_sub(6)).max(24);
+        let height = (COMMANDS.len() as u16 + 6)
+            .min(area.height.saturating_sub(4))
+            .max(8);
+        let area = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, area);
+        let block = panel_block("commands", ACCENT);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width < 6 || inner.height < 4 {
+            return;
         }
-
-        if self.setup.is_some() {
-            self.draw_setup(frame);
-        }
-
-        if let Some(pending) = self.approvals.first() {
-            let id = pending.get("id").and_then(Value::as_u64).unwrap_or(0);
-            let tool = pending.get("tool").and_then(Value::as_str).unwrap_or("?");
-            let reason = pending
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let args = serde_json::to_string_pretty(pending.get("args").unwrap_or(&Value::Null))
-                .unwrap_or_default();
-            let area = centered_rect(78, 58, frame.area());
-            frame.render_widget(Clear, area);
-            let text = format!(
-                "tool: {tool}\nreason: {reason}\n\nargs:\n{args}\n\n[y] approve   [n] deny"
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("❯ ", Style::default().fg(ACCENT)),
+                Span::styled(palette.query.clone(), Style::default().fg(TEXT)),
+                Span::styled("▌", Style::default().fg(ACCENT)),
+                Span::styled(
+                    if palette.query.is_empty() {
+                        "  type a command"
+                    } else {
+                        ""
+                    },
+                    Style::default().fg(FAINT),
+                ),
+            ])),
+            Rect {
+                x: inner.x + 1,
+                y: inner.y,
+                width: inner.width.saturating_sub(2),
+                height: 1,
+            },
+        );
+        let filtered = filtered_commands(&palette.query);
+        let list_area = Rect {
+            x: inner.x,
+            y: inner.y + 2,
+            width: inner.width,
+            height: inner.height.saturating_sub(3),
+        };
+        if filtered.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "  no matching command",
+                    Style::default().fg(DIM),
+                )),
+                list_area,
             );
-            let paragraph = Paragraph::new(text)
-                .block(Block::default().borders(Borders::ALL).title(format!(
-                    "approval required · 1/{} · #{}",
-                    self.approvals.len(),
-                    id
-                )))
-                .wrap(Wrap { trim: false });
-            frame.render_widget(paragraph, area);
+            return;
+        }
+        let items: Vec<ListItem> = filtered
+            .iter()
+            .map(|index| {
+                let command = &COMMANDS[*index];
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{:<26}", command.label), Style::default().fg(TEXT)),
+                    Span::styled(command.hint, Style::default().fg(DIM)),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(palette.selected.min(filtered.len() - 1)));
+        let list = List::new(items)
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(30, 45, 66))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("› ");
+        frame.render_stateful_widget(list, list_area, &mut state);
+    }
+
+    fn draw_sessions(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let width = 76.min(area.width.saturating_sub(6)).max(26);
+        let height = ((self.tasks.len() as u16) + 5)
+            .min(area.height.saturating_sub(4))
+            .max(7);
+        let area = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, area);
+        let block = panel_block("sessions", ACCENT);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if self.tasks.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "  No sessions yet. Esc to start one.",
+                    Style::default().fg(DIM),
+                )),
+                inner,
+            );
+            return;
+        }
+        let list_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: inner.height.saturating_sub(1),
+        };
+        let items: Vec<ListItem> = self
+            .tasks
+            .iter()
+            .map(|task| {
+                let state = task.get("state").and_then(Value::as_str).unwrap_or("?");
+                let state_color = state_color(state);
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<12}", state_label(state)),
+                        Style::default().fg(state_color),
+                    ),
+                    Span::styled(
+                        truncate(
+                            task.get("goal").and_then(Value::as_str).unwrap_or(""),
+                            list_area.width.saturating_sub(16) as usize,
+                        ),
+                        Style::default().fg(TEXT),
+                    ),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(self.selected_task.min(items.len() - 1)));
+        let list = List::new(items)
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(30, 45, 66))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("› ");
+        frame.render_stateful_widget(list, list_area, &mut state);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "↑/↓ select · Enter switch · Esc close",
+                Style::default().fg(FAINT),
+            ))
+            .alignment(Alignment::Right),
+            Rect {
+                x: inner.x,
+                y: inner.bottom().saturating_sub(1),
+                width: inner.width.saturating_sub(1),
+                height: 1,
+            },
+        );
+    }
+
+    fn draw_findings(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let width = 100.min(area.width.saturating_sub(6)).max(30);
+        let height = ((self.findings.len() as u16).saturating_mul(3) + 7)
+            .min(30)
+            .min(area.height.saturating_sub(4))
+            .max(10);
+        let area = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, area);
+        let block = panel_block("assessment findings", ACCENT);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width < 10 || inner.height < 4 {
+            return;
+        }
+        if self.findings.is_empty() {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        "No findings recorded.",
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "The agent records findings with the finding_add tool.",
+                        Style::default().fg(DIM),
+                    )),
+                ]),
+                inner,
+            );
+            return;
+        }
+
+        let mut counts = [0usize; 5];
+        for finding in &self.findings {
+            let rank = finding_rank(
+                finding
+                    .get("severity")
+                    .and_then(Value::as_str)
+                    .unwrap_or("info"),
+            ) as usize;
+            if rank > 0 {
+                counts[rank - 1] += 1;
+            }
+        }
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("{} finding(s)", self.findings.len()),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "   critical {} · high {} · medium {} · low {} · info {}",
+                        counts[4], counts[3], counts[2], counts[1], counts[0]
+                    ),
+                    Style::default().fg(DIM),
+                ),
+            ]),
+            Line::from(""),
+        ];
+        for finding in &self.findings {
+            let severity = finding
+                .get("severity")
+                .and_then(Value::as_str)
+                .unwrap_or("info");
+            let color = match severity {
+                "critical" | "high" => RED,
+                "medium" => YELLOW,
+                "low" => ACCENT,
+                _ => DIM,
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<9}", severity.to_ascii_uppercase()),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    truncate(
+                        finding
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .unwrap_or("untitled"),
+                        inner.width.saturating_sub(12) as usize,
+                    ),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            let asset = finding.get("asset").and_then(Value::as_str).unwrap_or("");
+            let status = finding.get("status").and_then(Value::as_str).unwrap_or("");
+            let tags = finding
+                .get("tags")
+                .and_then(Value::as_array)
+                .map(|tags| {
+                    tags.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            let mut meta = vec![Span::raw("  ")];
+            if !asset.is_empty() {
+                meta.push(Span::styled(asset.to_string(), Style::default().fg(ACCENT)));
+            }
+            if !status.is_empty() {
+                meta.push(Span::styled(
+                    format!("  {status}"),
+                    Style::default().fg(DIM),
+                ));
+            }
+            if !tags.is_empty() {
+                meta.push(Span::styled(
+                    format!("  [{tags}]"),
+                    Style::default().fg(FAINT),
+                ));
+            }
+            lines.push(Line::from(meta));
+            if let Some(description) = finding.get("description").and_then(Value::as_str)
+                && !description.is_empty()
+            {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {}",
+                        truncate(description, inner.width.saturating_sub(4) as usize)
+                    ),
+                    Style::default().fg(DIM),
+                )));
+            }
+            lines.push(Line::from(""));
+        }
+
+        let list_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: inner.height.saturating_sub(1),
+        };
+        let scroll = self.findings_scroll.min(lines.len().saturating_sub(1));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+            list_area,
+        );
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "j/k scroll · r reload · Esc close",
+                Style::default().fg(FAINT),
+            ))
+            .alignment(Alignment::Right),
+            Rect {
+                x: inner.x,
+                y: inner.bottom().saturating_sub(1),
+                width: inner.width.saturating_sub(1),
+                height: 1,
+            },
+        );
+    }
+
+    fn draw_modes(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let width = 72.min(area.width.saturating_sub(6)).max(32);
+        let height = (self.modes.len() as u16 + 7)
+            .min(area.height.saturating_sub(4))
+            .max(10);
+        let area = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, area);
+        let block = panel_block("agent mode", ACCENT);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let mut lines = vec![
+            Line::from(vec![Span::styled(
+                "Next session operates in the selected mode.",
+                Style::default().fg(DIM),
+            )]),
+            Line::from(""),
+        ];
+        for (index, mode) in self.modes.iter().enumerate() {
+            let selected = index == self.mode_selection;
+            let current = mode.id == self.mode;
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { "❯ " } else { "  " },
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled(
+                    format!("{:<12}", mode.id),
+                    if selected {
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(TEXT)
+                    },
+                ),
+                Span::styled(
+                    format!("{:<6}", self.mode_label(&mode.id)),
+                    Style::default().fg(if current { GREEN } else { FAINT }),
+                ),
+                Span::styled(mode.description.clone(), Style::default().fg(DIM)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "↑/↓ choose · Enter apply · Esc cancel",
+            Style::default().fg(ACCENT),
+        )));
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            Rect {
+                x: inner.x + 1,
+                y: inner.y,
+                width: inner.width.saturating_sub(2),
+                height: inner.height,
+            },
+        );
+    }
+
+    fn draw_permissions(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let width = 78.min(area.width.saturating_sub(6)).max(34);
+        let height = (PERMISSIONS.len() as u16 + 7)
+            .min(area.height.saturating_sub(4))
+            .max(10);
+        let area = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, area);
+        let block = panel_block("permissions", GREEN);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "Controls approval prompts for tool calls in the next session.",
+                Style::default().fg(DIM),
+            )),
+            Line::from(""),
+        ];
+        for (index, (id, description)) in PERMISSIONS.iter().enumerate() {
+            let selected = index == self.permission_selection;
+            let current = *id == self.permission;
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { "❯ " } else { "  " },
+                    Style::default().fg(GREEN),
+                ),
+                Span::styled(
+                    format!("{:<10}", id),
+                    if selected {
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(TEXT)
+                    },
+                ),
+                Span::styled(
+                    format!("{:<6}", permission_label(id)),
+                    Style::default().fg(if current { permission_color(id) } else { FAINT }),
+                ),
+                Span::styled((*description).to_string(), Style::default().fg(DIM)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "↑/↓ choose · Enter apply · Esc cancel",
+            Style::default().fg(ACCENT),
+        )));
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            Rect {
+                x: inner.x + 1,
+                y: inner.y,
+                width: inner.width.saturating_sub(2),
+                height: inner.height,
+            },
+        );
+    }
+
+    fn draw_approval(&self, frame: &mut ratatui::Frame, area: Rect, pending: &Value) {
+        let id = pending.get("id").and_then(Value::as_u64).unwrap_or(0);
+        let tool = pending.get("tool").and_then(Value::as_str).unwrap_or("?");
+        let reason = pending
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let args = serde_json::to_string_pretty(pending.get("args").unwrap_or(&Value::Null))
+            .unwrap_or_default();
+        let area = centered_rect(80, 48, area);
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().fg(YELLOW))
+            .style(Style::default().bg(PANEL))
+            .title(Span::styled(
+                format!(
+                    " approval required · {} of {} · #{id} ",
+                    1,
+                    self.approvals.len()
+                ),
+                Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("tool  ", Style::default().fg(FAINT)),
+                Span::styled(
+                    tool.to_string(),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("why   ", Style::default().fg(FAINT)),
+                Span::styled(reason.to_string(), Style::default().fg(DIM)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("arguments", Style::default().fg(FAINT))),
+        ];
+        let budget = inner.height.saturating_sub(7) as usize;
+        for part in args.lines().take(budget.max(1)) {
+            lines.push(Line::from(Span::styled(
+                format!("  {part}"),
+                Style::default().fg(DIM),
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("y", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled(" allow     ", Style::default().fg(DIM)),
+            Span::styled("n", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
+            Span::styled(" deny", Style::default().fg(DIM)),
+        ]));
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
+    fn draw_terminal(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let Some(terminal) = &self.terminal else {
+            return;
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().fg(FAINT))
+            .style(Style::default().bg(BG))
+            .title(Span::styled(
+                format!(
+                    " terminal {} · {}×{} · Ctrl+Q detach ",
+                    terminal.session_id, terminal.cols, terminal.rows
+                ),
+                Style::default().fg(DIM),
+            ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        self.terminal_size.set((inner.width, inner.height));
+        frame.render_widget(
+            TerminalWidget {
+                screen: terminal.screen(),
+            },
+            inner,
+        );
+        let screen = terminal.screen();
+        if !screen.hide_cursor() {
+            let (row, col) = screen.cursor_position();
+            if col < inner.width && row < inner.height {
+                frame.set_cursor_position((inner.x + col, inner.y + row));
+            }
         }
     }
 }
@@ -2454,7 +3963,17 @@ fn main() -> Result<()> {
 
     if cli.snapshot {
         let root = daemon_root.as_ref().context("--snapshot needs a daemon")?;
-        return snapshot_daemon(root, provider, cli.setup, cli.setup_step.clone());
+        return snapshot_daemon(
+            root,
+            provider,
+            cli.setup,
+            cli.setup_step.clone(),
+            cli.snapshot_palette,
+            cli.snapshot_sessions,
+            cli.snapshot_findings,
+            cli.snapshot_modes,
+            cli.snapshot_permissions,
+        );
     }
 
     enable_raw_mode()?;
@@ -2491,12 +4010,38 @@ fn snapshot_daemon(
     provider: Option<String>,
     setup: bool,
     setup_step: Option<String>,
+    palette: bool,
+    sessions: bool,
+    findings: bool,
+    modes: bool,
+    permissions: bool,
 ) -> Result<()> {
     let mut app = DaemonApp::connect(root.to_path_buf(), 100, provider)?;
     let _ = app.refresh();
+    if palette || sessions || findings || modes || permissions {
+        app.setup = None;
+    }
     if setup {
         app.open_setup();
         open_setup_step(&mut app, setup_step.as_deref());
+    }
+    if palette {
+        app.open_palette();
+    }
+    if sessions {
+        app.show_sessions = true;
+    }
+    if findings {
+        let _ = app.load_findings();
+        app.show_findings = true;
+    }
+    if modes {
+        app.mode_selection = app.mode_index(&app.mode);
+        app.show_modes = true;
+    }
+    if permissions {
+        app.permission_selection = permission_index(&app.permission);
+        app.show_permissions = true;
     }
     app.auto_scroll = false;
     app.scroll_from_bottom = 10_000;
@@ -2816,6 +4361,133 @@ fn cell_modifier(cell: &vt100::Cell) -> Modifier {
     modifier
 }
 
+fn filtered_commands(query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    COMMANDS
+        .iter()
+        .enumerate()
+        .filter(|(_, command)| {
+            needle.is_empty()
+                || command.label.to_lowercase().contains(&needle)
+                || command.hint.to_lowercase().contains(&needle)
+                || command.command.contains(&needle)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn state_color(state: &str) -> Color {
+    match state {
+        "running" => ACCENT,
+        "waiting_input" => GREEN,
+        "failed" | "cancelled" => RED,
+        "done" => DIM,
+        _ => FAINT,
+    }
+}
+
+fn finding_rank(severity: &str) -> u8 {
+    match severity {
+        "critical" => 5,
+        "high" => 4,
+        "medium" => 3,
+        "low" => 2,
+        "info" => 1,
+        _ => 0,
+    }
+}
+
+fn state_label(state: &str) -> &'static str {
+    match state {
+        "running" => "● running",
+        "waiting_input" => "● ready",
+        "failed" => "✗ failed",
+        "cancelled" => "✗ cancelled",
+        "done" => "✓ done",
+        _ => "· unknown",
+    }
+}
+
+fn dim_background(frame: &mut ratatui::Frame) {
+    let area = frame.area();
+    let buffer = frame.buffer_mut();
+    let fg = Color::Rgb(64, 64, 72);
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            let cell = &mut buffer[(x, y)];
+            cell.set_fg(fg);
+            cell.set_bg(BG);
+        }
+    }
+}
+
+fn chip(text: String, fg: Color, bg: Color) -> Span<'static> {
+    Span::styled(
+        text,
+        Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn panel_block(title: &str, accent: Color) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(FAINT))
+        .style(Style::default().bg(PANEL))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ))
+}
+
+fn help_line(key: &'static str, description: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{key:<14}"),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(description, Style::default().fg(DIM)),
+    ])
+}
+
+fn wordmark(width: u16) -> Vec<Line<'static>> {
+    const PIXEL_WIDTH: u16 = 71;
+    if width >= PIXEL_WIDTH + 6 {
+        (0..7)
+            .map(|row| {
+                let mut spans = Vec::new();
+                for (index, (_, glyph)) in WORDMARK.iter().enumerate() {
+                    let mut text = String::new();
+                    for cell in glyph[row].chars() {
+                        text.push(if cell == '1' { '█' } else { ' ' });
+                    }
+                    if index + 1 < WORDMARK.len() {
+                        text.push(' ');
+                    }
+                    let shade = 242u16
+                        .saturating_sub(index as u16 * 10)
+                        .saturating_sub(row as u16 * 5) as u8;
+                    spans.push(Span::styled(
+                        text,
+                        Style::default().fg(Color::Rgb(shade, shade, shade.saturating_add(5))),
+                    ));
+                }
+                Line::from(spans)
+            })
+            .collect()
+    } else if width >= 24 {
+        vec![Line::from(Span::styled(
+            "M I T N I C K S O L V E",
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ))]
+    } else {
+        vec![Line::from(Span::styled(
+            "MSK",
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ))]
+    }
+}
+
 fn short_time(ts: &str) -> String {
     ts.get(11..19).unwrap_or(ts).to_string()
 }
@@ -2990,6 +4662,46 @@ mod tests {
     }
 
     #[test]
+    fn wordmark_scales_with_terminal_width() {
+        assert_eq!(wordmark(120).len(), 7);
+        assert_eq!(wordmark(40).len(), 1);
+        let narrow = wordmark(20);
+        assert_eq!(narrow.len(), 1);
+        assert!(narrow[0].spans[0].content.contains("MSK"));
+    }
+
+    #[test]
+    fn palette_filters_command_labels() {
+        assert_eq!(filtered_commands("").len(), COMMANDS.len());
+        let terminal = filtered_commands("term");
+        assert!(
+            terminal
+                .iter()
+                .any(|index| COMMANDS[*index].command == "/terminal")
+        );
+        let effort = filtered_commands("reasoning");
+        assert!(
+            effort
+                .iter()
+                .any(|index| COMMANDS[*index].command == "/effort")
+        );
+        assert!(filtered_commands("no-such-command").is_empty());
+    }
+
+    #[test]
+    fn mode_picker_covers_all_modes() {
+        let modes = fallback_modes();
+        assert_eq!(modes[0].id, "auto");
+        assert!(
+            modes
+                .iter()
+                .any(|mode| mode.id == "harden" && mode.label == "加固")
+        );
+        assert_eq!(mode_color("plan"), ACCENT);
+        assert_eq!(mode_color("exploit"), RED);
+    }
+
+    #[test]
     fn terminal_parser_renders_text() {
         let mut parser = vt100::Parser::new(2, 10, 0);
         parser.process(b"hi");
@@ -3045,6 +4757,7 @@ mod tests {
                 json!({
                     "goal": "approval draw test",
                     "provider": "openai",
+                    "mode": "exploit",
                     "interactive": true,
                     "stream": true,
                     "approvals": "ask"
@@ -3231,8 +4944,10 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(content.contains("conversation"));
+        assert!(content.contains("hello tui"));
         assert!(content.contains("echo: hello tui"));
+        assert!(content.contains("攻击") || content.contains("exploit"));
+        assert!(content.contains("scripted"));
         app.cancel_task();
     }
 }

@@ -1,0 +1,59 @@
+{
+  "auto": {
+    "default": "investigate"
+  },
+  "modes": [
+    {
+      "id": "plan",
+      "label": "规划",
+      "extends": "plan"
+    },
+    {
+      "id": "osint",
+      "label": "OSINT",
+      "description": "public-source reconnaissance with read-only evidence",
+      "prompt": "MODE: OSINT. Collect only public-source, read-only evidence. Do not execute commands or modify targets. Use DNS, TLS, HTTP GET/HEAD and file analysis, record findings and distinguish verified facts from hypotheses.",
+      "extends": "investigate",
+      "tools": [
+        "net_info",
+        "net_dns",
+        "net_tls",
+        "web_request",
+        "file_type",
+        "file_hash",
+        "file_strings",
+        "transform",
+        "finding_add",
+        "finding_list",
+        "report_generate",
+        "flag_add",
+        "flag_list",
+        "blackboard_get",
+        "blackboard_list"
+      ],
+      "spawn": ["osint", "investigate", "plan"],
+      "keywords": ["osint", "public source", "whois", "passive", "公开情报"],
+      "priority": 2,
+      "order": 4,
+      "write_capable": false
+    },
+    {
+      "id": "reporting",
+      "label": "报告",
+      "description": "turn the finding and flag ledger into a report",
+      "prompt": "MODE: REPORTING. Read the finding and flag ledger, verify citations and evidence, and produce a clear Markdown report. Do not run new active tests.",
+      "extends": "investigate",
+      "tools": [
+        "@investigate",
+        "write_file",
+        "report_generate",
+        "finding_list",
+        "flag_list"
+      ],
+      "spawn": ["plan", "investigate"],
+      "keywords": ["report", "write up", "报告", "总结"],
+      "priority": 3,
+      "order": 5
+    }
+  ]
+}

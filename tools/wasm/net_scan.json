@@ -1,0 +1,73 @@
+{
+  "name": "net_scan",
+  "description": "Bounded TCP connect scan of explicit hosts and ports with optional banner capture. Max 8192 probes, a 30 s wall-clock deadline, and a ~160 KiB result budget per call.",
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "env_id",
+      "targets"
+    ],
+    "anyOf": [
+      {
+        "required": [
+          "ports"
+        ]
+      },
+      {
+        "required": [
+          "port_range"
+        ]
+      }
+    ],
+    "properties": {
+      "env_id": {
+        "type": "string",
+        "description": "Environment identifier returned by envd."
+      },
+      "targets": {
+        "type": "array",
+        "description": "Explicit hostnames or IP addresses to scan (1-64 entries).",
+        "minItems": 1,
+        "maxItems": 64,
+        "items": {
+          "type": "string"
+        }
+      },
+      "ports": {
+        "type": "array",
+        "description": "Explicit TCP ports to probe.",
+        "items": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      },
+      "port_range": {
+        "type": "string",
+        "description": "Comma-separated ports and ranges, for example 22,80,8000-8100."
+      },
+      "timeout_ms": {
+        "type": "integer",
+        "description": "Per-probe connect timeout in milliseconds.",
+        "minimum": 50,
+        "maximum": 5000,
+        "default": 500
+      },
+      "concurrency": {
+        "type": "integer",
+        "description": "Number of concurrent probes.",
+        "minimum": 1,
+        "maximum": 128,
+        "default": 32
+      },
+      "banner": {
+        "type": "boolean",
+        "description": "Read a short banner from each open port.",
+        "default": false
+      }
+    }
+  },
+  "capabilities": [
+    "net.egress"
+  ]
+}

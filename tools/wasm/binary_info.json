@@ -1,0 +1,24 @@
+{
+  "name": "binary_info",
+  "description": "Inspect ELF, PE or Mach-O metadata, sections, imports and hardening flags.",
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "env_id",
+      "path"
+    ],
+    "properties": {
+      "env_id": {
+        "type": "string",
+        "description": "Environment identifier returned by envd."
+      },
+      "path": {
+        "type": "string",
+        "description": "Workspace-relative file path."
+      }
+    }
+  },
+  "capabilities": [
+    "fs.workspace"
+  ]
+}

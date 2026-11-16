@@ -16,7 +16,8 @@ use msk_core::context::{ContextLimits, ContextManager, summarize_output};
 use msk_core::{Capability, DataLabel, ObjectRef, PolicyDecision, PolicyTable};
 use msk_data::ObjectStore;
 use msk_ipc::{Client, methods};
-use msk_kernel::policy;
+use msk_kernel::mode::ModeRegistry;
+use msk_kernel::policy::{self, PermissionMode};
 use msk_llm::{LlmDelta, LlmError, LlmProvider, LlmRequest, LlmResponse, Message, ToolSchema};
 use msk_mcp::EnvTransport;
 use msk_secret::SecretStore;
@@ -33,6 +34,9 @@ pub struct EnvHost {
     pub agent_depth: u32,
     pub task_id: Option<String>,
     pub default_provider: String,
+    pub mode: String,
+    pub modes: Arc<ModeRegistry>,
+    pub permission: PermissionMode,
 }
 
 /// Daemon control plane used by spawn_agent/agent_result. The agent process
@@ -58,6 +62,8 @@ impl ControlPlane {
         max_context_tokens: usize,
         parent_task: Option<&str>,
         depth: u32,
+        mode: &str,
+        permission: PermissionMode,
     ) -> std::result::Result<Value, String> {
         if depth >= 2 {
             return Err("subagent depth limit reached (max 2)".into());
@@ -74,11 +80,12 @@ impl ControlPlane {
                     "provider": provider,
                     "interactive": false,
                     "headless": true,
-                    "approvals": "allow",
+                    "permission": permission.as_str(),
                     "agent_depth": depth + 1,
                     "parent_task": parent_task,
                     "max_steps": max_steps,
-                    "max_context_tokens": max_context_tokens
+                    "max_context_tokens": max_context_tokens,
+                    "mode": mode
                 }),
             )
             .map_err(|err| err.to_string())
@@ -385,6 +392,26 @@ impl ToolHost for EnvHost {
             };
             return serde_json::to_vec(&value).map_err(|err| err.to_string());
         }
+        if matches!(
+            ctx.tool.as_str(),
+            "finding_add" | "finding_list" | "report_generate"
+        ) {
+            if !ctx.allows(Capability::SharedState) {
+                return Err("denied: state.shared not granted".to_string());
+            }
+            let control = self
+                .control
+                .as_ref()
+                .ok_or_else(|| "control plane is not configured".to_string())?;
+            let args: Value = serde_json::from_slice(input)
+                .map_err(|err| format!("invalid finding input: {err}"))?;
+            let value = match ctx.tool.as_str() {
+                "finding_add" => add_finding(control, &args)?,
+                "finding_list" => list_findings(control, &args)?,
+                _ => generate_report(control, &args)?,
+            };
+            return serde_json::to_vec(&value).map_err(|err| err.to_string());
+        }
         if matches!(ctx.tool.as_str(), "spawn_agent" | "agent_result") {
             if !ctx.allows(Capability::AgentSpawn) {
                 return Err("denied: agent.spawn not granted".to_string());
@@ -414,6 +441,19 @@ impl ToolHost for EnvHost {
                     .and_then(Value::as_u64)
                     .unwrap_or(50_000)
                     .clamp(4_096, 1_000_000) as usize;
+                let child_mode = args
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|mode| !mode.is_empty())
+                    .unwrap_or(&self.mode)
+                    .to_string();
+                if !self.modes.can_spawn(&self.mode, &child_mode) {
+                    return Err(format!(
+                        "denied: {} mode cannot spawn a {} subagent",
+                        self.mode, child_mode
+                    ));
+                }
                 control.spawn_agent(
                     goal,
                     provider,
@@ -421,6 +461,8 @@ impl ToolHost for EnvHost {
                     max_context_tokens,
                     self.task_id.as_deref(),
                     self.agent_depth,
+                    &child_mode,
+                    self.permission,
                 )?
             } else {
                 let task_id = args
@@ -451,17 +493,82 @@ impl ToolHost for EnvHost {
             }
             return self.read_artifact(input);
         }
+        if ctx.tool == "wasm_eval" {
+            let args: Value = serde_json::from_slice(input)
+                .map_err(|err| format!("invalid wasm_eval input: {err}"))?;
+            let wat = args
+                .get("wat")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "wat is required".to_string())?;
+            if wat.is_empty() || wat.len() > 64 * 1024 {
+                return Err("wat must be 1..64 KiB".into());
+            }
+            let encoded = args
+                .get("input_base64")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let data = STANDARD
+                .decode(encoded)
+                .map_err(|err| format!("input_base64: {err}"))?;
+            if data.len() > 64 * 1024 {
+                return Err("input_base64 exceeds 64 KiB".into());
+            }
+            let output =
+                msk_wasm::run_pure_wat(wat, &data).map_err(|err| format!("wasm_eval: {err}"))?;
+            if output.len() > 256 * 1024 {
+                return Err("wasm_eval output exceeds 256 KiB".into());
+            }
+            let value = json!({
+                "output_base64": STANDARD.encode(&output),
+                "bytes": output.len()
+            });
+            return serde_json::to_vec(&value).map_err(|err| err.to_string());
+        }
 
         let (envd_tool, capability) = match ctx.tool.as_str() {
             "exec" | "session_create" | "session_exec" | "session_close" | "session_write"
-            | "session_read" | "session_resize" => (ctx.tool.as_str(), Capability::ExecSession),
-            "read_file" | "write_file" | "list_dir" | "stat_file" => {
-                (ctx.tool.as_str(), Capability::FsWorkspace)
+            | "session_read" | "session_resize" => {
+                (ctx.tool.as_str(), Some(Capability::ExecSession))
             }
+            "read_file" | "write_file" | "list_dir" | "stat_file" | "file_hash" | "file_type"
+            | "file_strings" | "file_hexdump" | "file_entropy" | "file_search" | "archive_list"
+            | "archive_extract" | "binary_info" | "secret_scan" => {
+                (ctx.tool.as_str(), Some(Capability::FsWorkspace))
+            }
+            "net_dns" | "net_dial" | "net_tls" | "net_scan" | "net_info" | "web_request" => {
+                (ctx.tool.as_str(), Some(Capability::NetEgress))
+            }
+            "transform" => (ctx.tool.as_str(), None),
             other => return Err(format!("denied: tool {other} is not allowed")),
         };
-        if !ctx.allows(capability.clone()) {
-            return Err(format!("denied: {} not granted", capability.as_str()));
+        if let Some(capability) = capability {
+            if !ctx.allows(capability.clone()) {
+                return Err(format!("denied: {} not granted", capability.as_str()));
+            }
+        }
+        if ctx.tool == "web_request" && !self.modes.write_capable(&self.mode) {
+            let args: Value = serde_json::from_slice(input)
+                .map_err(|err| format!("invalid web request input: {err}"))?;
+            let method = args
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("GET")
+                .to_ascii_uppercase();
+            let has_body = args
+                .get("body_base64")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+                || args.get("json").is_some_and(|value| !value.is_null())
+                || args
+                    .get("form")
+                    .and_then(Value::as_object)
+                    .is_some_and(|form| !form.is_empty());
+            if !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") || has_body {
+                return Err(format!(
+                    "denied: {} mode allows only GET/HEAD/OPTIONS web requests without a body",
+                    self.mode
+                ));
+            }
         }
         let args: Value =
             serde_json::from_slice(input).map_err(|err| format!("invalid tool input: {err}"))?;
@@ -517,9 +624,12 @@ pub fn load_registry_with_policy(
             .with_context(|| format!("authorize tool {name}"))?;
         let decision = policy.decision(&manifest.name);
 
-        let candidate = tools_dir.join(format!("{name}.wat"));
-        let wasm = if candidate.exists() {
-            candidate
+        let wat = tools_dir.join(format!("{name}.wat"));
+        let compiled = tools_dir.join(format!("{name}.wasm"));
+        let wasm = if wat.exists() {
+            wat
+        } else if compiled.exists() {
+            compiled
         } else {
             fallback_wasm.to_path_buf()
         };
@@ -647,6 +757,341 @@ pub fn substitute(
     Ok(())
 }
 
+fn severity_rank(value: &str) -> u8 {
+    match value {
+        "critical" => 5,
+        "high" => 4,
+        "medium" => 3,
+        "low" => 2,
+        "info" => 1,
+        _ => 0,
+    }
+}
+
+fn clean_field(value: &str, max: usize) -> String {
+    let text = value.replace(['\r', '\n', '\t'], " ");
+    let text = text.trim();
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        text.chars().take(max).collect()
+    }
+}
+
+fn optional_field(args: &Value, name: &str, max: usize) -> Option<String> {
+    args.get(name)
+        .and_then(Value::as_str)
+        .map(|value| clean_field(value, max))
+        .filter(|value| !value.is_empty())
+}
+
+fn add_finding(control: &ControlPlane, args: &Value) -> Result<Value, String> {
+    let title = args
+        .get("title")
+        .and_then(Value::as_str)
+        .map(|value| clean_field(value, 200))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "title is required (1..200 characters)".to_string())?;
+    let severity = args
+        .get("severity")
+        .and_then(Value::as_str)
+        .unwrap_or("info")
+        .to_ascii_lowercase();
+    if severity_rank(&severity) == 0 {
+        return Err("severity must be info, low, medium, high, or critical".into());
+    }
+    let status = args
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("open")
+        .to_ascii_lowercase();
+    if !matches!(
+        status.as_str(),
+        "open" | "confirmed" | "fixed" | "false_positive"
+    ) {
+        return Err("status must be open, confirmed, fixed, or false_positive".into());
+    }
+    let asset = optional_field(args, "asset", 512).unwrap_or_default();
+    let description = optional_field(args, "description", 8192).unwrap_or_default();
+    let evidence = optional_field(args, "evidence", 32768).unwrap_or_default();
+    let source = optional_field(args, "source", 200).unwrap_or_default();
+    let tags: Vec<String> = args
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|tag| clean_field(tag, 64))
+                .filter(|tag| !tag.is_empty())
+                .take(16)
+                .collect()
+        })
+        .unwrap_or_default();
+    let key = format!("finding:{}", sha256_hex(&format!("{title}\0{asset}")));
+    let existing = control.blackboard_get(&key)?;
+    let existing_value = existing.get("value").cloned().unwrap_or(Value::Null);
+    let added = existing_value.is_null();
+    let recorded_ms = existing_value
+        .get("recorded_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(now_unix_ms);
+    let finding = json!({
+        "id": key.trim_start_matches("finding:"),
+        "title": title,
+        "severity": severity,
+        "asset": asset,
+        "description": description,
+        "evidence": evidence,
+        "status": status,
+        "tags": tags,
+        "source": source,
+        "recorded_ms": recorded_ms,
+        "updated_ms": now_unix_ms()
+    });
+    control.blackboard_set(&key, finding.clone(), None)?;
+    Ok(json!({"added": added, "key": key, "finding": finding}))
+}
+
+fn collect_findings(control: &ControlPlane, args: Option<&Value>) -> Result<Vec<Value>, String> {
+    let listed = control.blackboard_list()?;
+    let mut findings = Vec::new();
+    if let Some(entries) = listed.get("entries").and_then(Value::as_array) {
+        for entry in entries {
+            let key = entry.get("key").and_then(Value::as_str).unwrap_or_default();
+            if !key.starts_with("finding:") {
+                continue;
+            }
+            let value = entry.get("value").cloned().unwrap_or(Value::Null);
+            if !value.is_object() {
+                continue;
+            }
+            if let Some(args) = args {
+                let matches = |field: &str| {
+                    args.get(field)
+                        .and_then(Value::as_str)
+                        .filter(|wanted| !wanted.is_empty())
+                        .is_none_or(|wanted| {
+                            value.get(field).and_then(Value::as_str) == Some(wanted)
+                        })
+                };
+                if !matches("severity") || !matches("status") || !matches("asset") {
+                    continue;
+                }
+                if let Some(tag) = args
+                    .get("tag")
+                    .and_then(Value::as_str)
+                    .filter(|tag| !tag.is_empty())
+                {
+                    let has_tag = value
+                        .get("tags")
+                        .and_then(Value::as_array)
+                        .is_some_and(|tags| tags.iter().any(|item| item.as_str() == Some(tag)));
+                    if !has_tag {
+                        continue;
+                    }
+                }
+            }
+            findings.push(value);
+        }
+    }
+    findings.sort_by(|left, right| {
+        let left_key = (
+            severity_rank(left.get("severity").and_then(Value::as_str).unwrap_or("")),
+            left.get("recorded_ms").and_then(Value::as_u64).unwrap_or(0),
+        );
+        let right_key = (
+            severity_rank(right.get("severity").and_then(Value::as_str).unwrap_or("")),
+            right
+                .get("recorded_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+        right_key.cmp(&left_key)
+    });
+    Ok(findings)
+}
+
+fn list_findings(control: &ControlPlane, args: &Value) -> Result<Value, String> {
+    let mut findings = collect_findings(control, Some(args))?;
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(100)
+        .clamp(1, 500) as usize;
+    findings.truncate(limit);
+    let count = findings.len();
+    Ok(json!({"findings": findings, "count": count}))
+}
+
+fn collect_flags(control: &ControlPlane) -> Result<Vec<Value>, String> {
+    let listed = control.blackboard_list()?;
+    let mut flags = Vec::new();
+    if let Some(entries) = listed.get("entries").and_then(Value::as_array) {
+        for entry in entries {
+            let key = entry.get("key").and_then(Value::as_str).unwrap_or_default();
+            if !key.starts_with("flag:") {
+                continue;
+            }
+            let value = entry.get("value").cloned().unwrap_or(Value::Null);
+            if value.is_object() {
+                flags.push(value);
+            }
+        }
+    }
+    Ok(flags)
+}
+
+fn render_report_markdown(
+    title: &str,
+    findings: &[Value],
+    flags: &[Value],
+    generated_ms: u64,
+) -> String {
+    let mut severity_counts = [0usize; 5];
+    for finding in findings {
+        let rank = severity_rank(
+            finding
+                .get("severity")
+                .and_then(Value::as_str)
+                .unwrap_or("info"),
+        ) as usize;
+        if rank > 0 {
+            severity_counts[rank - 1] += 1;
+        }
+    }
+    let mut out = String::new();
+    out.push_str(&format!("# {title}\n\n"));
+    out.push_str(&format!("Generated: {generated_ms} (unix ms)\n\n"));
+    out.push_str("## Summary\n\n");
+    out.push_str(&format!("- Findings: {}\n", findings.len()));
+    for (rank, label) in ["info", "low", "medium", "high", "critical"]
+        .iter()
+        .enumerate()
+    {
+        out.push_str(&format!("  - {label}: {}\n", severity_counts[rank]));
+    }
+    out.push_str(&format!("- Flags: {}\n\n", flags.len()));
+
+    out.push_str("## Findings\n\n");
+    if findings.is_empty() {
+        out.push_str("No findings recorded.\n\n");
+    } else {
+        for finding in findings {
+            let finding_title = clean_field(
+                finding
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("untitled"),
+                200,
+            );
+            let severity = finding
+                .get("severity")
+                .and_then(Value::as_str)
+                .unwrap_or("info")
+                .to_ascii_uppercase();
+            out.push_str(&format!("### [{severity}] {finding_title}\n\n"));
+            for (label, field) in [("Asset", "asset"), ("Status", "status")] {
+                if let Some(value) = finding.get(field).and_then(Value::as_str)
+                    && !value.is_empty()
+                {
+                    out.push_str(&format!("- **{label}:** {}\n", clean_field(value, 512)));
+                }
+            }
+            if let Some(tags) = finding.get("tags").and_then(Value::as_array)
+                && !tags.is_empty()
+            {
+                let tags = tags
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|tag| clean_field(tag, 64))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!("- **Tags:** {tags}\n"));
+            }
+            out.push('\n');
+            if let Some(description) = finding.get("description").and_then(Value::as_str)
+                && !description.is_empty()
+            {
+                out.push_str(&clean_field(description, 8192));
+                out.push_str("\n\n");
+            }
+            if let Some(evidence) = finding.get("evidence").and_then(Value::as_str)
+                && !evidence.is_empty()
+            {
+                out.push_str("Evidence:\n\n");
+                for line in evidence.lines().take(200) {
+                    out.push_str(&format!("    {line}\n"));
+                }
+                out.push('\n');
+            }
+        }
+    }
+
+    out.push_str("## Flags\n\n");
+    if flags.is_empty() {
+        out.push_str("No flags recorded.\n");
+    } else {
+        for flag in flags {
+            let value = flag
+                .get("flag")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .replace(['\r', '\n'], " ");
+            let source = flag
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if source.is_empty() {
+                out.push_str(&format!("    {value}\n"));
+            } else {
+                out.push_str(&format!("    {value}  ({})\n", clean_field(source, 200)));
+            }
+        }
+    }
+    out
+}
+
+fn generate_report(control: &ControlPlane, args: &Value) -> Result<Value, String> {
+    let title = clean_field(
+        args.get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("Security assessment"),
+        200,
+    );
+    let findings = collect_findings(control, None)?;
+    let flags = collect_flags(control)?;
+    let generated_ms = now_unix_ms();
+    let markdown = render_report_markdown(&title, &findings, &flags, generated_ms);
+    let mut counts = serde_json::Map::new();
+    for (rank, label) in ["info", "low", "medium", "high", "critical"]
+        .iter()
+        .enumerate()
+    {
+        let count = findings
+            .iter()
+            .filter(|finding| {
+                severity_rank(
+                    finding
+                        .get("severity")
+                        .and_then(Value::as_str)
+                        .unwrap_or("info"),
+                ) as usize
+                    == rank + 1
+            })
+            .count();
+        counts.insert((*label).to_string(), json!(count));
+    }
+    Ok(json!({
+        "title": title,
+        "markdown": markdown,
+        "findings": findings,
+        "flags": flags,
+        "counts": counts,
+        "generated_ms": generated_ms
+    }))
+}
+
 fn sha256_hex(text: &str) -> String {
     Sha256::digest(text.as_bytes())
         .iter()
@@ -767,5 +1212,147 @@ mod tests {
     fn http_request_rejects_non_http_urls() {
         let input = serde_json::to_vec(&json!({"url": "file:///etc/passwd"})).unwrap();
         assert!(http_request(&input, &msk_secret::MemorySecretStore::new(), false).is_err());
+    }
+
+    struct RecordingTransport {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl EnvTransport for RecordingTransport {
+        fn call_tool(&mut self, name: &str, _arguments: Value) -> std::io::Result<Value> {
+            self.calls.lock().unwrap().push(name.to_string());
+            Ok(json!({
+                "structuredContent": {
+                    "ok": true,
+                    "data": {"routed": name}
+                }
+            }))
+        }
+
+        fn request(&mut self, _method: &str, _params: Value) -> std::io::Result<Value> {
+            Ok(Value::Null)
+        }
+
+        fn shutdown(&mut self) {}
+    }
+
+    fn recording_host() -> (EnvHost, Arc<Mutex<Vec<String>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let transport = RecordingTransport {
+            calls: calls.clone(),
+        };
+        (
+            EnvHost {
+                client: Arc::new(Mutex::new(Box::new(transport))),
+                artifacts: Arc::new(msk_data::MemoryObjectStore::default()),
+                control: None,
+                secrets: Arc::new(msk_secret::MemorySecretStore::new()),
+                agent_depth: 0,
+                task_id: None,
+                default_provider: "scripted".into(),
+                mode: "investigate".into(),
+                modes: Arc::new(ModeRegistry::builtin().unwrap()),
+                permission: PermissionMode::Bypass,
+            },
+            calls,
+        )
+    }
+
+    #[test]
+    fn security_tools_are_forwarded_to_envd_with_capabilities() {
+        let (host, calls) = recording_host();
+        let net = ToolContext::new("net_scan", vec![Capability::NetEgress]);
+        let result = host
+            .call(
+                &net,
+                br#"{"env_id":"env_1","targets":["127.0.0.1"],"ports":[80]}"#,
+            )
+            .unwrap();
+        let value: Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(value["structuredContent"]["data"]["routed"], "net_scan");
+
+        let files = ToolContext::new("binary_info", vec![Capability::FsWorkspace]);
+        host.call(&files, br#"{"env_id":"env_1","path":"challenge"}"#)
+            .unwrap();
+
+        let transform = ToolContext::new("transform", vec![]);
+        host.call(&transform, br#"{"op":"hex_encode","data":"hi"}"#)
+            .unwrap();
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["net_scan", "binary_info", "transform"]
+        );
+    }
+
+    #[test]
+    fn security_tools_deny_missing_capabilities() {
+        let (host, calls) = recording_host();
+        let scan = ToolContext::new("net_scan", vec![Capability::FsWorkspace]);
+        let error = host
+            .call(
+                &scan,
+                br#"{"env_id":"env_1","targets":["127.0.0.1"],"ports":[80]}"#,
+            )
+            .unwrap_err();
+        assert!(error.contains("net.egress"), "{error}");
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn report_markdown_groups_findings_and_flags() {
+        let findings = vec![
+            json!({
+                "title": "Exposed admin panel\nsecond line",
+                "severity": "high",
+                "asset": "https://example.test/admin",
+                "status": "confirmed",
+                "tags": ["web", "auth"],
+                "description": "Admin panel is reachable without authentication.",
+                "evidence": "GET /admin -> 200\nSet-Cookie: session=..."
+            }),
+            json!({
+                "title": "TLS certificate expires soon",
+                "severity": "low",
+                "asset": "example.test:443",
+                "status": "open"
+            }),
+        ];
+        let flags = vec![json!({"flag": "flag{report}", "source": "ctf"})];
+        let markdown = render_report_markdown("Assessment", &findings, &flags, 42);
+        assert!(markdown.contains("# Assessment"));
+        assert!(markdown.contains("- Findings: 2"));
+        assert!(markdown.contains("- high: 1"));
+        assert!(markdown.contains("- low: 1"));
+        assert!(markdown.contains("### [HIGH] Exposed admin panel second line"));
+        assert!(markdown.contains("- **Asset:** https://example.test/admin"));
+        assert!(markdown.contains("Evidence:"));
+        assert!(markdown.contains("    flag{report}  (ctf)"));
+    }
+
+    #[test]
+    fn report_fields_are_sanitized() {
+        assert_eq!(clean_field("  a\nb\tc  ", 200), "a b c");
+        assert_eq!(severity_rank("critical"), 5);
+        assert_eq!(severity_rank("info"), 1);
+        assert_eq!(severity_rank("nope"), 0);
+    }
+
+    #[test]
+    fn investigate_mode_restricts_web_methods() {
+        let (host, calls) = recording_host();
+        let ctx = ToolContext::new("web_request", vec![Capability::NetEgress]);
+        let error = host
+            .call(
+                &ctx,
+                br#"{"env_id":"env_1","url":"http://127.0.0.1/","method":"POST","json":{"a":1}}"#,
+            )
+            .unwrap_err();
+        assert!(error.contains("GET/HEAD"), "{error}");
+        assert!(calls.lock().unwrap().is_empty());
+
+        host.call(&ctx, br#"{"env_id":"env_1","url":"http://127.0.0.1/"}"#)
+            .unwrap();
+        assert_eq!(calls.lock().unwrap().as_slice(), ["web_request"]);
     }
 }

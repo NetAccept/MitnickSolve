@@ -81,8 +81,25 @@ func (h serviceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	encoded, err := json.Marshal(response)
+	if err != nil || len(encoded)+protocol.HeaderLen > h.server.opts.MaxFrame {
+		response = rpcResponse{
+			JSONRPC: "2.0",
+			ID:      request.ID,
+			Error: &rpcError{
+				Code: -32005,
+				Message: "response exceeds the control frame limit; narrow the request " +
+					"(fewer targets/ports, a smaller max_bytes, a shorter dump)",
+			},
+		}
+		encoded, err = json.Marshal(response)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(response); err != nil {
+	if _, err := w.Write(encoded); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -107,6 +124,9 @@ func RunService(ctx context.Context, opts ServiceOptions) error {
 		return errors.New("a control listen address is required")
 	}
 	if err := ValidateSandbox(opts.Sandbox, opts.Root); err != nil {
+		return err
+	}
+	if err := ValidateNetAllow(opts.NetAllow); err != nil {
 		return err
 	}
 	server := New(opts.Options)

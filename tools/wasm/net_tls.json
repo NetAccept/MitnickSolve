@@ -1,0 +1,49 @@
+{
+  "name": "net_tls",
+  "description": "Inspect a TLS endpoint: negotiated version, cipher, ALPN and a bounded peer certificate chain (at most 8 certificates and 32 KiB of PEM).",
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "env_id",
+      "host"
+    ],
+    "properties": {
+      "env_id": {
+        "type": "string",
+        "description": "Environment identifier returned by envd."
+      },
+      "host": {
+        "type": "string",
+        "description": "Hostname or IP address to connect to."
+      },
+      "port": {
+        "type": "integer",
+        "description": "TLS port to connect to.",
+        "minimum": 1,
+        "maximum": 65535,
+        "default": 443
+      },
+      "server_name": {
+        "type": "string",
+        "description": "TLS SNI and certificate verification name; defaults to host."
+      },
+      "timeout_ms": {
+        "type": "integer",
+        "description": "Connect and handshake timeout in milliseconds.",
+        "minimum": 100,
+        "maximum": 30000,
+        "default": 5000
+      },
+      "alpn": {
+        "type": "array",
+        "description": "Optional ALPN protocols to offer.",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "capabilities": [
+    "net.egress"
+  ]
+}

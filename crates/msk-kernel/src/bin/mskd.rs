@@ -16,6 +16,8 @@ use msk_events::Event;
 use msk_ipc::data::{DATA_MAX_FRAME, DataFrame, DataKind, write_frame};
 use msk_ipc::local::{self, Stream};
 use msk_ipc::{RpcNotification, RpcRequest, RpcResponse, TryClone, methods};
+use msk_kernel::mode::ModeRegistry;
+use msk_kernel::policy::PermissionMode;
 use msk_mcp::{EnvClient, EnvDataClient, EnvTransport, ServiceClient};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -26,6 +28,9 @@ struct Cli {
     /// Kernel state directory containing the socket and token.
     #[arg(long, default_value = ".msk")]
     root: PathBuf,
+    /// Optional modes.json schema file. Defaults to $MSK_MODES or <root>/modes.json.
+    #[arg(long)]
+    modes_file: Option<PathBuf>,
     /// SQLite event index (optional).
     #[arg(long)]
     store: Option<PathBuf>,
@@ -109,6 +114,10 @@ struct Task {
     interactive: bool,
     stream: bool,
     approvals: String,
+    permission: String,
+    requested_mode: String,
+    mode: String,
+    mode_reason: String,
     headless: bool,
     agent_depth: u32,
     parent_task: Option<String>,
@@ -139,6 +148,10 @@ impl Task {
             "interactive": self.interactive,
             "stream": self.stream,
             "approvals": self.approvals,
+            "permission": self.permission,
+            "requested_mode": self.requested_mode,
+            "mode": self.mode,
+            "mode_reason": self.mode_reason,
             "headless": self.headless,
             "agent_depth": self.agent_depth,
             "parent_task": self.parent_task,
@@ -361,6 +374,8 @@ struct Daemon {
     wasm_cache: Option<PathBuf>,
     agent_bin: PathBuf,
     token: String,
+    modes: Arc<ModeRegistry>,
+    modes_file: Option<PathBuf>,
     inner: Mutex<Inner>,
     subscribers: Mutex<Vec<Subscriber>>,
     terminal: Mutex<Option<TerminalSession>>,
@@ -433,6 +448,17 @@ fn main() -> Result<()> {
         .component_host
         .as_ref()
         .map(|path| msk_ipc::normalize_root(path));
+    let modes_file = cli
+        .modes_file
+        .clone()
+        .map(|path| msk_ipc::normalize_root(&path))
+        .or_else(|| std::env::var_os("MSK_MODES").map(PathBuf::from))
+        .or_else(|| {
+            let candidate = root.join("modes.json");
+            candidate.exists().then_some(candidate)
+        });
+    let modes =
+        Arc::new(ModeRegistry::load(&root, modes_file.as_deref()).context("load agent modes")?);
     let workspace = cli
         .workspace
         .clone()
@@ -495,6 +521,8 @@ fn main() -> Result<()> {
         wasm_cache: cli.wasm_cache.clone(),
         agent_bin,
         token,
+        modes,
+        modes_file,
         inner: Mutex::new(Inner::default()),
         subscribers: Mutex::new(Vec::new()),
         terminal: Mutex::new(None),
@@ -623,6 +651,8 @@ impl Daemon {
                             "server": "mskd",
                             "capabilities": ["tasks", "events", "sessions", "approvals", "terminal"],
                             "workspace": self.workspace.display().to_string(),
+                            "modes": self.modes.infos(),
+                            "default_mode": "auto",
                             "llm": {
                                 "api_key": std::env::var("MSK_LLM_API_KEY").is_ok(),
                                 "model": std::env::var("MSK_LLM_MODEL").ok(),
@@ -705,6 +735,34 @@ impl Daemon {
                             "allow".to_string()
                         }
                     });
+                let permission = params
+                    .get("permission")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| match approvals.as_str() {
+                        "ask" => "manual".to_string(),
+                        "allow" => "bypass".to_string(),
+                        _ => "auto".to_string(),
+                    });
+                if PermissionMode::parse(&permission).is_none() {
+                    return (
+                        RpcResponse::err(id, -32602, format!("unknown permission: {permission}")),
+                        None,
+                    );
+                }
+                let requested_mode = params
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("auto")
+                    .to_string();
+                if requested_mode != "auto" && self.modes.spec(&requested_mode).is_none() {
+                    return (
+                        RpcResponse::err(id, -32602, format!("unknown mode: {requested_mode}")),
+                        None,
+                    );
+                }
                 let headless = params
                     .get("headless")
                     .and_then(Value::as_bool)
@@ -743,6 +801,8 @@ impl Daemon {
                     interactive,
                     stream,
                     approvals,
+                    permission,
+                    requested_mode,
                     headless,
                     agent_depth,
                     max_steps,
@@ -938,6 +998,8 @@ impl Daemon {
         interactive: bool,
         stream: bool,
         approvals: String,
+        permission: String,
+        requested_mode: String,
         headless: bool,
         agent_depth: u32,
         max_steps: usize,
@@ -948,6 +1010,33 @@ impl Daemon {
     ) -> Result<Value> {
         if !matches!(approvals.as_str(), "allow" | "ask") {
             bail!("approvals must be allow or ask");
+        }
+        let requested = if requested_mode.trim().is_empty() {
+            "auto".to_string()
+        } else {
+            requested_mode.trim().to_string()
+        };
+        let decision = self
+            .modes
+            .resolve(&requested, &goal)
+            .with_context(|| format!("resolve mode {requested}"))?;
+        let mut resolved_mode = decision.mode.clone();
+        let mode_reason = decision.reason.clone();
+        // The scripted demo drives shell/session tools; a read-only mode would
+        // leave it without the tools it was built to exercise.
+        if demo == "session" && matches!(provider.as_str(), "scripted" | "scripted-demo") {
+            if self.modes.spec("exploit").is_some() {
+                resolved_mode = "exploit".into();
+            } else {
+                bail!("scripted session demo requires an 'exploit' mode in modes.json");
+            }
+        }
+        // A resumed session may contain shell/tool history; default auto to
+        // the active mode unless the caller chose a concrete mode.
+        if resume_checkpoint.is_some() && requested == "auto" {
+            if self.modes.spec("exploit").is_some() {
+                resolved_mode = "exploit".into();
+            }
         }
         if provider == "component" && self.component_manifest.is_none() {
             bail!("component provider is not configured on this daemon");
@@ -991,6 +1080,10 @@ impl Daemon {
             interactive,
             stream,
             approvals,
+            permission,
+            requested_mode: requested.as_str().to_string(),
+            mode: resolved_mode.as_str().to_string(),
+            mode_reason,
             headless,
             agent_depth,
             parent_task,
@@ -1061,7 +1154,8 @@ impl Daemon {
             api_key,
             interactive,
             stream,
-            approvals,
+            permission,
+            mode,
             headless,
             agent_depth,
             forked_from,
@@ -1087,7 +1181,8 @@ impl Daemon {
                     task.api_key.clone(),
                     task.interactive,
                     task.stream,
-                    task.approvals.clone(),
+                    task.permission.clone(),
+                    task.mode.clone(),
                     task.headless,
                     task.agent_depth,
                     task.forked_from.clone(),
@@ -1177,7 +1272,12 @@ impl Daemon {
         if let Some(cache) = &self.wasm_cache {
             command.arg("--wasm-cache").arg(cache);
         }
+        if let Some(modes_file) = &self.modes_file {
+            command.arg("--modes-file").arg(modes_file);
+        }
         command.arg("--provider").arg(&provider);
+        command.arg("--mode").arg(&mode);
+        command.arg("--permission").arg(&permission);
         if let Some(model) = &model {
             command.arg("--llm-model").arg(model);
         }
@@ -1191,8 +1291,6 @@ impl Daemon {
             command.env("MSK_LLM_API_KEY", api_key);
         }
         command
-            .arg("--approvals")
-            .arg(&approvals)
             .arg("--control-root")
             .arg(&self.root)
             .arg("--task-id")

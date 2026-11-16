@@ -1,9 +1,39 @@
 {
   "name": "spawn_agent",
-  "description": "Spawn a headless subagent with a goal. Returns task_id for agent_result.",
+  "description": "Delegate a goal to a headless subagent and return its task_id for agent_result. The child cannot use a more powerful mode than the parent allows.",
   "input_schema": {
     "type": "object",
-    "required": ["goal"]
+    "required": [
+      "goal"
+    ],
+    "properties": {
+      "goal": {
+        "type": "string",
+        "description": "Subagent objective."
+      },
+      "provider": {
+        "type": "string",
+        "description": "Provider override; defaults to the parent task provider."
+      },
+      "max_steps": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 50,
+        "default": 8
+      },
+      "max_context_tokens": {
+        "type": "integer",
+        "minimum": 4096,
+        "maximum": 1000000,
+        "default": 50000
+      },
+      "mode": {
+        "type": "string",
+        "description": "Subagent mode id from modes.json. Defaults to the parent mode; escalation is denied."
+      }
+    }
   },
-  "capabilities": ["agent.spawn"]
+  "capabilities": [
+    "agent.spawn"
+  ]
 }

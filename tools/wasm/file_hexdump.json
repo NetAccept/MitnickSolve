@@ -1,0 +1,44 @@
+{
+  "name": "file_hexdump",
+  "description": "Render a byte range of a workspace file as a hex/ASCII dump.",
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "env_id",
+      "path"
+    ],
+    "properties": {
+      "env_id": {
+        "type": "string",
+        "description": "Environment identifier returned by envd."
+      },
+      "path": {
+        "type": "string",
+        "description": "Workspace-relative file path."
+      },
+      "offset": {
+        "type": "integer",
+        "description": "Byte offset to start reading from.",
+        "minimum": 0,
+        "default": 0
+      },
+      "length": {
+        "type": "integer",
+        "description": "Maximum bytes to dump.",
+        "minimum": 1,
+        "maximum": 16384,
+        "default": 4096
+      },
+      "width": {
+        "type": "integer",
+        "description": "Bytes per row.",
+        "minimum": 8,
+        "maximum": 32,
+        "default": 16
+      }
+    }
+  },
+  "capabilities": [
+    "fs.workspace"
+  ]
+}

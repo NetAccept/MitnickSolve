@@ -25,6 +25,9 @@ type Options struct {
 	// environments. It is never supplied by a tool call and is never evaluated
 	// by a shell. An empty prefix makes the isolated profile unavailable.
 	Sandbox []string
+	// NetAllow is an optional deployment egress allowlist. Entries are CIDR
+	// blocks or domain suffixes; an empty list allows every target.
+	NetAllow []string
 }
 
 type Env struct {
@@ -93,12 +96,14 @@ func (s *Server) profiles() []string {
 }
 
 type Server struct {
-	opts      Options
-	mu        sync.Mutex
-	envs      map[string]*Env
-	sessions  map[string]*Session
-	transport string
-	dataPlane bool
+	opts       Options
+	mu         sync.Mutex
+	envs       map[string]*Env
+	sessions   map[string]*Session
+	transport  string
+	dataPlane  bool
+	netRules   []netRule
+	netRuleErr error
 }
 
 func New(opts Options) *Server {
@@ -106,11 +111,14 @@ func New(opts Options) *Server {
 		opts.MaxFrame = protocol.EmbeddedMaxFrame
 	}
 	opts.Sandbox = NormalizeSandbox(opts.Sandbox)
+	rules, ruleErr := parseNetAllow(opts.NetAllow)
 	return &Server{
-		opts:      opts,
-		envs:      make(map[string]*Env),
-		sessions:  make(map[string]*Session),
-		transport: "embedded-stdio",
+		opts:       opts,
+		envs:       make(map[string]*Env),
+		sessions:   make(map[string]*Session),
+		transport:  "embedded-stdio",
+		netRules:   rules,
+		netRuleErr: ruleErr,
 	}
 }
 
@@ -138,6 +146,9 @@ func RunEmbedded(ctx context.Context, opts Options) error {
 		return errors.New("--sandbox-command requires service mode")
 	}
 	if err := ValidateSandbox(opts.Sandbox, opts.Root); err != nil {
+		return err
+	}
+	if err := ValidateNetAllow(opts.NetAllow); err != nil {
 		return err
 	}
 	return New(opts).serve(os.Stdin, os.Stdout)
@@ -227,6 +238,21 @@ func (s *Server) handleControl(out io.Writer, payload []byte) error {
 	resp, ok := s.dispatch(req)
 	if !ok {
 		return nil
+	}
+	// A tool result that does not fit one control frame must become a small
+	// error, never a frame-write failure: the latter tears down the embedded
+	// transport and every session in it. Tools also have per-result budgets;
+	// this is the last line of defence.
+	if encoded, err := json.Marshal(resp); err != nil || len(encoded)+protocol.HeaderLen > s.opts.MaxFrame {
+		resp = rpcResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Error: &rpcError{
+				Code: -32005,
+				Message: "response exceeds the control frame limit; narrow the request " +
+					"(fewer targets/ports, a smaller max_bytes, a shorter dump)",
+			},
+		}
 	}
 	return s.writeJSON(out, protocol.KindControl, 0, resp)
 }

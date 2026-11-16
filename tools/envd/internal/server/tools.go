@@ -66,7 +66,13 @@ func errResult(code int, name, message string) toolResult {
 	}
 }
 
-func (s *Server) callTool(name string, raw json.RawMessage) toolResult {
+func (s *Server) callTool(name string, raw json.RawMessage) (result toolResult) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			result = errResult(codeInternal, "INTERNAL",
+				fmt.Sprintf("tool %s panicked: %v", name, recovered))
+		}
+	}()
 	if len(raw) == 0 {
 		raw = json.RawMessage(`{}`)
 	}
@@ -101,6 +107,40 @@ func (s *Server) callTool(name string, raw json.RawMessage) toolResult {
 		return s.toolSessionList(raw)
 	case "session_close":
 		return s.toolSessionClose(raw)
+	case "net_dns":
+		return s.toolNetDNS(raw)
+	case "net_dial":
+		return s.toolNetDial(raw)
+	case "net_tls":
+		return s.toolNetTLS(raw)
+	case "net_scan":
+		return s.toolNetScan(raw)
+	case "net_info":
+		return s.toolNetInfo(raw)
+	case "web_request":
+		return s.toolWebRequest(raw)
+	case "file_hash":
+		return s.toolFileHash(raw)
+	case "file_type":
+		return s.toolFileType(raw)
+	case "file_strings":
+		return s.toolFileStrings(raw)
+	case "file_hexdump":
+		return s.toolFileHexdump(raw)
+	case "file_entropy":
+		return s.toolFileEntropy(raw)
+	case "file_search":
+		return s.toolFileSearch(raw)
+	case "archive_list":
+		return s.toolArchiveList(raw)
+	case "archive_extract":
+		return s.toolArchiveExtract(raw)
+	case "binary_info":
+		return s.toolBinaryInfo(raw)
+	case "secret_scan":
+		return s.toolSecretScan(raw)
+	case "transform":
+		return s.toolTransform(raw)
 	default:
 		return errResult(codeUnsupported, "UNSUPPORTED", "unknown tool: "+name)
 	}
@@ -125,6 +165,7 @@ func (s *Server) toolAgentInfo() toolResult {
 		"isolation":       isolation,
 		"capabilities":    s.capabilities(),
 		"max_frame":       s.opts.MaxFrame,
+		"net_allow":       s.opts.NetAllow,
 	})
 }
 

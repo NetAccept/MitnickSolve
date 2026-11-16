@@ -307,7 +307,12 @@ fn create_task(app: &App, body: &[u8]) -> ApiResult {
         "interactive": interactive,
         "stream": body.get("stream").and_then(Value::as_bool).unwrap_or(true),
         "headless": headless,
-        "approvals": approvals
+        "approvals": approvals,
+        "mode": body.get("mode").and_then(Value::as_str).unwrap_or("auto"),
+        "permission": body
+            .get("permission")
+            .and_then(Value::as_str)
+            .unwrap_or("auto")
     });
     if let Some(model) = body
         .get("model")

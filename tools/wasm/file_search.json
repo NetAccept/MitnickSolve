@@ -1,0 +1,80 @@
+{
+  "name": "file_search",
+  "description": "Walk a workspace root and match file names or text content.",
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "env_id",
+      "pattern"
+    ],
+    "properties": {
+      "env_id": {
+        "type": "string",
+        "description": "Environment identifier returned by envd."
+      },
+      "root": {
+        "type": "string",
+        "description": "Workspace-relative directory to walk (defaults to the workspace root).",
+        "default": "."
+      },
+      "pattern": {
+        "type": "string",
+        "description": "Name or content pattern to find.",
+        "minLength": 1,
+        "maxLength": 512
+      },
+      "mode": {
+        "type": "string",
+        "description": "Match file names or file contents.",
+        "enum": [
+          "name",
+          "content"
+        ],
+        "default": "content"
+      },
+      "glob": {
+        "type": "string",
+        "description": "Optional glob filter applied to relative paths or base names."
+      },
+      "case_sensitive": {
+        "type": "boolean",
+        "description": "Match case-sensitively.",
+        "default": false
+      },
+      "regex": {
+        "type": "boolean",
+        "description": "Treat pattern as a regular expression.",
+        "default": false
+      },
+      "max_results": {
+        "type": "integer",
+        "description": "Maximum matches to return.",
+        "minimum": 1,
+        "maximum": 500,
+        "default": 100
+      },
+      "max_file_bytes": {
+        "type": "integer",
+        "description": "Maximum bytes read per file.",
+        "minimum": 1,
+        "maximum": 8388608,
+        "default": 1048576
+      },
+      "include_hidden": {
+        "type": "boolean",
+        "description": "Include hidden files and directories.",
+        "default": false
+      },
+      "max_files_walked": {
+        "type": "integer",
+        "description": "Maximum files to visit.",
+        "minimum": 1,
+        "maximum": 100000,
+        "default": 10000
+      }
+    }
+  },
+  "capabilities": [
+    "fs.workspace"
+  ]
+}

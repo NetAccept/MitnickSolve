@@ -1,0 +1,70 @@
+{
+  "name": "net_dial",
+  "description": "Open a TCP or TLS connection, optionally send bytes and read a bounded banner.",
+  "input_schema": {
+    "type": "object",
+    "required": [
+      "env_id",
+      "host",
+      "port"
+    ],
+    "properties": {
+      "env_id": {
+        "type": "string",
+        "description": "Environment identifier returned by envd."
+      },
+      "host": {
+        "type": "string",
+        "description": "Hostname or IP address to connect to."
+      },
+      "port": {
+        "type": "integer",
+        "description": "TCP port to connect to.",
+        "minimum": 1,
+        "maximum": 65535
+      },
+      "send_base64": {
+        "type": "string",
+        "description": "Base64 bytes to send after connecting (maximum 64 KiB)."
+      },
+      "read_bytes": {
+        "type": "integer",
+        "description": "Maximum bytes to read after connecting.",
+        "minimum": 0,
+        "maximum": 65536,
+        "default": 1024
+      },
+      "timeout_ms": {
+        "type": "integer",
+        "description": "Connect, write and handshake timeout in milliseconds.",
+        "minimum": 100,
+        "maximum": 30000,
+        "default": 5000
+      },
+      "tls": {
+        "type": "boolean",
+        "description": "Wrap the connection in TLS after connecting.",
+        "default": false
+      },
+      "server_name": {
+        "type": "string",
+        "description": "TLS SNI and verification name; defaults to host."
+      },
+      "insecure_tls": {
+        "type": "boolean",
+        "description": "Skip TLS certificate verification.",
+        "default": false
+      },
+      "alpn": {
+        "type": "array",
+        "description": "Optional ALPN protocols to offer.",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "capabilities": [
+    "net.egress"
+  ]
+}
