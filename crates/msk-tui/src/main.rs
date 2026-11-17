@@ -859,6 +859,7 @@ fn build_chat_group(line: &ChatLine, width: u16) -> ChatGroup {
         0
     } else {
         Paragraph::new(Text::from(lines.clone()))
+            .wrap(Wrap { trim: false })
             .line_count(width)
             .max(1)
     };
