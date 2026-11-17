@@ -4016,6 +4016,17 @@ fn main() -> Result<()> {
     }
 
     enable_raw_mode()?;
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
+        hook(info);
+    }));
     let mut out = stdout();
     execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(out);
