@@ -4252,6 +4252,9 @@ impl DaemonApp {
     }
 
     fn draw_footer(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let right = format!("MitnickSolve {VERSION}");
+        let right_width = UnicodeWidthStr::width(right.as_str()) as u16;
+        let left_width = area.width.saturating_sub(right_width + 5).max(10);
         let mut spans = vec![
             Span::styled(self.workspace_label(), Style::default().fg(FAINT)),
             Span::styled("  ·  ", Style::default().fg(FAINT)),
@@ -4260,7 +4263,7 @@ impl DaemonApp {
                 Style::default().fg(permission_color(&self.display_permission())),
             ),
         ];
-        if self.selected_task_id().is_some() {
+        if left_width >= 80 && self.selected_task_id().is_some() {
             let (tokens, tools) = self.selected_usage();
             if tokens > 0 {
                 spans.push(Span::styled("  ·  ", Style::default().fg(FAINT)));
@@ -4277,10 +4280,14 @@ impl DaemonApp {
                 ));
             }
         }
-        if !self.auto_scroll && self.selected_task_id().is_some() {
+        if !self.auto_scroll && self.selected_task_id().is_some() && left_width >= 70 {
             spans.push(Span::styled("  ·  ", Style::default().fg(FAINT)));
             spans.push(Span::styled(
-                "↑ scrollback · End follows",
+                if left_width >= 90 {
+                    "↑ scrollback · End follows"
+                } else {
+                    "↑ scrollback"
+                },
                 Style::default().fg(YELLOW),
             ));
         }
@@ -4289,13 +4296,11 @@ impl DaemonApp {
             Rect {
                 x: area.x + 2,
                 y: area.y,
-                width: area.width.saturating_sub(4),
+                width: left_width,
                 height: 1,
             },
         );
-        let right = format!("MitnickSolve {VERSION}");
-        let width = UnicodeWidthStr::width(right.as_str()) as u16;
-        if area.width > width + 4 {
+        if area.width > right_width + 4 {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(right, Style::default().fg(FAINT))))
                     .alignment(Alignment::Right),
