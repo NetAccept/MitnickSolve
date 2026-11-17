@@ -167,7 +167,9 @@ workspace, so the agent sees `./challenge` immediately. Use `--workspace <dir>`
 on `msk`/`mskd` to point it elsewhere. With no API key it uses the offline
 `scripted-demo` provider; type a message and press Enter to create a task, or
 `/demo` for the canned tool demo. Press `Ctrl+P` (or `/setup`) to choose
-provider, model and reasoning effort; `/provider openai` is the quick switch.
+provider, model, reasoning effort and API key; the result is saved as a provider
+profile. `Ctrl+P` → **Providers** (`/providers`) switches between saved
+providers or edits their keys, and `/provider openai` is the quick switch.
 See [`docs/tui.md`](docs/tui.md) for keys, slash commands, approvals, history,
 diagnostics, and troubleshooting.
 

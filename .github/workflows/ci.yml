@@ -293,8 +293,14 @@ jobs:
             --snapshot-modes | grep -q "agent mode"
           target/debug/msk-tui --root .msk/ci --snapshot --provider scripted \
             --snapshot-permissions | grep -q "permissions"
+          target/debug/msk-tui --root .msk/ci --snapshot --provider scripted \
+            --snapshot-providers | grep -q "No saved providers"
           target/debug/msk-tui --root .msk/ci --snapshot --setup --setup-step effort \
             --provider openai | grep -q "Reasoning effort"
+          target/debug/msk-tui --root .msk/ci --snapshot --setup --setup-step service \
+            --provider openai | grep -q "DeepSeek"
+          target/debug/msk-tui --root .msk/ci --snapshot --setup --setup-step key \
+            --provider openai | grep -q "API key"
       - name: TLS service and data plane smoke
         run: |
           set -euo pipefail

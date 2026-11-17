@@ -267,7 +267,7 @@
                   │ MitnickSolve   connect a model                                                   │
                   │ You can change all of this later with ctrl+p.                                    │
                   │                                                                                  │
-                  │ ● provider  ›  ○ model  ›  ○ effort  ›  ○ endpoint                               │
+                  │ ● provider  ›  ○ service  ›  ○ model  ›  ○ effort  ›  ○ endpoint  ›  ○ key      │
                   │                                                                                  │
                   │ Choose how the agent reaches a model                                             │
                   │ scripted-demo needs no key and works offline.                                    │
@@ -278,7 +278,7 @@
                   │   component           signed llm.provider component configured on mskd           │
                   │                                                                                  │
                   │                                                                                  │
-                  │ mskd is missing MSK_LLM_API_KEY (export it before starting mskd)                 │
+                  │ no API key yet (type one in setup or export MSK_LLM_API_KEY in mskd)            │
                   │ config  C:\Users\cy\MitnickSolve\.msk\ui-home2\tui-config.json                   │
                   │ ↑/↓ choose   Enter next   Esc back/close   Ctrl+U clear input                    │
                   │                                                                                  │
@@ -291,7 +291,7 @@
                   │ MitnickSolve   connect a model                                                   │
                   │ You can change all of this later with ctrl+p.                                    │
                   │                                                                                  │
-                  │ ○ provider  ›  ● model  ›  ○ effort  ›  ○ endpoint                               │
+                  │ ○ provider  ›  ○ service  ›  ● model  ›  ○ effort  ›  ○ endpoint  ›  ○ key      │
                   │                                                                                  │
                   │ Model for openai                                                                 │
                   │ Choose a preset, or type an exact model id.                                      │
@@ -303,7 +303,7 @@
                   │ ❯ custom…             type any model id                                          │
                   │                                                                                  │
                   │                                                                                  │
-                  │ mskd is missing MSK_LLM_API_KEY (export it before starting mskd)                 │
+                  │ no API key yet (type one in setup or export MSK_LLM_API_KEY in mskd)            │
                   │ config  C:\Users\cy\MitnickSolve\.msk\ui-home2\tui-config.json                   │
                   │ ↑/↓ choose   Enter next   Esc back/close   Ctrl+U clear input                    │
                   ╰──────────────────────────────────────────────────────────────────────────────────╯
@@ -315,7 +315,7 @@
                   │ MitnickSolve   connect a model                                                   │
                   │ You can change all of this later with ctrl+p.                                    │
                   │                                                                                  │
-                  │ ○ provider  ›  ○ model  ›  ● effort  ›  ○ endpoint                               │
+                  │ ○ provider  ›  ○ service  ›  ○ model  ›  ● effort  ›  ○ endpoint  ›  ○ key      │
                   │                                                                                  │
                   │ Reasoning effort                                                                 │
                   │ Sent to OpenAI-compatible providers that support it.                             │
@@ -327,14 +327,14 @@
                   │   high                deep reasoning                                             │
                   │                                                                                  │
                   │                                                                                  │
-                  │ mskd is missing MSK_LLM_API_KEY (export it before starting mskd)                 │
+                  │ no API key yet (type one in setup or export MSK_LLM_API_KEY in mskd)            │
                   │ config  C:\Users\cy\MitnickSolve\.msk\ui-home2\tui-config.json                   │
                   │ ↑/↓ choose   Enter next   Esc back/close   Ctrl+U clear input                    │
                   ╰──────────────────────────────────────────────────────────────────────────────────╯
   ~                                                                                                 MitnickSolve 0.1.1</pre>
       </div>
-      <p class="caption">The provider list distinguishes the offline demo, Chat Completions, Responses and component providers. Model presets include a custom input; effort is sent as <code>reasoning_effort</code> or <code>reasoning.effort</code>. The header shows the active <code>provider / model / effort</code> at all times.</p>
-      <div class="callout"><strong>No key, no fake success:</strong> if the daemon is missing <code>MSK_LLM_API_KEY</code>, the setup screen says so and session creation stops with an actionable message instead of spawning a task that immediately fails.</div>
+      <p class="caption">The provider list distinguishes the offline demo, Chat Completions, Responses and component providers. The service step offers endpoint presets for OpenAI, DeepSeek, OpenRouter, Groq, Together, Ollama and LM Studio; model presets include a custom input; effort is sent as <code>reasoning_effort</code> or <code>reasoning.effort</code>. The final step accepts an API key (masked), and the result is saved as a provider profile. The header shows the active <code>provider / model / effort</code> at all times.</p>
+      <div class="callout"><strong>No key, no fake success:</strong> if neither a saved profile key nor the daemon's <code>MSK_LLM_API_KEY</code> is available, the setup screen says so and session creation stops with an actionable message instead of spawning a task that immediately fails.</div>
     </div>
   </section>
 

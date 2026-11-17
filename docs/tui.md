@@ -67,16 +67,17 @@ With no configured provider, a full-screen setup card opens first. Choose
 `scripted-demo` to try the app offline with no key, or `openai` /
 `openai-responses` for a real model.
 
-## Setup: provider, model and effort
+## Setup: provider, model, effort and key
 
-`Ctrl+P` → **Provider and model**, or `/setup`, or `msk-tui --setup`.
+`Ctrl+P` → **Providers** for saved profiles, or **Provider and model** (`/setup`,
+`msk-tui --setup`) for the step-by-step wizard.
 
 ```text
                   ╭ setup ───────────────────────────────────────────────────────────────────────────╮
                   │ MitnickSolve   connect a model                                                   │
                   │ You can change all of this later with ctrl+p.                                    │
                   │                                                                                  │
-                  │ ● provider  ›  ○ model  ›  ○ effort  ›  ○ endpoint                               │
+                  │ ● provider  ›  ○ service  ›  ○ model  ›  ○ effort  ›  ○ endpoint  ›  ○ key      │
                   │                                                                                  │
                   │ Choose how the agent reaches a model                                             │
                   │ scripted-demo needs no key and works offline.                                    │
@@ -86,7 +87,7 @@ With no configured provider, a full-screen setup card opens first. Choose
                   │   openai-responses    OpenAI Responses API function calls                        │
                   │   component           signed llm.provider component configured on mskd          │
                   │                                                                                  │
-                  │ mskd is missing MSK_LLM_API_KEY (export it before starting mskd)                 │
+                  │ no API key yet (type one here or export MSK_LLM_API_KEY in mskd)                 │
                   │ config  C:\Users\cy\MitnickSolve\.msk\ui-home2\tui-config.json                   │
                   │ ↑/↓ choose   Enter next   Esc back/close   Ctrl+U clear input                    │
                   ╰──────────────────────────────────────────────────────────────────────────────────╯
@@ -94,17 +95,58 @@ With no configured provider, a full-screen setup card opens first. Choose
 
 1. **Provider** — `scripted-demo` (offline), `openai` (Chat Completions),
    `openai-responses`, or a signed `component`.
-2. **Model** — presets (`gpt-5`, `gpt-5-mini`, `o3`, `o4-mini`) or any custom
+2. **Service** — endpoint presets: OpenAI, DeepSeek, OpenRouter, Groq, Together,
+   local Ollama, local LM Studio, or a custom endpoint. A preset fills the base
+   URL and suggests a model; it never overwrites an existing profile's model.
+3. **Model** — presets (`gpt-5`, `gpt-5-mini`, `o3`, `o4-mini`) or any custom
    model id.
-3. **Effort** — `default`, `minimal`, `low`, `medium`, `high`. It is sent as
+4. **Effort** — `default`, `minimal`, `low`, `medium`, `high`. It is sent as
    `reasoning_effort` (Chat Completions) or `reasoning.effort` (Responses).
-4. **Endpoint** — optional OpenAI-compatible base URL. Empty uses
+5. **Endpoint** — optional OpenAI-compatible base URL. Empty uses
    `MSK_LLM_BASE_URL` or the provider default.
+6. **API key** — masked while you type or paste. Empty keeps using the daemon's
+   `MSK_LLM_API_KEY`. The wizard saves the result as a provider profile, so the
+   key does not need to be exported again.
 
-The choice is saved to `<root>/tui-config.json` and applies to new sessions.
-The API key is never stored in that file or sent over IPC; export
-`MSK_LLM_API_KEY` where `mskd` starts. The setup card reports whether the daemon
-sees it. `msk-tui --doctor` checks daemon, envd, tools and key presence.
+`scripted-demo` and `component` skip the service, model, effort, endpoint and
+key steps and save immediately.
+
+## Providers and API keys
+
+`Ctrl+P` → **Providers** (or `/providers`) lists every saved endpoint. Each row
+shows the provider, model, effort, base URL and whether a key is set.
+
+```text
+                ╭ providers ───────────────────────────────────────────────────────────────────────────╮
+                │ Saved provider profiles. Switch with Enter; keys stay on this machine.               │
+                │                                                                                      │
+                │ ❯ ● openai · gpt-5                                                                   │
+                │     openai · gpt-5 · effort high · https://api.openai.com/v1 · key set               │
+                │   ○ local · qwen3                                                                    │
+                │     openai · qwen3 · effort default · http://127.0.0.1:8000/v1 · key set             │
+                │                                                                                      │
+                │ ↑/↓ choose · Enter use · n new · e edit · d delete · s setup · Esc close             │
+                ╰──────────────────────────────────────────────────────────────────────────────────────╯
+```
+
+| Key | Action |
+| --- | --- |
+| `Enter` | make the selected profile active for the next session |
+| `n` | add a profile (opens the wizard with empty model, endpoint and key) |
+| `e` | edit the selected profile, including replacing or clearing its key |
+| `s` | open the full setup wizard from the current settings |
+| `d` | delete; press `d` again on the same row to confirm |
+| `↑` / `↓`, `j` / `k` | move; `g` / `G` jump to the first or last profile |
+
+Switching profiles loads its provider, model, effort, endpoint and key, and
+starts a fresh session on the next message. Active settings are also written to
+`<root>/tui-config.json`; the profiles list lives under the same file's
+`profiles` array. Keys are stored locally in that file (mode `0600` on Unix,
+the usual user-profile ACL on Windows) and are sent to `mskd` over the local IPC
+socket only when creating a task; the daemon passes the key to the agent
+subprocess through its environment. Nothing is sent anywhere else. If you do not
+want keys on disk, leave the key empty and export `MSK_LLM_API_KEY` where `mskd`
+starts. `msk-tui --doctor` checks daemon, envd, tools and key presence.
 
 ## Command palette and sessions
 
@@ -118,7 +160,8 @@ Enter to run, Esc to close.
                       │ › New session               start a fresh conversation                    │
                       │   Sessions                  switch to another session (tab)               │
                       │   Resume latest             restore the newest checkpoint                 │
-                      │   Provider and model        choose provider, model, effort                │
+                      │   Providers                 saved provider profiles and API keys        │
+                      │   Provider and model        choose provider, model, effort, key           │
                       │   Model                     pick a model preset                           │
                       │   Reasoning effort          minimal, low, medium, high                    │
                       │   Agent mode                plan, investigate, exploit, harden, auto       │
@@ -232,7 +275,7 @@ Press `y` to approve or `n`/`Esc` to deny. Approvals are also hydrated from
 Slash commands still work if you prefer typing them:
 
 ```text
-/new [goal]   /demo        /provider NAME   /models      /model NAME
+/new [goal]   /demo        /providers      /provider NAME   /models      /model NAME
 /effort NAME  /setup       /resume          /sessions    /terminal
 /events       /approvals   /findings      /interrupt   /cancel      /clear
 /mode         /mode NAME   /status        /help        /quit
@@ -292,7 +335,10 @@ marks old session ids stale. Forks always use a fresh environment.
 
 ## Real models
 
-Set the OpenAI-compatible environment before launching:
+The easiest path is the wizard: `Ctrl+P` → **Provider and model**, enter the
+model, base URL and API key, and it becomes a saved profile.
+
+If you prefer environment variables, set them before launching:
 
 ```sh
 export MSK_LLM_BASE_URL=https://api.openai.com/v1
@@ -302,8 +348,9 @@ target/debug/msk
 ```
 
 The setup card auto-selects `openai` when the daemon already has a key and model.
-`MSK_PROVIDER` overrides the selection for one shell. If the key is missing, the
-composer shows `missing MSK_LLM_API_KEY` in amber instead of failing silently.
+`MSK_PROVIDER` overrides the selection for one shell. If neither a saved profile
+key nor `MSK_LLM_API_KEY` is present, the composer shows
+`missing API key · ctrl+p providers` in amber instead of failing silently.
 
 ## Demos
 
@@ -349,11 +396,12 @@ target/debug/msk-tui --doctor
 target/debug/msk-tui --root .msk --snapshot
 target/debug/msk-tui --root .msk --snapshot --snapshot-palette
 target/debug/msk-tui --root .msk --snapshot --snapshot-sessions
+target/debug/msk-tui --root .msk --snapshot --snapshot-providers
 ```
 
 `--doctor` reports the daemon, envd, tools directory, provider, model and key
 presence. `--snapshot` renders one real frame to stdout (no alternate screen);
-it is useful for CI and bug reports. The two hidden snapshot flags render the
+it is useful for CI and bug reports. The hidden snapshot flags render the
 overlays for documentation screenshots.
 
 The raw event viewer remains available without a daemon:
@@ -368,13 +416,18 @@ target/debug/msk-tui --events .msk/events.jsonl
   `MSK_MSKD`/`MSK_ENVD`.
 - **`tools directory not found`** — run from the repository root, set
   `MSK_TOOLS_DIR`, or keep `tools/wasm` under an executable ancestor.
-- **OpenAI task fails immediately** — run `--doctor`; check `MSK_LLM_MODEL`,
-  `MSK_LLM_API_KEY` and `MSK_LLM_BASE_URL`. See `.msk/mskd.log` and the task's
-  `agent.stderr.log`.
-- **`missing MSK_LLM_API_KEY` in the composer** — the key must be in the
-  daemon's environment, not the TUI's. Export it before `msk` starts, or stop the
-  running `mskd` and relaunch. `Ctrl+P` still works while typing; use
-  **Provider and model** or choose `scripted-demo` to work offline.
+- **OpenAI task fails immediately** — run `--doctor`; check the selected
+  profile's model, base URL and key in **Providers**, or the `MSK_LLM_MODEL`,
+  `MSK_LLM_API_KEY` and `MSK_LLM_BASE_URL` environment. See `.msk/mskd.log` and
+  the task's `agent.stderr.log`.
+- **`missing API key` in the composer** — open `Ctrl+P` → **Providers**, edit
+  the profile and paste a key, or export `MSK_LLM_API_KEY` before `mskd` starts.
+  A saved key is sent per task, so an already running daemon picks it up without
+  a restart. `Ctrl+P` still works while typing; choose `scripted-demo` to work
+  offline.
+- **A saved key is not used** — check that the active row in **Providers** has
+  `●` and `key set`; `Enter` activates it, then send a message to start the new
+  session. `--doctor` still reports only the *environment* key.
 - **Keys seem ignored** — `Ctrl+P`, `Tab` and `F1` are handled even while the
   composer has focus. If a terminal focus lost its PTY, press `Ctrl+Q`; the TUI
   also clears that state automatically on the next key.

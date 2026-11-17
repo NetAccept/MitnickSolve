@@ -69,8 +69,13 @@ const COMMANDS: &[CommandEntry] = &[
         command: "/resume",
     },
     CommandEntry {
+        label: "Providers",
+        hint: "saved provider profiles and API keys",
+        command: "/providers",
+    },
+    CommandEntry {
         label: "Provider and model",
-        hint: "choose provider, model, effort",
+        hint: "choose provider, model, effort, key",
         command: "/setup",
     },
     CommandEntry {
@@ -231,6 +236,36 @@ const PROVIDERS: &[(&str, &str)] = &[
 ];
 
 const MODELS: &[&str] = &["gpt-5", "gpt-5-mini", "o3", "o4-mini", "custom…"];
+const SERVICE_PRESETS: &[(&str, &str, &str, &str)] = &[
+    ("openai", "OpenAI", "https://api.openai.com/v1", "gpt-5"),
+    (
+        "deepseek",
+        "DeepSeek",
+        "https://api.deepseek.com/v1",
+        "deepseek-chat",
+    ),
+    (
+        "openrouter",
+        "OpenRouter",
+        "https://openrouter.ai/api/v1",
+        "openai/gpt-5",
+    ),
+    (
+        "groq",
+        "Groq",
+        "https://api.groq.com/openai/v1",
+        "llama-3.3-70b-versatile",
+    ),
+    ("together", "Together", "https://api.together.xyz/v1", ""),
+    ("ollama", "Ollama (local)", "http://127.0.0.1:11434/v1", ""),
+    (
+        "lmstudio",
+        "LM Studio (local)",
+        "http://127.0.0.1:1234/v1",
+        "",
+    ),
+    ("custom", "Custom endpoint", "", ""),
+];
 const PERMISSIONS: &[(&str, &str)] = &[
     (
         "auto",
@@ -342,6 +377,10 @@ struct TuiConfig {
     mode: String,
     #[serde(default = "default_permission")]
     permission: String,
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    profiles: Vec<ProviderProfile>,
 }
 
 impl Default for TuiConfig {
@@ -353,6 +392,8 @@ impl Default for TuiConfig {
             base_url: String::new(),
             mode: default_mode(),
             permission: default_permission(),
+            api_key: String::new(),
+            profiles: Vec::new(),
         }
     }
 }
@@ -391,6 +432,17 @@ fn provider_index(provider: &str) -> usize {
         .unwrap_or(0)
 }
 
+fn preset_index(base_url: &str) -> usize {
+    let base_url = base_url.trim();
+    if base_url.is_empty() {
+        return 0;
+    }
+    SERVICE_PRESETS
+        .iter()
+        .position(|(_, _, url, _)| *url == base_url)
+        .unwrap_or(SERVICE_PRESETS.len() - 1)
+}
+
 fn model_index(model: &str) -> usize {
     MODELS
         .iter()
@@ -412,21 +464,43 @@ fn requires_key(provider: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupStep {
     Provider,
+    Preset,
     Model,
     CustomModel,
     Effort,
     BaseUrl,
+    ApiKey,
 }
 
 #[derive(Debug, Clone)]
 struct SetupState {
     step: SetupStep,
     provider: usize,
+    preset: usize,
     model: usize,
     effort: usize,
     model_input: String,
     base_url: String,
+    api_key: String,
     input_cursor: usize,
+    /// Index of the saved profile being edited. `None` creates or updates one.
+    edit_profile: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ProviderProfile {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    effort: String,
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    api_key: String,
 }
 
 impl SetupState {
@@ -453,6 +527,7 @@ impl SetupState {
         Self {
             step: SetupStep::Provider,
             provider: provider_index(&provider),
+            preset: preset_index(&base_url),
             model: model_index,
             effort: effort_index(&app.effort),
             model_input: if model_index == MODELS.len() - 1 {
@@ -461,8 +536,36 @@ impl SetupState {
                 String::new()
             },
             base_url,
+            api_key: app.api_key.clone(),
             input_cursor: 0,
+            edit_profile: None,
         }
+    }
+
+    fn from_profile(app: &DaemonApp, index: usize) -> Option<Self> {
+        let profile = app.profiles.get(index)?;
+        let effort = if profile.effort.is_empty() {
+            default_effort()
+        } else {
+            profile.effort.clone()
+        };
+        let model_index = model_index(&profile.model);
+        Some(Self {
+            step: SetupStep::Provider,
+            provider: provider_index(&profile.provider),
+            preset: preset_index(&profile.base_url),
+            model: model_index,
+            effort: effort_index(&effort),
+            model_input: if model_index == MODELS.len() - 1 {
+                profile.model.clone()
+            } else {
+                String::new()
+            },
+            base_url: profile.base_url.clone(),
+            api_key: profile.api_key.clone(),
+            input_cursor: 0,
+            edit_profile: Some(index),
+        })
     }
 
     fn selected_provider(&self) -> &str {
@@ -476,6 +579,55 @@ impl SetupState {
             MODELS[self.model].to_string()
         }
     }
+}
+
+fn profile_name(provider: &str, model: &str) -> String {
+    if model.trim().is_empty() {
+        provider.to_string()
+    } else {
+        format!("{provider} · {}", model.trim())
+    }
+}
+
+fn unique_profile_name(profiles: &[ProviderProfile], base: &str) -> String {
+    unique_profile_name_excluding(profiles, base, None)
+}
+
+fn unique_profile_name_excluding(
+    profiles: &[ProviderProfile],
+    base: &str,
+    except: Option<usize>,
+) -> String {
+    let taken = |name: &str| {
+        profiles
+            .iter()
+            .enumerate()
+            .any(|(index, profile)| Some(index) != except && profile.name == name)
+    };
+    if !taken(base) {
+        return base.to_string();
+    }
+    for suffix in 2..1000 {
+        let candidate = format!("{base} ({suffix})");
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    base.to_string()
+}
+
+/// One bullet per character keeps the caret position exact while never
+/// putting the key itself on screen.
+fn masked_key(key: &str) -> String {
+    "•".repeat(key.chars().count())
+}
+
+/// Pasted keys often carry a trailing newline or wrapping spaces from the
+/// browser; neither belongs in the header value.
+fn clean_key_paste(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,8 +714,8 @@ struct Cli {
     /// Open the provider/model/effort setup wizard on launch.
     #[arg(long)]
     setup: bool,
-    /// Diagnostic: open the setup wizard at provider, model, effort, or base.
-    #[arg(long, value_parser = ["provider", "model", "effort", "base"])]
+    /// Diagnostic: open the setup wizard at provider, service, model, effort, base, or key.
+    #[arg(long, value_parser = ["provider", "service", "model", "effort", "base", "key"])]
     setup_step: Option<String>,
     /// Diagnostic: render the command palette in a snapshot.
     #[arg(long, hide = true)]
@@ -577,6 +729,9 @@ struct Cli {
     /// Diagnostic: render the agent mode picker in a snapshot.
     #[arg(long, hide = true)]
     snapshot_modes: bool,
+    /// Diagnostic: render the provider profile picker in a snapshot.
+    #[arg(long, hide = true)]
+    snapshot_providers: bool,
     /// Diagnostic: render the permission picker in a snapshot.
     #[arg(long, hide = true)]
     snapshot_permissions: bool,
@@ -1020,6 +1175,11 @@ struct DaemonApp {
     model: String,
     effort: String,
     base_url: String,
+    api_key: String,
+    profiles: Vec<ProviderProfile>,
+    show_providers: bool,
+    provider_selection: usize,
+    provider_delete_armed: Option<usize>,
     mode: String,
     modes: Vec<ModeInfo>,
     permission: String,
@@ -1115,6 +1275,16 @@ impl DaemonApp {
             config.effort = default_effort();
             config.base_url.clear();
         }
+        if config.api_key.is_empty() {
+            if let Some(profile) = config.profiles.iter().find(|profile| {
+                profile.provider == config.provider
+                    && profile.model == config.model
+                    && profile.base_url == config.base_url
+                    && !profile.api_key.is_empty()
+            }) {
+                config.api_key = profile.api_key.clone();
+            }
+        }
         let mut app = Self {
             client,
             root,
@@ -1138,6 +1308,11 @@ impl DaemonApp {
             model: config.model,
             effort: config.effort,
             base_url: config.base_url,
+            api_key: config.api_key,
+            profiles: config.profiles,
+            show_providers: false,
+            provider_selection: 0,
+            provider_delete_armed: None,
             mode: config.mode,
             modes,
             permission: config.permission,
@@ -1228,6 +1403,8 @@ impl DaemonApp {
             base_url: self.base_url.clone(),
             mode: self.mode.clone(),
             permission: self.permission.clone(),
+            api_key: self.api_key.clone(),
+            profiles: self.profiles.clone(),
         };
         if let Err(err) = config.save(&self.root) {
             self.status = format!("save config failed: {err}");
@@ -1876,6 +2053,7 @@ impl DaemonApp {
                 self.status = "help".into();
             }
             "/setup" => self.open_setup(),
+            "/providers" => self.open_providers(),
             "/resume" => self.resume_latest(),
             "/sessions" => {
                 self.show_sessions = !self.show_sessions;
@@ -2086,8 +2264,8 @@ impl DaemonApp {
         resume_checkpoint: Option<&Path>,
     ) {
         if requires_key(&self.provider) {
-            if !self.daemon_llm_key {
-                self.status = "missing MSK_LLM_API_KEY · Ctrl+P → Provider".into();
+            if !self.has_llm_key() {
+                self.status = "missing API key · Ctrl+P → Providers".into();
                 return;
             }
             if self.model.trim().is_empty() && self.daemon_llm_model.is_none() {
@@ -2115,6 +2293,9 @@ impl DaemonApp {
             }
             if !self.base_url.trim().is_empty() {
                 params["base_url"] = json!(self.base_url.trim());
+            }
+            if requires_key(&self.provider) && !self.api_key.trim().is_empty() {
+                params["api_key"] = json!(self.api_key.trim());
             }
             if let Some(checkpoint) = resume_checkpoint {
                 params["resume_checkpoint"] = json!(checkpoint.display().to_string());
@@ -2252,6 +2433,10 @@ impl DaemonApp {
     }
 
     fn handle_paste(&mut self, text: &str) {
+        if self.setup.is_some() {
+            self.setup_paste(text);
+            return;
+        }
         if self.terminal_focus {
             if let Some(data) = self.terminal_data.as_ref() {
                 if let Err(err) = data.send_data(text.as_bytes()) {
@@ -2479,6 +2664,151 @@ impl DaemonApp {
         false
     }
 
+    fn has_llm_key(&self) -> bool {
+        self.daemon_llm_key || !self.api_key.trim().is_empty()
+    }
+
+    fn active_profile_index(&self) -> Option<usize> {
+        self.profiles.iter().position(|profile| {
+            profile.provider == self.provider
+                && profile.model == self.model
+                && profile.effort == self.effort
+                && profile.base_url == self.base_url
+                && profile.api_key == self.api_key
+        })
+    }
+
+    fn open_providers(&mut self) {
+        self.composing = false;
+        self.show_providers = true;
+        self.provider_delete_armed = None;
+        self.provider_selection = self
+            .active_profile_index()
+            .unwrap_or(0)
+            .min(self.profiles.len().saturating_sub(1));
+        self.status = if self.profiles.is_empty() {
+            "no saved providers · n add one".into()
+        } else {
+            format!(
+                "{} provider profile(s) · Enter use · n new · e edit · d delete",
+                self.profiles.len()
+            )
+        };
+    }
+
+    fn activate_profile(&mut self, index: usize) {
+        let Some(profile) = self.profiles.get(index).cloned() else {
+            return;
+        };
+        self.provider = if profile.provider.is_empty() {
+            default_provider()
+        } else {
+            profile.provider.clone()
+        };
+        self.model = profile.model.clone();
+        self.effort = if profile.effort.is_empty() {
+            default_effort()
+        } else {
+            profile.effort.clone()
+        };
+        self.base_url = profile.base_url.clone();
+        self.api_key = profile.api_key.clone();
+        self.show_providers = false;
+        self.provider_delete_armed = None;
+        self.save_config();
+        let name = if profile.name.is_empty() {
+            profile_name(&self.provider, &self.model)
+        } else {
+            profile.name.clone()
+        };
+        if requires_key(&self.provider) && !self.has_llm_key() {
+            self.status = format!("{name} selected · API key missing · e to edit");
+        } else if self.selected_task_id().is_some() {
+            self.new_task = true;
+            self.composing = true;
+            self.status = format!("new session provider: {name} (send a message to start)");
+        } else {
+            self.status = format!("next session provider: {name}");
+        }
+    }
+
+    fn providers_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc | KeyCode::Tab => {
+                self.show_providers = false;
+                self.provider_delete_armed = None;
+                self.status.clear();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.provider_delete_armed = None;
+                self.provider_selection = self.provider_selection.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.provider_delete_armed = None;
+                if !self.profiles.is_empty() {
+                    self.provider_selection =
+                        (self.provider_selection + 1).min(self.profiles.len() - 1);
+                }
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.provider_delete_armed = None;
+                self.provider_selection = 0;
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.provider_delete_armed = None;
+                self.provider_selection = self.profiles.len().saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                if !self.profiles.is_empty() {
+                    let index = self.provider_selection.min(self.profiles.len() - 1);
+                    self.activate_profile(index);
+                }
+            }
+            KeyCode::Char('n') => {
+                self.show_providers = false;
+                self.open_setup_new();
+            }
+            KeyCode::Char('e') => {
+                if !self.profiles.is_empty() {
+                    let index = self.provider_selection.min(self.profiles.len() - 1);
+                    self.open_setup_edit_profile(index);
+                }
+            }
+            KeyCode::Char('s') => {
+                self.show_providers = false;
+                self.open_setup();
+            }
+            KeyCode::Char('d') => {
+                if self.profiles.is_empty() {
+                    return false;
+                }
+                let index = self.provider_selection.min(self.profiles.len() - 1);
+                if self.provider_delete_armed == Some(index) {
+                    let name = std::mem::take(&mut self.profiles[index].name);
+                    self.profiles.remove(index);
+                    self.provider_selection = self
+                        .provider_selection
+                        .min(self.profiles.len().saturating_sub(1));
+                    self.provider_delete_armed = None;
+                    self.save_config();
+                    self.status = if name.is_empty() {
+                        "provider profile deleted".into()
+                    } else {
+                        format!("provider profile {name} deleted")
+                    };
+                } else {
+                    self.provider_delete_armed = Some(index);
+                    let name = self.profiles[index].name.clone();
+                    self.status = format!("press d again to delete {name}");
+                }
+            }
+            _ => {
+                self.provider_delete_armed = None;
+            }
+        }
+        false
+    }
+
     fn mode_key(&mut self, key: KeyEvent) -> bool {
         if self.modes.is_empty() {
             self.show_modes = false;
@@ -2589,6 +2919,10 @@ impl DaemonApp {
 
         if self.show_modes {
             return self.mode_key(key);
+        }
+
+        if self.show_providers {
+            return self.providers_key(key);
         }
 
         if self.show_permissions {
@@ -2863,6 +3197,7 @@ impl DaemonApp {
             && !self.show_sessions
             && !self.show_findings
             && !self.show_modes
+            && !self.show_providers
             && !self.show_permissions
             && !self.show_help;
         let modal = !focused;
@@ -2900,6 +3235,9 @@ impl DaemonApp {
         }
         if self.show_modes {
             self.draw_modes(frame, area);
+        }
+        if self.show_providers {
+            self.draw_providers(frame, area);
         }
         if self.show_permissions {
             self.draw_permissions(frame, area);
@@ -3244,10 +3582,10 @@ impl DaemonApp {
                 Style::default().fg(DIM).bg(PANEL),
             ));
         }
-        if requires_key(&self.provider) && !self.daemon_llm_key {
+        if requires_key(&self.provider) && !self.has_llm_key() {
             meta.push(Span::styled("  ·  ", Style::default().fg(FAINT).bg(PANEL)));
             meta.push(Span::styled(
-                "missing MSK_LLM_API_KEY",
+                "missing API key · ctrl+p providers",
                 Style::default().fg(YELLOW).bg(PANEL),
             ));
         }
@@ -3787,6 +4125,137 @@ impl DaemonApp {
         );
     }
 
+    fn draw_providers(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let width = 88.min(area.width.saturating_sub(6)).max(36);
+        let rows = if self.profiles.is_empty() {
+            3
+        } else {
+            self.profiles.len() * 2 + 1
+        };
+        let armed = if self.provider_delete_armed.is_some() {
+            1
+        } else {
+            0
+        };
+        let height = (rows as u16 + 5 + armed)
+            .min(area.height.saturating_sub(4))
+            .max(10);
+        let area = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, area);
+        let block = panel_block("providers", ACCENT);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "Saved provider profiles. Switch with Enter; keys stay on this machine.",
+                Style::default().fg(DIM),
+            )),
+            Line::from(""),
+        ];
+        if self.profiles.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No saved providers yet.",
+                Style::default().fg(TEXT),
+            )));
+            lines.push(Line::from(Span::styled(
+                "Press n to add one, or s for the full setup.",
+                Style::default().fg(DIM),
+            )));
+        }
+        let active = self.active_profile_index();
+        for (index, profile) in self.profiles.iter().enumerate() {
+            let selected = index == self.provider_selection;
+            let current = active == Some(index);
+            let name = if profile.name.is_empty() {
+                profile_name(&profile.provider, &profile.model)
+            } else {
+                profile.name.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { "❯ " } else { "  " },
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled(
+                    if current { "● " } else { "○ " },
+                    Style::default().fg(if current { GREEN } else { FAINT }),
+                ),
+                Span::styled(
+                    name,
+                    if selected {
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(TEXT)
+                    },
+                ),
+            ]));
+            let model = if profile.model.is_empty() {
+                "-".to_string()
+            } else {
+                profile.model.clone()
+            };
+            let effort = if profile.effort.is_empty() {
+                "default".to_string()
+            } else {
+                profile.effort.clone()
+            };
+            let mut detail = vec![Span::styled(
+                format!("    {} · {} · effort {}", profile.provider, model, effort),
+                Style::default().fg(DIM),
+            )];
+            if !profile.base_url.is_empty() {
+                detail.push(Span::styled(" · ", Style::default().fg(FAINT)));
+                detail.push(Span::styled(
+                    truncate(&profile.base_url, 40),
+                    Style::default().fg(DIM),
+                ));
+            }
+            detail.push(Span::styled(" · ", Style::default().fg(FAINT)));
+            if !requires_key(&profile.provider) {
+                detail.push(Span::styled("no key needed", Style::default().fg(FAINT)));
+            } else if profile.api_key.is_empty() {
+                detail.push(Span::styled(
+                    if self.daemon_llm_key {
+                        "key from mskd env"
+                    } else {
+                        "key missing"
+                    },
+                    Style::default().fg(if self.daemon_llm_key { DIM } else { YELLOW }),
+                ));
+            } else {
+                detail.push(Span::styled("key set", Style::default().fg(GREEN)));
+            }
+            lines.push(Line::from(detail));
+        }
+        lines.push(Line::from(""));
+        if let Some(index) = self.provider_delete_armed {
+            if let Some(profile) = self.profiles.get(index) {
+                lines.push(Line::from(Span::styled(
+                    format!("press d again to delete {}", profile.name),
+                    Style::default().fg(RED).add_modifier(Modifier::BOLD),
+                )));
+            }
+        }
+        lines.push(Line::from(Span::styled(
+            "↑/↓ choose · Enter use · n new · e edit · d delete · s setup · Esc close",
+            Style::default().fg(ACCENT),
+        )));
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            Rect {
+                x: inner.x + 1,
+                y: inner.y,
+                width: inner.width.saturating_sub(2),
+                height: inner.height,
+            },
+        );
+    }
+
     fn draw_permissions(&self, frame: &mut ratatui::Frame, area: Rect) {
         let width = 78.min(area.width.saturating_sub(6)).max(34);
         let height = (PERMISSIONS.len() as u16 + 7)
@@ -4011,6 +4480,7 @@ fn main() -> Result<()> {
             cli.snapshot_sessions,
             cli.snapshot_findings,
             cli.snapshot_modes,
+            cli.snapshot_providers,
             cli.snapshot_permissions,
         );
     }
@@ -4064,11 +4534,12 @@ fn snapshot_daemon(
     sessions: bool,
     findings: bool,
     modes: bool,
+    providers: bool,
     permissions: bool,
 ) -> Result<()> {
     let mut app = DaemonApp::connect(root.to_path_buf(), 100, provider)?;
     let _ = app.refresh();
-    if palette || sessions || findings || modes || permissions {
+    if palette || sessions || findings || modes || providers || permissions {
         app.setup = None;
     }
     if setup {
@@ -4088,6 +4559,9 @@ fn snapshot_daemon(
     if modes {
         app.mode_selection = app.mode_index(&app.mode);
         app.show_modes = true;
+    }
+    if providers {
+        app.open_providers();
     }
     if permissions {
         app.permission_selection = permission_index(&app.permission);
@@ -4213,10 +4687,19 @@ fn open_setup_step(app: &mut DaemonApp, step: Option<&str>) {
     };
     setup.step = match step {
         "provider" => SetupStep::Provider,
+        "service" => SetupStep::Preset,
         "model" => SetupStep::Model,
         "effort" => SetupStep::Effort,
+        "key" => SetupStep::ApiKey,
         _ => SetupStep::BaseUrl,
     };
+    if matches!(setup.step, SetupStep::BaseUrl | SetupStep::ApiKey) {
+        setup.input_cursor = if setup.step == SetupStep::ApiKey {
+            setup.api_key.len()
+        } else {
+            setup.base_url.len()
+        };
+    }
 }
 
 fn sibling_binary(name: &str) -> Option<PathBuf> {
@@ -4740,7 +5223,42 @@ mod tests {
                 .iter()
                 .any(|index| COMMANDS[*index].command == "/effort")
         );
+        let providers = filtered_commands("provider");
+        assert!(
+            providers
+                .iter()
+                .any(|index| COMMANDS[*index].command == "/providers")
+        );
         assert!(filtered_commands("no-such-command").is_empty());
+    }
+
+    #[test]
+    fn provider_profile_helpers() {
+        assert_eq!(profile_name("openai", ""), "openai");
+        assert_eq!(profile_name("openai", " gpt-5 "), "openai · gpt-5");
+        let profiles = vec![ProviderProfile {
+            name: "openai · gpt-5".into(),
+            provider: "openai".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            unique_profile_name(&profiles, "openai · gpt-5"),
+            "openai · gpt-5 (2)"
+        );
+        assert_eq!(unique_profile_name(&profiles, "local"), "local");
+        assert_eq!(masked_key("sk-test"), "•••••••");
+        assert_eq!(masked_key(""), "");
+        assert_eq!(clean_key_paste(" sk-test\n"), "sk-test");
+        assert_eq!(clean_key_paste("sk-\r\nabc "), "sk-abc");
+        assert_eq!(preset_index(""), 0);
+        assert_eq!(
+            SERVICE_PRESETS[preset_index("https://api.deepseek.com/v1")].0,
+            "deepseek"
+        );
+        assert_eq!(
+            preset_index("http://127.0.0.1:9999/v1"),
+            SERVICE_PRESETS.len() - 1
+        );
     }
 
     #[test]
@@ -4915,7 +5433,11 @@ mod tests {
         app.effort = "default".into();
         app.open_setup();
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        app.handle_key(enter); // provider -> model
+        app.handle_key(enter); // provider -> service preset
+        app.handle_key(enter); // service -> model
+        for _ in 0..MODELS.len() - 1 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
         app.handle_key(enter); // custom model -> text input
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         for character in "gpt-5".chars() {
@@ -4924,11 +5446,135 @@ mod tests {
         app.handle_key(enter); // model -> effort
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(enter); // effort -> base URL
-        app.handle_key(enter); // save
+        app.handle_key(enter); // base URL -> API key
+        app.handle_key(enter); // API key -> save
         assert!(app.setup.is_none());
         assert_eq!(app.model, "gpt-5");
         assert_eq!(app.effort, "minimal");
         assert!(app.root.join("tui-config.json").exists());
+        assert!(
+            app.profiles
+                .iter()
+                .any(|profile| profile.model == "gpt-5" && profile.provider == "openai"),
+            "the wizard result must be saved as a provider profile"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn daemon_setup_applies_service_preset() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app = DaemonApp::connect(PathBuf::from(root), 100, Some("openai".into())).unwrap();
+        app.model.clear();
+        app.base_url.clear();
+        app.open_setup();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_key(enter); // provider -> service preset
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // DeepSeek
+        app.handle_key(enter); // service -> model
+        app.handle_key(enter); // custom model (prefilled) -> text input
+        app.handle_key(enter); // model -> effort
+        app.handle_key(enter); // effort -> base URL
+        app.handle_key(enter); // base URL -> API key
+        app.handle_key(enter); // save
+        assert!(app.setup.is_none());
+        assert_eq!(app.model, "deepseek-chat");
+        assert_eq!(app.base_url, "https://api.deepseek.com/v1");
+        assert!(
+            app.profiles.iter().any(|profile| {
+                profile.model == "deepseek-chat"
+                    && profile.base_url == "https://api.deepseek.com/v1"
+            }),
+            "preset settings must be saved in the profile"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn daemon_provider_overlay_switches_profile() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app = DaemonApp::connect(PathBuf::from(root), 100, Some("openai".into())).unwrap();
+        if !app.profiles.iter().any(|profile| {
+            profile.base_url == "https://api.deepseek.com/v1" && profile.model == "deepseek-chat"
+        }) {
+            app.profiles.push(ProviderProfile {
+                name: "deepseek".into(),
+                provider: "openai".into(),
+                model: "deepseek-chat".into(),
+                effort: "high".into(),
+                base_url: "https://api.deepseek.com/v1".into(),
+                api_key: "sk-deepseek".into(),
+            });
+        }
+        app.provider = "scripted-demo".into();
+        app.model.clear();
+        app.base_url.clear();
+        app.api_key.clear();
+        app.open_providers();
+        assert!(app.show_providers);
+        let index = app
+            .profiles
+            .iter()
+            .position(|profile| profile.base_url == "https://api.deepseek.com/v1")
+            .unwrap();
+        let expected = app.profiles[index].clone();
+        app.provider_selection = index;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.show_providers);
+        assert_eq!(app.provider, "openai");
+        assert_eq!(app.model, expected.model);
+        assert_eq!(app.effort, expected.effort);
+        assert_eq!(app.base_url, expected.base_url);
+        assert_eq!(app.api_key, expected.api_key);
+        if !expected.api_key.trim().is_empty() {
+            assert!(app.has_llm_key());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn daemon_setup_saves_profile_key() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app = DaemonApp::connect(PathBuf::from(root), 100, Some("openai".into())).unwrap();
+        app.api_key.clear();
+        app.profiles.clear();
+        app.open_setup();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_key(enter); // provider -> service preset
+        app.handle_key(enter); // service -> model
+        for _ in 0..MODELS.len() - 1 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        app.handle_key(enter); // custom model -> text input
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for character in "gpt-5".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(enter); // model -> effort
+        app.handle_key(enter); // effort -> base URL
+        app.handle_key(enter); // base URL -> API key
+        for character in "sk-test-key".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(enter); // save
+        assert!(app.setup.is_none());
+        assert_eq!(app.api_key, "sk-test-key");
+        assert!(app.has_llm_key());
+        assert!(
+            app.profiles
+                .iter()
+                .any(|profile| profile.api_key == "sk-test-key"),
+            "the key must be stored with the profile"
+        );
+        let text = std::fs::read_to_string(app.root.join("tui-config.json")).unwrap();
+        assert!(text.contains("sk-test-key"));
+        assert!(text.contains("gpt-5"));
     }
 
     #[test]
@@ -4982,6 +5628,35 @@ mod tests {
         assert!(content.contains("setup"));
         assert!(content.contains("scripted-demo"));
         assert!(content.contains("MSK_LLM_API_KEY"));
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn daemon_create_uses_saved_key() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app = DaemonApp::connect(PathBuf::from(root), 100, Some("openai".into())).unwrap();
+        app.provider = "openai".into();
+        app.model = "gpt-5".into();
+        app.effort = "default".into();
+        app.base_url = "http://127.0.0.1:1/v1".into();
+        app.api_key = "sk-test-key".into();
+        let before = app.tasks.len();
+        app.create_task_with_options("saved key gate test", false, None);
+        assert!(
+            !app.status.contains("missing API key"),
+            "a saved key must satisfy the create gate: {}",
+            app.status
+        );
+        let _ = app.reload_tasks();
+        assert!(
+            app.tasks.len() > before,
+            "task was not created: {}",
+            app.status
+        );
+        assert_eq!(app.selected_state(), "running");
+        app.cancel_task();
     }
 
     #[test]
