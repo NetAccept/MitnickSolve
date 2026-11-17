@@ -2610,6 +2610,19 @@ impl DaemonApp {
             self.open_palette();
             return false;
         }
+        if key.code == KeyCode::F(1) {
+            self.show_help = !self.show_help;
+            return false;
+        }
+        if key.code == KeyCode::Tab {
+            self.show_sessions = !self.show_sessions;
+            self.status = if self.show_sessions {
+                "sessions · ↑/↓ select · Enter switch · Esc close".into()
+            } else {
+                String::new()
+            };
+            return false;
+        }
 
         if self.composing {
             return self.compose_key(key);
