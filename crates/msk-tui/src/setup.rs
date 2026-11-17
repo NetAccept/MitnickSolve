@@ -369,7 +369,7 @@ impl DaemonApp {
         };
         let outer = frame.area();
         let width = 84.min(outer.width.saturating_sub(6)).max(32);
-        let height = 27.min(outer.height.saturating_sub(2)).max(14);
+        let height = 24.min(outer.height.saturating_sub(2)).max(14);
         let area = Rect {
             x: outer.x + outer.width.saturating_sub(width) / 2,
             y: outer.y + outer.height.saturating_sub(height) / 2,
