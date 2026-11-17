@@ -427,7 +427,8 @@ target/debug/msk-tui --events .msk/events.jsonl
   offline.
 - **A saved key is not used** — check that the active row in **Providers** has
   `●` and `key set`; `Enter` activates it, then send a message to start the new
-  session. `--doctor` still reports only the *environment* key.
+  session. `--doctor` reports whether it found an environment key or a profile
+  key (`key=set (profile)`).
 - **Keys seem ignored** — `Ctrl+P`, `Tab` and `F1` are handled even while the
   composer has focus. If a terminal focus lost its PTY, press `Ctrl+Q`; the TUI
   also clears that state automatically on the next key.

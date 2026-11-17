@@ -4642,15 +4642,20 @@ fn doctor(cli: &Cli, provider: &Option<String>) -> Result<()> {
     } else {
         config.base_url.clone()
     };
-    let key = std::env::var("MSK_LLM_API_KEY").is_ok();
-    println!(
-        "llm: model={model} effort={effort} base={base} key={}",
-        if key { "set" } else { "missing" }
-    );
+    let env_key = std::env::var("MSK_LLM_API_KEY").is_ok();
+    let profile_key = !config.api_key.trim().is_empty();
+    let key_state = if env_key {
+        "set (env)"
+    } else if profile_key {
+        "set (profile)"
+    } else {
+        "missing"
+    };
+    println!("llm: model={model} effort={effort} base={base} key={key_state}");
     if provider == "openai" || provider == "openai-responses" {
-        if model == "-" || !key {
+        if model == "-" || (!env_key && !profile_key) {
             println!(
-                "hint: export MSK_LLM_MODEL, MSK_LLM_API_KEY, and optionally MSK_LLM_BASE_URL"
+                "hint: set a key with Ctrl+P -> Providers, or export MSK_LLM_MODEL, MSK_LLM_API_KEY, and optionally MSK_LLM_BASE_URL"
             );
         }
     } else {
