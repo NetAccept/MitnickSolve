@@ -283,6 +283,9 @@ jobs:
           echo '{"provider":"scripted-demo","model":"","effort":"default","base_url":""}' > .msk/ci/tui-config.json
           target/debug/msk-tui --root .msk/ci --snapshot --provider scripted \
             | grep -q "MitnickSolve"
+          MSK_SNAPSHOT_WIDTH=80 MSK_SNAPSHOT_HEIGHT=24 \
+            target/debug/msk-tui --root .msk/ci --snapshot --provider scripted \
+            | grep -q "MitnickSolve"
           target/debug/msk-tui --root .msk/ci --snapshot --provider scripted \
             --snapshot-palette | grep -q "commands"
           target/debug/msk-tui --root .msk/ci --snapshot --provider scripted \

@@ -95,10 +95,12 @@ M0 scaffold plus the P1 session/turn slice:
   agent's stdin. `mskctl approvals/approve/deny` and the TUI modal (`y`/`n`)
   resolve it. `--approvals allow` restores unattended execution.
 - Semi-graphical conversational TUI: pixel wordmark, rounded composer, status
-  chips, borderless transcript, streamed assistant text, tool cards, dimmed
+  chips, a session rail, markdown-lite assistant text, readable tool summaries,
+  colored state/error blocks, a scrollback bar, dimmed
   approval/setup/palette layers, cooperative interrupt and a toggleable event
-  sidebar. `Ctrl+P` opens the command palette; `Tab` switches sessions; `y`/`n`
-  answer approvals; `Ctrl+Q` detaches from the PTY.
+  sidebar. `↑`/`↓`, PgUp/PgDn and the mouse wheel scroll the transcript;
+  `Ctrl+N` starts a session, `Ctrl+P` opens the command palette, `Tab` switches
+  sessions, `y`/`n` answer approvals, and `Ctrl+Q` detaches from the PTY.
 - SQLite event index: `msk-store` indexes events by id/task/kind/seq. Start
   mskd with `--store <path>` and query via `mskctl events` or
   `msk-replay --db <path>`; duplicate ids from log replay are ignored.
@@ -578,15 +580,18 @@ pass `--approvals allow` to `create` for unattended execution. Use
 environment for a real model.
 
 The TUI in daemon mode is a semi-graphical conversational app: a pixel wordmark
-on the home screen, a rounded composer, status chips, a borderless transcript,
-live tool cards and dimmed modal layers. The composer is always focused — just
-type. `Enter` sends, `Shift+Enter` inserts a newline, `Tab` opens the session
-switcher, `Ctrl+P` opens the command palette, and `F1` lists every shortcut.
-`Esc` interrupts a running turn or closes an overlay; `Ctrl+C` interrupts, then
-quits when idle. A pending approval opens a modal where `y` approves and
-`n`/`Esc` denies. Assistant text streams into the transcript as `agent.text`
-deltas. The event inspector and PTY terminal are available from the palette
-(`Ctrl+Q` detaches from the terminal). See [`docs/tui.md`](docs/tui.md).
+on the home screen, a rounded composer, status chips, a session rail,
+markdown-lite assistant text, readable tool summaries, a scrollback bar and
+dimmed modal layers. The composer is always focused — just type. `Enter` sends,
+`Shift+Enter` inserts a newline, `Ctrl+N` starts a new session, `Tab` opens the
+session switcher, `Ctrl+P` opens the command palette, and `F1` lists every
+shortcut. `↑`/`↓`, PgUp/PgDn and the mouse wheel scroll; `Ctrl+↑`/`Ctrl+↓` walk
+the input history. `Esc` interrupts a running turn or closes an overlay;
+`Ctrl+C` interrupts, then quits when idle. A pending approval opens a modal
+where `y` approves and `n`/`Esc` denies. Assistant text streams into the
+transcript as `agent.text` deltas. The event inspector and PTY terminal are
+available from the palette (`Ctrl+Q` detaches from the terminal). See
+[`docs/tui.md`](docs/tui.md).
 
 Terminal scripting:
 

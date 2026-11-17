@@ -1,8 +1,9 @@
 # Terminal app
 
 `msk` with no arguments opens the conversational app. It is a semi-graphical
-terminal UI: a pixel wordmark, rounded composer, status chips, live tool cards,
-modal approvals and a command palette. It starts a local `mskd` daemon if one is
+terminal UI: a pixel wordmark, rounded composer, status chips, a session rail,
+markdown-lite assistant text, readable tool summaries, a scrollback bar, modal
+approvals and a command palette. It starts a local `mskd` daemon if one is
 not already listening, and it is a normal client of that daemon — the same one
 used by `mskctl`, the browser UI and the eval harness.
 
@@ -42,26 +43,41 @@ This is an actual `--snapshot` frame (120×40):
                          █   █   █     █   █   █   █   █     █  █      █ █   █ █      █ █  █
                          █   █ █████   █   █   █ █████  ████ █   █ ████   ███  █████   █   █████
 
-                                                    ~   scripted-demo
+                                                      ~   scripted
 
                 ╭──────────────────────────────────────────────────────────────────────────────────────╮
                 │ Ask anything…  "inspect ./challenge and find the flag"                               │
                 │                                                                                      │
-                │  Build · scripted-demo                                                               │
+                │  自 动  · scripted                                                                     │
                 ╰──────────────────────────────────────────────────────────────────────────────────────╯
-                                                   tab sessions   ctrl+n new   ctrl+p commands   F1 help
+                                                 tab sessions   ctrl+n new   ctrl+p commands   F1 help
 
-  ~                                                                                 MitnickSolve 0.1.3
+                            ╭ try ─────────────────────────────────────────────────────────╮
+                            │   › inspect ./challenge and find the flag                    │
+                            │   › map the services on 10.10.10.5                           │
+                            │   › triage ./evidence and summarize the findings             │
+                            │   /demo runs the offline tool demo                           │
+                            ╰──────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+  ~  ·  权 限  自 动                                                                                    MitnickSolve 0.1.4
 ```
 
 - The large wordmark is drawn from Unicode blocks with a left-to-right gradient.
 - The chips under it show the workspace, provider, model and effort.
 - The rounded composer is always the focused input. Just start typing; Enter
   sends. `Shift+Enter` inserts a newline, bracketed paste inserts whole scripts.
-- `Build · provider · model · effort` is always visible inside the composer.
-- `Tab` opens the session switcher, `Ctrl+P` opens the command palette, `F1`
-  shows every shortcut.
-- The footer shows the workspace on the left and the version on the right.
+- The leading slot of the composer shows the mode, then provider, model and
+  effort. The `try` card below it suggests starter prompts; `/demo` runs the
+  offline tool demo.
+- `Tab` opens the session switcher, `Ctrl+N` starts a new session, `Ctrl+P`
+  opens the command palette, `F1` shows every shortcut.
+- The footer shows the workspace, permission posture, context tokens, tool
+  count, a scrollback indicator and the version.
 
 With no configured provider, a full-screen setup card opens first. Choose
 `scripted-demo` to try the app offline with no key, or `openai` /
@@ -198,35 +214,59 @@ replacing the conversation you are reading.
 
 ## Conversation
 
-A real frame after a turn, with the header rule, role glyphs, tool cards and the
-composer at the bottom:
+A real frame after a turn, with the session rail, status bar, role gutters,
+markdown rendering and the composer at the bottom:
 
 ```text
-  ▌ Find the flag in ./challenge  ● ready                                                scripted · - · effort default
-  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-    ▸ env_create {"kind":"managed","name":"session","profile":"dev","root":"."}
-
-    ✓ env_create
-
-  ❯ inspect ./challenge and find the flag
-
-    echo: inspect ./challenge and find the flag
-
-        ╭──────────────────────────────────────────────────────────────────────────────────────────────────────╮
-        │ Reply…   Shift+Enter for a new line                                                                  │
-        │                                                                                                      │
-        │  Build · scripted                                                                                    │
-        ╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯
-                                                           tab sessions   ctrl+n new   ctrl+p commands   F1 help
-  ~/.msk/ui-chat/ws                                                                                 MitnickSolve 0.1.3
+ ╭ sessions ──────────╮   ▌ Interactive markup test  ● ready                             scripted · - · effort default
+ │  ✓ Find the flag i…│   ────────────────────────────────────────────────────────────────────────────────────────────
+ │▌ ● Interactive mar…│     ▸ env_create {"kind":"managed","name":"session","profile":"dev","root":"."}
+ │                    │
+ │＋  New session      │     ✓ env_create
+ │                    │
+ │                    │   ❯ hello **world** and `code`
+ │                    │
+ │                    │   │   echo: hello world and code
+ │                    │
+ │                    │   ❯ # Recon
+ │                    │     - found **TLS** on `443`
+ │                    │     - certificate expired
+ │                    │
+ │                    │
+ │                    │     ```text
+ │                    │     subject=challenge.local
+ │                    │     ```
+ │                    │
+ │                    │   │   echo: # Recon
+ │                    │   │   • found TLS on 443
+ │                    │   │   • certificate expired
+ │                    │   │
+ │                    │   │   ╭─ text
+ │                    │   │   │ subject=challenge.local
+ │                    │   │   ╰─
+ │                    │   ╭──────────────────────────────────────────────────────────────────────────────────────────╮
+ │                    │   │ Reply…   Shift+Enter for a new line                                                      │
+ │                    │   │                                                                                          │
+ │                    │   │  攻 击  · scripted                                                                         │
+ │tab switch · ctrl+n │   ╰──────────────────────────────────────────────────────────────────────────────────────────╯
+ ╰────────────────────╯                                        tab sessions   ctrl+n new   ctrl+p commands   F1 help
 ```
 
-- `▌` and `❯` mark the active session and your messages; agent text is plain.
-- Tool calls appear as `▸ tool args`, results as `✓ tool` (green) or `✗ tool`
-  (red). Streaming text ends with a blinking block.
-- The header shows the session goal, a live state (`⠋ running`, `● ready`,
+- On wide terminals the left rail lists sessions; `▌` marks the open one and the
+  glyph shows its state. `＋ New session` sits below it.
+- `❯` marks your messages (on a tinted row); agent text uses a `│` gutter and a
+  small Markdown renderer: headings, bullets, **bold**, `inline code` and fenced
+  code blocks are styled.
+- Tool calls appear as `▸ tool summary` (e.g. the shell command or target path),
+  results as `✓ tool` (green) or `✗ tool` (red) with a short observation.
+  Streaming text ends with a blinking block.
+- The header is a status bar: goal, a live state chip (`⠋ running`, `● ready`,
   `✗ failed`, `✓ done`), and provider/model/effort.
-- `PgUp` / `PgDn` or `↑` / `↓` scroll; `End` follows new output.
+- `↑` / `↓` scroll one line (even while the composer is focused), `PgUp` /
+  `PgDn` scroll ten, and the mouse wheel scrolls three. `Ctrl+Home` jumps to the
+  top; `Ctrl+End` or `End` follows new output when the composer is idle.
+  `Ctrl+↑` / `Ctrl+↓` (or `Alt+↑` / `Alt+↓`) walk the input history.
+  A scrollback bar appears on the right when there is older output.
 - The event inspector (`Ctrl+P` → Event inspector, or `/events`) opens a dimmed
   sidebar with the raw kernel event stream.
 
@@ -276,8 +316,15 @@ Press `y` to approve or `n`/`Esc` to deny. Approvals are also hydrated from
 | `Ctrl+N` | start a new session |
 | `Ctrl+P` | command palette |
 | `F1` | keyboard shortcuts |
-| `PgUp` / `PgDn`, `↑` / `↓` | scroll the conversation |
-| `End` | jump to the newest output |
+| `↑` / `↓` | scroll the conversation one line |
+| `PgUp` / `PgDn` | scroll ten lines |
+| `Ctrl/Alt+↑` / `Ctrl/Alt+↓` | older / newer input history |
+| `Ctrl+Home` / `Ctrl+End` | transcript top / follow output |
+| mouse wheel | scroll three lines |
+
+Mouse capture is enabled for wheel scrolling; use `Shift`+drag for the
+terminal's native text selection, or detach the PTY with `Ctrl+Q` first.
+| `End` | follow output when the composer is idle (`Ctrl+End` while typing) |
 | `y` / `n` | approve / deny a pending approval |
 | `Ctrl+Q` | detach from the PTY terminal |
 | `Ctrl+U` | clear the composer |

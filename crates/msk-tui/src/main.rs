@@ -1,5 +1,7 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Stdout, Write, stdout};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -8,8 +10,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event as CrosstermEvent, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -45,6 +47,9 @@ const FAINT: Color = Color::Rgb(72, 72, 82);
 const GREEN: Color = Color::Rgb(74, 222, 128);
 const YELLOW: Color = Color::Rgb(250, 204, 21);
 const RED: Color = Color::Rgb(248, 113, 113);
+const TOOL: Color = Color::Rgb(167, 139, 250);
+const USER_BG: Color = Color::Rgb(26, 28, 36);
+const ERR_BG: Color = Color::Rgb(42, 22, 26);
 
 struct CommandEntry {
     label: &'static str,
@@ -630,6 +635,240 @@ fn clean_key_paste(text: &str) -> String {
         .collect()
 }
 
+fn is_timeout_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>().is_some_and(|err| {
+        err.kind() == std::io::ErrorKind::TimedOut || err.kind() == std::io::ErrorKind::WouldBlock
+    })
+}
+
+/// Minimal inline markdown: `code` and **bold**, preserving everything else.
+fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let code = rest.find('`');
+        let bold = rest.find("**");
+        let (index, is_code) = match (code, bold) {
+            (Some(code), Some(bold)) if code < bold => (code, true),
+            (Some(code), None) => (code, true),
+            (Some(_), Some(bold)) => (bold, false),
+            (None, Some(bold)) => (bold, false),
+            (None, None) => break,
+        };
+        if index > 0 {
+            spans.push(Span::styled(rest[..index].to_string(), base));
+        }
+        if is_code {
+            let after = &rest[index + 1..];
+            if let Some(end) = after.find('`') {
+                spans.push(Span::styled(
+                    after[..end].to_string(),
+                    Style::default().fg(YELLOW).bg(PANEL),
+                ));
+                rest = &after[end + 1..];
+            } else {
+                spans.push(Span::styled(rest[index..].to_string(), base));
+                rest = "";
+            }
+        } else {
+            let after = &rest[index + 2..];
+            if let Some(end) = after.find("**") {
+                spans.push(Span::styled(
+                    after[..end].to_string(),
+                    base.add_modifier(Modifier::BOLD),
+                ));
+                rest = &after[end + 2..];
+            } else {
+                spans.push(Span::styled(rest[index..].to_string(), base));
+                rest = "";
+            }
+        }
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), base));
+    }
+    spans
+}
+
+fn markdown_lite(text: &str) -> Vec<Line<'static>> {
+    let body = Style::default().fg(TEXT);
+    let mut lines = Vec::new();
+    let mut in_code = false;
+    for raw in text.split('\n') {
+        let trimmed = raw.trim_start();
+        if let Some(language) = trimmed.strip_prefix("```") {
+            if in_code {
+                lines.push(Line::from(Span::styled("  ╰─", Style::default().fg(FAINT))));
+                in_code = false;
+            } else {
+                let label = language.trim();
+                let label = if label.is_empty() { "code" } else { label };
+                lines.push(Line::from(Span::styled(
+                    format!("  ╭─ {label}"),
+                    Style::default().fg(DIM),
+                )));
+                in_code = true;
+            }
+            continue;
+        }
+        if in_code {
+            lines.push(Line::from(vec![
+                Span::styled("  │ ", Style::default().fg(FAINT)),
+                Span::styled(
+                    raw.to_string(),
+                    Style::default().fg(Color::Rgb(205, 210, 220)).bg(PANEL),
+                ),
+            ]));
+            continue;
+        }
+        if trimmed.is_empty() {
+            lines.push(Line::from(""));
+            continue;
+        }
+        let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
+        if hashes > 0 && trimmed[hashes..].starts_with(' ') {
+            lines.push(Line::from(vec![
+                Span::styled("  ", body),
+                Span::styled(
+                    trimmed[hashes + 1..].to_string(),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            continue;
+        }
+        if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            let mut spans = vec![Span::styled("  • ", Style::default().fg(ACCENT))];
+            spans.extend(inline_spans(item, body));
+            lines.push(Line::from(spans));
+            continue;
+        }
+        let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+        if digits > 0 && trimmed[digits..].starts_with(". ") {
+            let mut spans = vec![Span::styled(
+                format!("  {} ", &trimmed[..digits]),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )];
+            spans.extend(inline_spans(&trimmed[digits + 2..], body));
+            lines.push(Line::from(spans));
+            continue;
+        }
+        if let Some(quote) = trimmed.strip_prefix("> ") {
+            let mut spans = vec![Span::styled("  │ ", Style::default().fg(FAINT))];
+            spans.extend(inline_spans(quote, Style::default().fg(DIM)));
+            lines.push(Line::from(spans));
+            continue;
+        }
+        let mut spans = vec![Span::styled("  ", body)];
+        spans.extend(inline_spans(raw, body));
+        lines.push(Line::from(spans));
+    }
+    if in_code {
+        lines.push(Line::from(Span::styled("  ╰─", Style::default().fg(FAINT))));
+    }
+    lines
+}
+
+fn chat_hash(line: &ChatLine) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    line.role.hash(&mut hasher);
+    line.streaming.hash(&mut hasher);
+    line.text.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn chat_lines(line: &ChatLine) -> Vec<Line<'static>> {
+    if line.role == ChatRole::System && line.text.starts_with("turn end:") {
+        return Vec::new();
+    }
+    let parts: Vec<&str> = line.text.split('\n').collect();
+    let mut rendered = Vec::new();
+    match line.role {
+        ChatRole::User => {
+            for (index, part) in parts.iter().enumerate() {
+                let prefix = if index == 0 { "❯ " } else { "  " };
+                rendered.push(Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(ACCENT).bg(USER_BG)),
+                    Span::styled((*part).to_string(), Style::default().fg(TEXT).bg(USER_BG)),
+                ]));
+            }
+        }
+        ChatRole::Assistant => {
+            let markdown = markdown_lite(&line.text);
+            let last = markdown.len().saturating_sub(1);
+            for (index, rendered_line) in markdown.into_iter().enumerate() {
+                let mut spans = vec![Span::styled("│ ", Style::default().fg(FAINT))];
+                spans.extend(rendered_line.spans);
+                if line.streaming && index == last {
+                    spans.push(Span::styled("▍", Style::default().fg(ACCENT)));
+                }
+                rendered.push(Line::from(spans));
+            }
+        }
+        ChatRole::Tool => {
+            let first = line.text.chars().next().unwrap_or('·');
+            let color = match first {
+                '✓' => GREEN,
+                '✗' => RED,
+                '▸' => TOOL,
+                _ => DIM,
+            };
+            let body = line.text[first.len_utf8()..].trim_start();
+            let (name, detail) = body.split_once(' ').unwrap_or((body, ""));
+            rendered.push(Line::from(vec![
+                Span::styled(format!("  {first} "), Style::default().fg(color)),
+                Span::styled(
+                    name.to_string(),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {detail}"), Style::default().fg(DIM)),
+            ]));
+        }
+        ChatRole::System => {
+            let is_error = line.text.starts_with('✗');
+            for (index, part) in parts.iter().enumerate() {
+                if is_error && index == 0 {
+                    rendered.push(Line::from(vec![
+                        Span::styled("  ▌ ", Style::default().fg(RED)),
+                        Span::styled(
+                            (*part).to_string(),
+                            Style::default()
+                                .fg(RED)
+                                .bg(ERR_BG)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                } else {
+                    rendered.push(Line::from(Span::styled(
+                        format!("    {part}"),
+                        Style::default().fg(FAINT).add_modifier(Modifier::ITALIC),
+                    )));
+                }
+            }
+        }
+    }
+    rendered.push(Line::from(""));
+    rendered
+}
+
+fn build_chat_group(line: &ChatLine, width: u16) -> ChatGroup {
+    let lines = chat_lines(line);
+    let height = if lines.is_empty() {
+        0
+    } else {
+        Paragraph::new(Text::from(lines.clone()))
+            .line_count(width)
+            .max(1)
+    };
+    ChatGroup {
+        hash: chat_hash(line),
+        lines,
+        height,
+    }
+}
+
 /// Turns an agent/provider failure into one readable transcript block. The
 /// provider JSON is noisy; keep its message and code, not the whole body.
 fn turn_error_text(status: &str, message: &str) -> String {
@@ -663,7 +902,7 @@ fn turn_error_text(status: &str, message: &str) -> String {
     text
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ChatRole {
     User,
     Assistant,
@@ -677,6 +916,20 @@ struct ChatLine {
     role: ChatRole,
     text: String,
     streaming: bool,
+}
+
+struct ChatGroup {
+    hash: u64,
+    lines: Vec<Line<'static>>,
+    height: usize,
+}
+
+#[derive(Default)]
+struct TranscriptCache {
+    task: String,
+    width: u16,
+    groups: Vec<ChatGroup>,
+    prefix: Vec<usize>,
 }
 
 fn append_agent_text(chat: &mut Vec<ChatLine>, task_id: &str, text: &str, delta: bool) {
@@ -1223,9 +1476,12 @@ struct DaemonApp {
     new_task: bool,
     quit_requested: bool,
     pending_initial: Option<(String, String)>,
-    scroll_from_bottom: u16,
+    last_initial_try: Instant,
+    scroll_top: u16,
+    max_scroll: Cell<u16>,
     auto_scroll: bool,
     transcript_loaded: Option<String>,
+    transcript_cache: RefCell<TranscriptCache>,
     input_history: Vec<String>,
     history_index: Option<usize>,
     show_events: bool,
@@ -1357,9 +1613,12 @@ impl DaemonApp {
             new_task: false,
             quit_requested: false,
             pending_initial: None,
-            scroll_from_bottom: 0,
+            last_initial_try: Instant::now(),
+            scroll_top: 0,
+            max_scroll: Cell::new(0),
             auto_scroll: true,
             transcript_loaded: None,
+            transcript_cache: RefCell::new(TranscriptCache::default()),
             input_history: Vec::new(),
             history_index: None,
             show_events: false,
@@ -1397,7 +1656,7 @@ impl DaemonApp {
         let result = self.client.request_with_timeout(
             methods::TASK_LIST,
             json!({}),
-            Duration::from_secs(1),
+            Duration::from_millis(200),
         )?;
         self.tasks = result
             .get("tasks")
@@ -1420,7 +1679,7 @@ impl DaemonApp {
         let result = self.client.request_with_timeout(
             methods::APPROVAL_LIST,
             json!({}),
-            Duration::from_secs(1),
+            Duration::from_millis(200),
         )?;
         self.approvals = result
             .get("approvals")
@@ -1487,7 +1746,8 @@ impl DaemonApp {
         Ok(())
     }
 
-    fn refresh(&mut self) -> Result<()> {
+    fn refresh(&mut self) -> Result<bool> {
+        let mut changed = false;
         while let Some(value) = self.client.try_notification() {
             match value.get("method").and_then(Value::as_str) {
                 Some("event") => {
@@ -1514,7 +1774,7 @@ impl DaemonApp {
                                         self.chat.push(ChatLine {
                                             task_id: task_id.clone(),
                                             role: ChatRole::Tool,
-                                            text: format!("▸ {tool} {}", compact_json(&args, 180)),
+                                            text: format!("▸ {tool} {}", tool_summary(tool, &args)),
                                             streaming: false,
                                         });
                                     }
@@ -1579,9 +1839,10 @@ impl DaemonApp {
                             && let Some((pending_task, text)) = self.pending_initial.clone()
                             && pending_task == task_id
                         {
-                            match self.client.request(
+                            match self.client.request_with_timeout(
                                 methods::TASK_MESSAGE,
                                 json!({"task_id": task_id, "text": text}),
+                                Duration::from_secs(5),
                             ) {
                                 Ok(_) => {
                                     self.pending_initial = None;
@@ -1679,6 +1940,7 @@ impl DaemonApp {
                 }
                 _ => {}
             }
+            changed = true;
         }
 
         if self.events.len() > MAX_EVENTS {
@@ -1690,6 +1952,7 @@ impl DaemonApp {
             let mut closed = false;
             let mut credits = 0usize;
             while let Some(event) = data.try_event() {
+                changed = true;
                 match event {
                     DataEvent::Data(bytes) => {
                         if let Some(terminal) = self.terminal.as_mut() {
@@ -1732,17 +1995,24 @@ impl DaemonApp {
             }
         }
 
-        if self.last_refresh.elapsed() >= Duration::from_secs(1) {
-            if let Err(err) = self.reload_tasks() {
-                self.status = format!("refresh failed: {err}");
+        if self.last_refresh.elapsed() >= Duration::from_secs(3) {
+            // Push notifications are the primary source of task/approval state;
+            // polling is only a fallback. Keep each round trip short so a busy
+            // daemon cannot freeze input for a second at a time.
+            match self.reload_tasks() {
+                Ok(()) => changed = true,
+                Err(err) if is_timeout_error(&err) => {}
+                Err(err) => self.status = format!("refresh failed: {err}"),
             }
-            if let Err(err) = self.reload_approvals() {
-                self.status = format!("approval refresh failed: {err}");
+            match self.reload_approvals() {
+                Ok(()) => changed = true,
+                Err(err) if is_timeout_error(&err) => {}
+                Err(err) => self.status = format!("approval refresh failed: {err}"),
             }
             self.last_refresh = Instant::now();
         }
         self.flush_pending_initial();
-        Ok(())
+        Ok(changed)
     }
 
     fn append_history_event(&mut self, task_id: &str, event: &Event) {
@@ -1776,7 +2046,7 @@ impl DaemonApp {
                 self.chat.push(ChatLine {
                     task_id: task_id.to_string(),
                     role: ChatRole::Tool,
-                    text: format!("▸ {tool} {}", compact_json(&args, 180)),
+                    text: format!("▸ {tool} {}", tool_summary(tool, &args)),
                     streaming: false,
                 });
             }
@@ -1831,13 +2101,13 @@ impl DaemonApp {
         let result = match self.client.request_with_timeout(
             methods::TASK_HISTORY,
             json!({"task_id": task_id}),
-            Duration::from_secs(5),
+            Duration::from_secs(2),
         ) {
             Ok(result) => result,
             Err(_) => match self.client.request_with_timeout(
                 methods::TASK_RESULT,
                 json!({"task_id": task_id}),
-                Duration::from_secs(5),
+                Duration::from_secs(2),
             ) {
                 Ok(result) => result,
                 Err(err) => {
@@ -1845,6 +2115,11 @@ impl DaemonApp {
                     return;
                 }
             },
+        };
+        let previous_scroll = if self.transcript_loaded.as_deref() == Some(task_id) {
+            Some((self.auto_scroll, self.scroll_top))
+        } else {
+            None
         };
         self.chat.retain(|line| line.task_id != task_id);
         if let Some(history) = result.get("history").and_then(Value::as_array) {
@@ -1855,8 +2130,13 @@ impl DaemonApp {
             }
             self.trim_chat();
             self.transcript_loaded = Some(task_id.to_string());
-            self.auto_scroll = true;
-            self.scroll_from_bottom = 0;
+            match previous_scroll {
+                Some((auto_scroll, offset)) => {
+                    self.auto_scroll = auto_scroll;
+                    self.scroll_top = offset;
+                }
+                None => self.follow_output(),
+            }
             return;
         }
         let transcript = result
@@ -1890,8 +2170,13 @@ impl DaemonApp {
         }
         self.trim_chat();
         self.transcript_loaded = Some(task_id.to_string());
-        self.auto_scroll = true;
-        self.scroll_from_bottom = 0;
+        match previous_scroll {
+            Some((auto_scroll, offset)) => {
+                self.auto_scroll = auto_scroll;
+                self.scroll_top = offset;
+            }
+            None => self.follow_output(),
+        }
     }
 
     fn open_sessions(&mut self) {
@@ -1951,6 +2236,10 @@ impl DaemonApp {
         let Some((task_id, text)) = self.pending_initial.clone() else {
             return;
         };
+        if self.last_initial_try.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        self.last_initial_try = Instant::now();
         let waiting = self.tasks.iter().any(|task| {
             task.get("task_id").and_then(Value::as_str) == Some(task_id.as_str())
                 && task.get("state").and_then(Value::as_str) == Some("waiting_input")
@@ -1958,9 +2247,10 @@ impl DaemonApp {
         if !waiting {
             return;
         }
-        match self.client.request(
+        match self.client.request_with_timeout(
             methods::TASK_MESSAGE,
             json!({"task_id": task_id, "text": text}),
+            Duration::from_secs(5),
         ) {
             Ok(_) => {
                 self.pending_initial = None;
@@ -1989,6 +2279,39 @@ impl DaemonApp {
             .map(str::to_string)
     }
 
+    fn scroll_up(&mut self, lines: u16) {
+        let limit = self.max_scroll.get();
+        if limit == 0 {
+            return;
+        }
+        if self.auto_scroll {
+            self.scroll_top = limit;
+            self.auto_scroll = false;
+        }
+        self.scroll_top = self.scroll_top.saturating_sub(lines);
+    }
+
+    fn scroll_down(&mut self, lines: u16) {
+        if self.auto_scroll {
+            return;
+        }
+        let limit = self.max_scroll.get();
+        self.scroll_top = self.scroll_top.saturating_add(lines).min(limit);
+        if self.scroll_top >= limit {
+            self.auto_scroll = true;
+        }
+    }
+
+    fn scroll_to_top(&mut self) {
+        self.auto_scroll = false;
+        self.scroll_top = 0;
+    }
+
+    fn follow_output(&mut self) {
+        self.auto_scroll = true;
+        self.scroll_top = 0;
+    }
+
     fn selected_events(&self) -> Vec<usize> {
         let task_id = self.selected_task_id();
         self.events
@@ -1997,6 +2320,29 @@ impl DaemonApp {
             .filter(|(_, (id, _))| Some(id.as_str()) == task_id.as_deref())
             .map(|(index, _)| index)
             .collect()
+    }
+
+    fn selected_usage(&self) -> (u64, usize) {
+        let Some(task_id) = self.selected_task_id() else {
+            return (0, 0);
+        };
+        let mut tokens = 0;
+        let mut tools = 0;
+        for (id, event) in &self.events {
+            if id != &task_id {
+                continue;
+            }
+            match event.kind.as_str() {
+                "context.state" => {
+                    if let Some(value) = event.data.get("approx_tokens").and_then(Value::as_u64) {
+                        tokens = value;
+                    }
+                }
+                "tool.call" => tools += 1,
+                _ => {}
+            }
+        }
+        (tokens, tools)
     }
 
     fn selected_task_title(&self) -> String {
@@ -2014,6 +2360,12 @@ impl DaemonApp {
             .and_then(|task| task.get("state"))
             .and_then(Value::as_str)
             .unwrap_or("?")
+    }
+
+    fn any_running(&self) -> bool {
+        self.tasks
+            .iter()
+            .any(|task| task.get("state").and_then(Value::as_str) == Some("running"))
     }
 
     fn selected_mode(&self) -> String {
@@ -2174,9 +2526,10 @@ impl DaemonApp {
             self.status = "no task selected".into();
             return;
         };
-        match self.client.request(
+        match self.client.request_with_timeout(
             methods::TASK_MESSAGE,
             json!({"task_id": task_id, "text": text}),
+            Duration::from_secs(5),
         ) {
             Ok(_) => {
                 self.remember_history(&text);
@@ -2396,34 +2749,38 @@ impl DaemonApp {
                 return;
             }
         }
-        let result = self.client.request(methods::TASK_CREATE, {
-            let mut params = json!({
-                "goal": goal,
-                "demo": "session",
-                "provider": self.provider,
-                "mode": self.mode,
-                "permission": self.permission,
-                "interactive": true,
-                "stream": true,
-                "approvals": "ask"
-            });
-            if !self.model.trim().is_empty() {
-                params["model"] = json!(self.model.trim());
-            }
-            if self.effort != "default" && !self.effort.is_empty() {
-                params["effort"] = json!(self.effort);
-            }
-            if !self.base_url.trim().is_empty() {
-                params["base_url"] = json!(self.base_url.trim());
-            }
-            if requires_key(&self.provider) && !self.api_key.trim().is_empty() {
-                params["api_key"] = json!(self.api_key.trim());
-            }
-            if let Some(checkpoint) = resume_checkpoint {
-                params["resume_checkpoint"] = json!(checkpoint.display().to_string());
-            }
-            params
-        });
+        let result = self.client.request_with_timeout(
+            methods::TASK_CREATE,
+            {
+                let mut params = json!({
+                    "goal": goal,
+                    "demo": "session",
+                    "provider": self.provider,
+                    "mode": self.mode,
+                    "permission": self.permission,
+                    "interactive": true,
+                    "stream": true,
+                    "approvals": "ask"
+                });
+                if !self.model.trim().is_empty() {
+                    params["model"] = json!(self.model.trim());
+                }
+                if self.effort != "default" && !self.effort.is_empty() {
+                    params["effort"] = json!(self.effort);
+                }
+                if !self.base_url.trim().is_empty() {
+                    params["base_url"] = json!(self.base_url.trim());
+                }
+                if requires_key(&self.provider) && !self.api_key.trim().is_empty() {
+                    params["api_key"] = json!(self.api_key.trim());
+                }
+                if let Some(checkpoint) = resume_checkpoint {
+                    params["resume_checkpoint"] = json!(checkpoint.display().to_string());
+                }
+                params
+            },
+            Duration::from_secs(15),
+        );
         match result {
             Ok(snapshot) => {
                 let task_id = snapshot
@@ -2464,10 +2821,11 @@ impl DaemonApp {
             self.status = "no task selected".into();
             return;
         };
-        match self
-            .client
-            .request(methods::TASK_INTERRUPT, json!({"task_id": task_id}))
-        {
+        match self.client.request_with_timeout(
+            methods::TASK_INTERRUPT,
+            json!({"task_id": task_id}),
+            Duration::from_secs(5),
+        ) {
             Ok(snapshot) => {
                 if snapshot
                     .get("interrupted")
@@ -2493,9 +2851,10 @@ impl DaemonApp {
             .unwrap_or_default()
             .to_string();
         let id = pending.get("id").and_then(Value::as_u64).unwrap_or(0);
-        match self.client.request(
+        match self.client.request_with_timeout(
             methods::APPROVAL_RESPOND,
             json!({"task_id": task_id, "id": id, "approved": approved}),
+            Duration::from_secs(5),
         ) {
             Ok(_) => {
                 self.approvals.retain(|approval| {
@@ -2617,6 +2976,12 @@ impl DaemonApp {
                     self.input.insert(self.input_cursor, '\n');
                     self.input_cursor += 1;
                 }
+                KeyCode::Up => self.history_previous(),
+                KeyCode::Down => self.history_next(),
+                KeyCode::Home => self.scroll_to_top(),
+                KeyCode::End => self.follow_output(),
+                KeyCode::PageUp => self.scroll_up(20),
+                KeyCode::PageDown => self.scroll_down(20),
                 _ => {}
             }
             return false;
@@ -2641,8 +3006,12 @@ impl DaemonApp {
                 self.input_cursor += 1;
             }
             KeyCode::Enter => self.send_message(),
-            KeyCode::Up => self.history_previous(),
-            KeyCode::Down => self.history_next(),
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => self.history_previous(),
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => self.history_next(),
+            KeyCode::Up => self.scroll_up(1),
+            KeyCode::Down => self.scroll_down(1),
+            KeyCode::PageUp => self.scroll_up(10),
+            KeyCode::PageDown => self.scroll_down(10),
             KeyCode::Backspace => {
                 if let Some((index, _)) = self.input[..self.input_cursor].char_indices().last() {
                     self.input.remove(index);
@@ -3015,6 +3384,12 @@ impl DaemonApp {
             match key.code {
                 KeyCode::Char('y') => self.respond_approval(true),
                 KeyCode::Char('n') | KeyCode::Esc => self.respond_approval(false),
+                KeyCode::Up => self.scroll_up(1),
+                KeyCode::Down => self.scroll_down(1),
+                KeyCode::PageUp => self.scroll_up(10),
+                KeyCode::PageDown => self.scroll_down(10),
+                KeyCode::Home => self.scroll_to_top(),
+                KeyCode::End => self.follow_output(),
                 _ => {}
             }
             return false;
@@ -3095,22 +3470,12 @@ impl DaemonApp {
                     self.status.clear();
                 }
             }
-            KeyCode::Tab => self.toggle_sessions(),
-            KeyCode::F(1) => self.show_help = !self.show_help,
-            KeyCode::PageUp | KeyCode::Up => {
-                self.auto_scroll = false;
-                self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(5);
-            }
-            KeyCode::PageDown | KeyCode::Down => {
-                self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(5);
-                if self.scroll_from_bottom == 0 {
-                    self.auto_scroll = true;
-                }
-            }
-            KeyCode::End => {
-                self.auto_scroll = true;
-                self.scroll_from_bottom = 0;
-            }
+            KeyCode::PageUp => self.scroll_up(10),
+            KeyCode::PageDown => self.scroll_down(10),
+            KeyCode::Up => self.scroll_up(3),
+            KeyCode::Down => self.scroll_down(3),
+            KeyCode::Home => self.scroll_to_top(),
+            KeyCode::End => self.follow_output(),
             KeyCode::Enter => self.enter_compose(),
             KeyCode::Char(character) if !alt && !character.is_control() => {
                 self.enter_compose();
@@ -3127,10 +3492,11 @@ impl DaemonApp {
             self.status = "no task selected".into();
             return;
         };
-        match self
-            .client
-            .request(methods::TASK_CANCEL, json!({"task_id": task_id}))
-        {
+        match self.client.request_with_timeout(
+            methods::TASK_CANCEL,
+            json!({"task_id": task_id}),
+            Duration::from_secs(5),
+        ) {
             Ok(_) => {
                 self.chat.push(ChatLine {
                     task_id: task_id.clone(),
@@ -3234,6 +3600,24 @@ impl DaemonApp {
             .is_some_and(|task_id| self.chat.iter().any(|line| &line.task_id == task_id));
         let home = self.new_task || task_id.is_none() || !has_messages;
         let input_height = self.input_height();
+        let rail_width = if !home && area.width >= 100 { 24 } else { 0 };
+        let content_area = Rect {
+            x: area.x + rail_width,
+            y: area.y,
+            width: area.width.saturating_sub(rail_width),
+            height: area.height,
+        };
+        if rail_width > 0 {
+            self.draw_session_rail(
+                frame,
+                Rect {
+                    x: area.x + 1,
+                    y: area.y,
+                    width: rail_width.saturating_sub(2),
+                    height: area.height.saturating_sub(1),
+                },
+            );
+        }
 
         let footer_area = Rect {
             x: area.x,
@@ -3242,16 +3626,16 @@ impl DaemonApp {
             height: 1,
         };
         let input_width = if home {
-            88.min(area.width.saturating_sub(6)).max(24)
+            88.min(content_area.width.saturating_sub(6)).max(24)
         } else {
-            104.min(area.width.saturating_sub(4)).max(24)
+            104.min(content_area.width.saturating_sub(4)).max(24)
         };
-        let input_x = area.x + area.width.saturating_sub(input_width) / 2;
+        let input_x = content_area.x + content_area.width.saturating_sub(input_width) / 2;
         let (input_area, hints_area) = if home {
-            let target = area.y + ((area.height as u32 * 52 / 100) as u16);
+            let target = content_area.y + ((content_area.height as u32 * 52 / 100) as u16);
             let input_y = target
-                .min(area.bottom().saturating_sub(input_height + 2))
-                .max(area.y + 1);
+                .min(content_area.bottom().saturating_sub(input_height + 2))
+                .max(content_area.y + 1);
             (
                 Rect {
                     x: input_x,
@@ -3285,9 +3669,9 @@ impl DaemonApp {
         };
 
         if home {
-            self.draw_home(frame, area, input_area);
+            self.draw_home(frame, content_area, input_area);
         } else {
-            self.draw_chat(frame, area, input_area);
+            self.draw_chat(frame, content_area, input_area);
         }
 
         let focused = self.setup.is_none()
@@ -3412,6 +3796,49 @@ impl DaemonApp {
             Paragraph::new(Line::from(chips)).alignment(Alignment::Center),
             chip_area,
         );
+
+        let card_y = input_area
+            .y
+            .saturating_add(input_area.height)
+            .saturating_add(2);
+        let card_height = 6u16;
+        if area.bottom().saturating_sub(1) > card_y + card_height {
+            let width = 64.min(area.width.saturating_sub(8)).max(30);
+            let card = Rect {
+                x: area.x + area.width.saturating_sub(width) / 2,
+                y: card_y,
+                width,
+                height: card_height,
+            };
+            let block = panel_block("try", ACCENT);
+            let inner = block.inner(card);
+            frame.render_widget(block, card);
+            let examples = [
+                "inspect ./challenge and find the flag",
+                "map the services on 10.10.10.5",
+                "triage ./evidence and summarize the findings",
+            ];
+            let mut lines = Vec::new();
+            for example in examples {
+                lines.push(Line::from(vec![
+                    Span::styled("  › ", Style::default().fg(ACCENT)),
+                    Span::styled(example, Style::default().fg(TEXT)),
+                ]));
+            }
+            lines.push(Line::from(Span::styled(
+                "  /demo runs the offline tool demo",
+                Style::default().fg(FAINT),
+            )));
+            frame.render_widget(
+                Paragraph::new(lines),
+                Rect {
+                    x: inner.x + 1,
+                    y: inner.y,
+                    width: inner.width.saturating_sub(2),
+                    height: inner.height,
+                },
+            );
+        }
     }
 
     fn draw_chat(&self, frame: &mut ratatui::Frame, area: Rect, input_area: Rect) {
@@ -3424,17 +3851,22 @@ impl DaemonApp {
         let state = self.selected_state();
         let last_error = self.selected_last_error();
         let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-        let (state_text, state_color) = match state {
+        let (state_text, state_color, state_bg) = match state {
             "running" => (
                 format!("{} running", spinner[(self.spin.get() / 2) % spinner.len()]),
                 ACCENT,
+                Color::Rgb(22, 36, 54),
             ),
-            "waiting_input" if last_error.is_some() => ("✗ last turn failed".to_string(), RED),
-            "waiting_input" => ("● ready".to_string(), GREEN),
-            "failed" => ("✗ failed".to_string(), RED),
-            "cancelled" => ("✗ cancelled".to_string(), RED),
-            "done" => ("✓ done".to_string(), DIM),
-            other => (format!("● {other}"), DIM),
+            "waiting_input" if last_error.is_some() => (
+                "✗ last turn failed".to_string(),
+                RED,
+                Color::Rgb(46, 24, 28),
+            ),
+            "waiting_input" => ("● ready".to_string(), GREEN, Color::Rgb(20, 38, 28)),
+            "failed" => ("✗ failed".to_string(), RED, Color::Rgb(46, 24, 28)),
+            "cancelled" => ("✗ cancelled".to_string(), RED, Color::Rgb(46, 24, 28)),
+            "done" => ("✓ done".to_string(), DIM, Color::Rgb(32, 32, 36)),
+            other => (format!("● {other}"), DIM, Color::Rgb(32, 32, 36)),
         };
         self.spin.set(self.spin.get().wrapping_add(1));
         let display_provider = self.display_provider();
@@ -3450,18 +3882,21 @@ impl DaemonApp {
             },
             display_effort
         );
-        let right_width = right_text.chars().count() as u16;
-        let left_width = header_area.width.saturating_sub(right_width + 2).max(12);
+        let right_width = UnicodeWidthStr::width(right_text.as_str()) as u16;
+        let left_width = header_area.width.saturating_sub(right_width + 2).max(16);
+        let state_width = UnicodeWidthStr::width(state_text.as_str()) as u16 + 2;
+        let title_width = left_width.saturating_sub(state_width + 4) as usize;
         let left = Line::from(vec![
             Span::styled("▌ ", Style::default().fg(ACCENT)),
             Span::styled(
-                truncate(
-                    &self.selected_task_title(),
-                    left_width.saturating_sub(15) as usize,
-                ),
+                truncate(&self.selected_task_title(), title_width),
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("  {state_text}"), Style::default().fg(state_color)),
+            Span::styled(" ", Style::default()),
+            Span::styled(
+                format!(" {state_text} "),
+                Style::default().fg(state_color).bg(state_bg),
+            ),
         ]);
         frame.render_widget(
             Paragraph::new(left),
@@ -3472,7 +3907,20 @@ impl DaemonApp {
                 height: 1,
             },
         );
-        let right = Line::from(Span::styled(right_text, Style::default().fg(FAINT)));
+        let right = Line::from(vec![
+            Span::styled(display_provider, Style::default().fg(ACCENT)),
+            Span::styled(" · ", Style::default().fg(FAINT)),
+            Span::styled(
+                if display_model.is_empty() {
+                    "-".to_string()
+                } else {
+                    display_model
+                },
+                Style::default().fg(GREEN),
+            ),
+            Span::styled(" · ", Style::default().fg(FAINT)),
+            Span::styled(format!("effort {display_effort}"), Style::default().fg(DIM)),
+        ]);
         frame.render_widget(
             Paragraph::new(right).alignment(Alignment::Right),
             header_area,
@@ -3499,113 +3947,152 @@ impl DaemonApp {
             return;
         }
 
+        let show_bar = transcript_area.width >= 8;
+        let bar_width = if show_bar { 1 } else { 0 };
+        let text_width = transcript_area.width.saturating_sub(bar_width);
         let task_id = self.selected_task_id();
-        let mut transcript: Vec<Line> = Vec::new();
-        for line in self
+        let selected: Vec<&ChatLine> = self
             .chat
             .iter()
             .filter(|line| Some(line.task_id.as_str()) == task_id.as_deref())
-        {
-            let parts: Vec<&str> = line.text.split('\n').collect();
-            match line.role {
-                ChatRole::User => {
-                    for (index, part) in parts.iter().enumerate() {
-                        let prefix = if index == 0 { "❯ " } else { "  " };
-                        transcript.push(Line::from(vec![
-                            Span::styled(prefix, Style::default().fg(ACCENT)),
-                            Span::styled((*part).to_string(), Style::default().fg(TEXT)),
-                        ]));
+            .collect();
+        let hashes: Vec<u64> = selected.iter().map(|line| chat_hash(line)).collect();
+        let (scroll, line_count, visible, offset) = {
+            let mut cache = self.transcript_cache.borrow_mut();
+            let cache_task = task_id.as_deref().unwrap_or("");
+            if cache.task != cache_task || cache.width != text_width {
+                cache.task = cache_task.to_string();
+                cache.width = text_width;
+                cache.groups = selected
+                    .iter()
+                    .map(|line| build_chat_group(line, text_width))
+                    .collect();
+            } else {
+                let old = cache.groups.len();
+                let common = old.min(hashes.len());
+                let prefix_matches = cache.groups[..common]
+                    .iter()
+                    .zip(hashes.iter().take(common))
+                    .all(|(group, hash)| group.hash == *hash);
+                if prefix_matches {
+                    cache.groups.truncate(hashes.len());
+                    for line in selected.iter().skip(common) {
+                        cache.groups.push(build_chat_group(line, text_width));
                     }
-                }
-                ChatRole::Assistant => {
-                    for (index, part) in parts.iter().enumerate() {
-                        let suffix = if line.streaming && index + 1 == parts.len() {
-                            "▍"
-                        } else {
-                            ""
-                        };
-                        transcript.push(Line::from(vec![
-                            Span::raw("  "),
-                            Span::styled((*part).to_string(), Style::default().fg(TEXT)),
-                            Span::styled(suffix.to_string(), Style::default().fg(ACCENT)),
-                        ]));
-                    }
-                }
-                ChatRole::Tool => {
-                    let color = if line.text.starts_with('✓') {
-                        GREEN
-                    } else if line.text.starts_with('✗') {
-                        RED
-                    } else {
-                        DIM
-                    };
-                    transcript.push(Line::from(Span::styled(
-                        format!("  {}", line.text),
-                        Style::default().fg(color),
-                    )));
-                }
-                ChatRole::System => {
-                    if line.text.starts_with("turn end:") {
-                        continue;
-                    }
-                    let is_error = line.text.starts_with('✗');
-                    for (index, part) in parts.iter().enumerate() {
-                        let color = if is_error && index == 0 { RED } else { FAINT };
-                        transcript.push(Line::from(Span::styled(
-                            format!("  {part}"),
-                            Style::default().fg(color).add_modifier(Modifier::ITALIC),
-                        )));
-                    }
+                } else if old == hashes.len()
+                    && old > 0
+                    && cache.groups[..old - 1]
+                        .iter()
+                        .zip(hashes.iter().take(old - 1))
+                        .all(|(group, hash)| group.hash == *hash)
+                {
+                    cache.groups[old - 1] = build_chat_group(selected[old - 1], text_width);
+                } else {
+                    cache.groups = selected
+                        .iter()
+                        .map(|line| build_chat_group(line, text_width))
+                        .collect();
                 }
             }
-            transcript.push(Line::from(""));
-        }
-
-        if transcript.is_empty() {
-            transcript.push(Line::from(Span::styled(
-                "No messages yet. Type below to start.",
-                Style::default().fg(DIM),
-            )));
-        }
-
-        let paragraph = Paragraph::new(Text::from(transcript)).wrap(Wrap { trim: false });
-        let line_count = paragraph.line_count(transcript_area.width);
-        let max_scroll = line_count.saturating_sub(transcript_area.height as usize);
-        let scroll = if self.auto_scroll {
-            max_scroll
-        } else {
-            max_scroll.saturating_sub(self.scroll_from_bottom as usize)
+            cache.prefix.clear();
+            cache.prefix.push(0);
+            for index in 0..cache.groups.len() {
+                let height = cache.groups[index].height;
+                let last = *cache.prefix.last().unwrap_or(&0);
+                cache.prefix.push(last + height);
+            }
+            let total = *cache.prefix.last().unwrap_or(&0);
+            let max_scroll = total.saturating_sub(transcript_area.height as usize);
+            self.max_scroll
+                .set(max_scroll.min(u16::MAX as usize) as u16);
+            let scroll = if self.auto_scroll {
+                max_scroll
+            } else {
+                (self.scroll_top as usize).min(max_scroll)
+            };
+            if cache.groups.is_empty() {
+                (
+                    scroll,
+                    total,
+                    vec![Line::from(Span::styled(
+                        "No messages yet. Type below to start.",
+                        Style::default().fg(DIM),
+                    ))],
+                    0,
+                )
+            } else {
+                let start = cache
+                    .prefix
+                    .partition_point(|prefix| *prefix <= scroll)
+                    .saturating_sub(1)
+                    .min(cache.groups.len() - 1);
+                let offset = scroll.saturating_sub(cache.prefix[start]);
+                let end = cache
+                    .prefix
+                    .partition_point(|prefix| *prefix < scroll + transcript_area.height as usize)
+                    .max(start + 1)
+                    .min(cache.groups.len());
+                let mut visible = Vec::new();
+                for group in &cache.groups[start..end] {
+                    visible.extend(group.lines.iter().cloned());
+                }
+                (scroll, total, visible, offset)
+            }
         };
         frame.render_widget(
-            paragraph.scroll((scroll.min(u16::MAX as usize) as u16, 0)),
-            transcript_area,
+            Paragraph::new(Text::from(visible))
+                .wrap(Wrap { trim: false })
+                .scroll((offset.min(u16::MAX as usize) as u16, 0)),
+            Rect {
+                width: text_width,
+                ..transcript_area
+            },
         );
-    }
-
-    fn draw_prompt(&self, frame: &mut ratatui::Frame, area: Rect, focused: bool) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(ratatui::widgets::BorderType::Rounded)
-            .border_style(Style::default().fg(FAINT))
-            .style(Style::default().bg(PANEL));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        if area.height > 2 {
-            let rows = area.height - 2;
-            let bar = std::iter::repeat("│")
-                .take(rows as usize)
-                .collect::<Vec<_>>()
-                .join("\n");
+        let max_scroll = line_count.saturating_sub(transcript_area.height as usize);
+        if show_bar && max_scroll > 0 {
+            let height = transcript_area.height as usize;
+            let thumb = ((height * height) / line_count.max(1)).max(1).min(height);
+            let travel = height.saturating_sub(thumb);
+            let top = if max_scroll == 0 {
+                0
+            } else {
+                (scroll * travel / max_scroll).min(travel)
+            };
+            let mut bar = Vec::with_capacity(height);
+            for row in 0..height {
+                let active = row >= top && row < top + thumb;
+                bar.push(Line::from(Span::styled(
+                    if active { "█" } else { "│" },
+                    Style::default().fg(if active { ACCENT } else { FAINT }),
+                )));
+            }
             frame.render_widget(
-                Paragraph::new(bar).style(Style::default().fg(ACCENT).bg(PANEL)),
+                Paragraph::new(bar),
                 Rect {
-                    x: area.x,
-                    y: area.y + 1,
+                    x: transcript_area.right().saturating_sub(1),
+                    y: transcript_area.y,
                     width: 1,
-                    height: rows,
+                    height: transcript_area.height,
                 },
             );
         }
+    }
+
+    fn draw_prompt(&self, frame: &mut ratatui::Frame, area: Rect, focused: bool) {
+        let border = if !self.approvals.is_empty() {
+            YELLOW
+        } else if focused {
+            ACCENT
+        } else {
+            FAINT
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().fg(border))
+            .style(Style::default().bg(PANEL));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
         if inner.width < 2 || inner.height < 3 {
             return;
         }
@@ -3764,15 +4251,40 @@ impl DaemonApp {
     }
 
     fn draw_footer(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let mut spans = vec![
+            Span::styled(self.workspace_label(), Style::default().fg(FAINT)),
+            Span::styled("  ·  ", Style::default().fg(FAINT)),
+            Span::styled(
+                format!("权限 {}", permission_label(&self.display_permission())),
+                Style::default().fg(permission_color(&self.display_permission())),
+            ),
+        ];
+        if self.selected_task_id().is_some() {
+            let (tokens, tools) = self.selected_usage();
+            if tokens > 0 {
+                spans.push(Span::styled("  ·  ", Style::default().fg(FAINT)));
+                spans.push(Span::styled(
+                    format!("ctx {}", format_tokens(tokens)),
+                    Style::default().fg(DIM),
+                ));
+            }
+            if tools > 0 {
+                spans.push(Span::styled("  ·  ", Style::default().fg(FAINT)));
+                spans.push(Span::styled(
+                    format!("tools {tools}"),
+                    Style::default().fg(DIM),
+                ));
+            }
+        }
+        if !self.auto_scroll && self.selected_task_id().is_some() {
+            spans.push(Span::styled("  ·  ", Style::default().fg(FAINT)));
+            spans.push(Span::styled(
+                "↑ scrollback · End follows",
+                Style::default().fg(YELLOW),
+            ));
+        }
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(self.workspace_label(), Style::default().fg(FAINT)),
-                Span::styled("  ·  ", Style::default().fg(FAINT)),
-                Span::styled(
-                    format!("权限 {}", permission_label(&self.display_permission())),
-                    Style::default().fg(permission_color(&self.display_permission())),
-                ),
-            ])),
+            Paragraph::new(Line::from(spans)),
             Rect {
                 x: area.x + 2,
                 y: area.y,
@@ -3781,7 +4293,7 @@ impl DaemonApp {
             },
         );
         let right = format!("MitnickSolve {VERSION}");
-        let width = right.chars().count() as u16;
+        let width = UnicodeWidthStr::width(right.as_str()) as u16;
         if area.width > width + 4 {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(right, Style::default().fg(FAINT))))
@@ -3826,7 +4338,7 @@ impl DaemonApp {
     }
 
     fn draw_help(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let area = centered_rect(70, 66, area);
+        let area = centered_rect(70, 78, area);
         frame.render_widget(Clear, area);
         let lines = vec![
             help_line("Enter", "write a message / send"),
@@ -3836,8 +4348,11 @@ impl DaemonApp {
             help_line("Ctrl+N", "start a new session"),
             help_line("Ctrl+P", "command palette"),
             help_line("F1", "toggle this help"),
-            help_line("↑ / ↓", "scroll the transcript"),
-            help_line("PgUp / PgDn", "scroll faster"),
+            help_line("↑ / ↓", "scroll the transcript one line"),
+            help_line("PgUp / PgDn", "scroll ten lines"),
+            help_line("Ctrl/Alt+↑/↓", "older / newer input history"),
+            help_line("Ctrl+Home/End", "transcript top / follow output"),
+            help_line("mouse wheel", "scroll the transcript"),
             help_line("y / n", "approve or deny a pending tool call"),
             help_line("Ctrl+Q", "detach from the terminal"),
             help_line("Ctrl+C", "interrupt the turn, or quit when idle"),
@@ -3941,6 +4456,86 @@ impl DaemonApp {
         frame.render_stateful_widget(list, list_area, &mut state);
     }
 
+    fn draw_session_rail(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let block = panel_block("sessions", ACCENT);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.height < 3 || inner.width < 8 {
+            return;
+        }
+        let rows = inner.height.saturating_sub(2) as usize;
+        let total = self.tasks.len();
+        let current_row = if self.new_task {
+            total
+        } else {
+            self.selected_task
+        };
+        let start = if total <= rows {
+            0
+        } else {
+            current_row
+                .saturating_sub(rows / 2)
+                .min(total.saturating_sub(rows))
+        };
+        let mut lines = Vec::new();
+        for index in start..total.min(start + rows) {
+            let task = &self.tasks[index];
+            let state = task.get("state").and_then(Value::as_str).unwrap_or("?");
+            let glyph = state_label(state).chars().next().unwrap_or('·');
+            let current = !self.new_task && index == self.selected_task;
+            let title = task.get("goal").and_then(Value::as_str).unwrap_or("");
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if current { "▌ " } else { "  " },
+                    Style::default().fg(if current { ACCENT } else { FAINT }),
+                ),
+                Span::styled(format!("{glyph} "), Style::default().fg(state_color(state))),
+                Span::styled(
+                    truncate(title, inner.width.saturating_sub(5) as usize),
+                    Style::default().fg(if current { TEXT } else { DIM }),
+                ),
+            ]));
+        }
+        if total == 0 {
+            lines.push(Line::from(Span::styled(
+                "  no sessions",
+                Style::default().fg(FAINT),
+            )));
+        }
+        if lines.len() < rows {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if self.new_task { "● " } else { "＋ " },
+                    Style::default().fg(if self.new_task { GREEN } else { ACCENT }),
+                ),
+                Span::styled("New session", Style::default().fg(ACCENT)),
+            ]));
+        }
+        frame.render_widget(
+            Paragraph::new(lines),
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: inner.height.saturating_sub(1),
+            },
+        );
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "tab switch · ctrl+n new",
+                Style::default().fg(FAINT),
+            ))
+            .alignment(Alignment::Center),
+            Rect {
+                x: inner.x,
+                y: inner.bottom().saturating_sub(1),
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+
     fn draw_sessions(&self, frame: &mut ratatui::Frame, area: Rect) {
         let width = 76.min(area.width.saturating_sub(6)).max(26);
         let height = ((self.tasks.len() as u16) + 5)
@@ -3996,7 +4591,7 @@ impl DaemonApp {
             let title = task.get("goal").and_then(Value::as_str).unwrap_or("");
             items.push(ListItem::new(Line::from(vec![
                 Span::styled(
-                    if current { "● " } else { "  " },
+                    if current { "▌ " } else { "  " },
                     Style::default().fg(if current { GREEN } else { FAINT }),
                 ),
                 Span::styled(
@@ -4559,27 +5154,54 @@ fn run_daemon(
         app.open_setup();
         open_setup_step(&mut app, setup_step.as_deref());
     }
+    let mut dirty = true;
     loop {
-        app.refresh()?;
+        let changed = match app.refresh() {
+            Ok(changed) => changed,
+            Err(err) => {
+                app.status = format!("refresh failed: {err}");
+                false
+            }
+        };
         if app.quit_requested {
             return Ok(());
         }
-        terminal.draw(|frame| app.draw(frame))?;
+        dirty |= changed;
+        let running = app.any_running();
+        if dirty || running {
+            terminal.draw(|frame| app.draw(frame))?;
+            dirty = false;
+        }
         let poll_ms = if app.terminal_focus {
+            16
+        } else if running {
             50
         } else {
-            app.refresh_ms
+            app.refresh_ms.clamp(100, 500)
         };
         if event::poll(Duration::from_millis(poll_ms))? {
             match event::read()? {
                 CrosstermEvent::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
+                    dirty = true;
                     if app.handle_key(key) {
                         return Ok(());
                     }
                 }
-                CrosstermEvent::Paste(text) => app.handle_paste(&text),
+                CrosstermEvent::Paste(text) => {
+                    dirty = true;
+                    app.handle_paste(&text);
+                }
+                CrosstermEvent::Mouse(mouse) => {
+                    dirty = true;
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => app.scroll_up(3),
+                        MouseEventKind::ScrollDown => app.scroll_down(3),
+                        _ => {}
+                    }
+                }
+                CrosstermEvent::Resize(_, _) => dirty = true,
                 _ => {}
             }
         }
@@ -4628,13 +5250,19 @@ fn main() -> Result<()> {
         let _ = execute!(
             std::io::stdout(),
             DisableBracketedPaste,
+            DisableMouseCapture,
             LeaveAlternateScreen,
             crossterm::cursor::Show
         );
         hook(info);
     }));
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        out,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
@@ -4655,6 +5283,7 @@ fn main() -> Result<()> {
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
+        DisableMouseCapture,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -4704,8 +5333,16 @@ fn snapshot_daemon(
         app.show_permissions = true;
     }
     app.auto_scroll = false;
-    app.scroll_from_bottom = 10_000;
-    let backend = ratatui::backend::TestBackend::new(120, 40);
+    app.scroll_top = 10_000;
+    let width = std::env::var("MSK_SNAPSHOT_WIDTH")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(120);
+    let height = std::env::var("MSK_SNAPSHOT_HEIGHT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(40);
+    let backend = ratatui::backend::TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend)?;
     terminal.draw(|frame| app.draw(frame))?;
     let buffer = terminal.backend().buffer();
@@ -5282,11 +5919,99 @@ fn compact_json(value: &Value, max_chars: usize) -> String {
     )
 }
 
+fn string_field<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key).and_then(Value::as_str)
+}
+
+fn tool_summary(tool: &str, args: &Value) -> String {
+    let value = match tool {
+        "exec" => args
+            .get("argv")
+            .and_then(Value::as_array)
+            .map(|argv| {
+                argv.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default(),
+        "session_exec" => string_field(args, "command")
+            .unwrap_or_default()
+            .to_string(),
+        "session_create" => string_field(args, "name")
+            .or_else(|| string_field(args, "kind"))
+            .unwrap_or_default()
+            .to_string(),
+        "session_close" => string_field(args, "session_id")
+            .unwrap_or_default()
+            .to_string(),
+        "env_create" => {
+            let kind = string_field(args, "kind").unwrap_or("managed");
+            let name = string_field(args, "name").unwrap_or("");
+            if name.is_empty() {
+                kind.to_string()
+            } else {
+                format!("{kind} {name}")
+            }
+        }
+        "env_open" | "env_close" => string_field(args, "env_id").unwrap_or_default().to_string(),
+        "artifact_list" => string_field(args, "env_id").unwrap_or_default().to_string(),
+        "read_file" | "write_file" | "list_dir" | "stat_file" | "file_hash" | "file_type"
+        | "file_strings" | "file_hexdump" | "file_entropy" | "file_search" | "binary_info"
+        | "secret_scan" => string_field(args, "path").unwrap_or_default().to_string(),
+        "net_dns" => string_field(args, "host").unwrap_or_default().to_string(),
+        "net_scan" => string_field(args, "target")
+            .or_else(|| string_field(args, "host"))
+            .unwrap_or_default()
+            .to_string(),
+        "net_dial" | "net_tls" => {
+            let host = string_field(args, "host").unwrap_or_default();
+            let port = args.get("port").and_then(Value::as_u64);
+            match port {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            }
+        }
+        "web_request" | "http_request" => {
+            let method = string_field(args, "method").unwrap_or("GET");
+            let url = string_field(args, "url").unwrap_or_default();
+            format!("{method} {url}")
+        }
+        "artifact_read" => {
+            let id = string_field(args, "id").unwrap_or_default();
+            let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
+            format!("artifact {id} @{offset}")
+        }
+        "spawn_agent" => string_field(args, "goal").unwrap_or_default().to_string(),
+        "finding_add" => string_field(args, "title").unwrap_or_default().to_string(),
+        "flag_add" => string_field(args, "value")
+            .or_else(|| string_field(args, "flag"))
+            .unwrap_or_default()
+            .to_string(),
+        _ => return compact_json(args, 140),
+    };
+    if value.trim().is_empty() {
+        compact_json(args, 140)
+    } else {
+        truncate(value.trim(), 180)
+    }
+}
+
 fn truncate(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         value.to_string()
     } else {
         format!("{}…", value.chars().take(max_chars).collect::<String>())
+    }
+}
+
+fn format_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
     }
 }
 
@@ -5380,6 +6105,45 @@ mod tests {
         assert!(text.starts_with("✗ model_not_found: no channel"));
         assert!(text.contains("ctrl+p providers"));
         assert_eq!(turn_error_text("error", ""), "✗ error");
+    }
+
+    #[test]
+    fn markdown_lite_renders_headings_lists_and_code() {
+        let lines = markdown_lite("# Heading\n- **bold** and `code`\n```sh\necho hi\n```");
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(text.iter().any(|line| line.contains("Heading")));
+        assert!(text.iter().any(|line| line.contains("• bold and code")));
+        assert!(text.iter().any(|line| line.contains("╭─ sh")));
+        assert!(text.iter().any(|line| line.contains("echo hi")));
+    }
+
+    #[test]
+    fn tool_summaries_are_readable() {
+        assert_eq!(
+            tool_summary("session_exec", &json!({"command": "id"})),
+            "id"
+        );
+        assert_eq!(
+            tool_summary("net_scan", &json!({"target": "10.0.0.0/24", "ports": [80]})),
+            "10.0.0.0/24"
+        );
+        assert_eq!(
+            tool_summary(
+                "web_request",
+                &json!({"method": "GET", "url": "https://x.test"})
+            ),
+            "GET https://x.test"
+        );
+        let fallback = tool_summary("echo", &json!({"text": "hi"}));
+        assert!(fallback.contains("hi"));
     }
 
     #[test]
@@ -5849,6 +6613,165 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.selected_task, 0);
         assert!(!app.show_sessions);
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn arrows_scroll_while_the_composer_is_focused() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app =
+            DaemonApp::connect(PathBuf::from(root), 100, Some("scripted".into())).unwrap();
+        app.setup = None;
+        app.tasks = vec![json!({
+            "task_id": "task-a", "goal": "scroll", "state": "waiting_input",
+            "provider": "scripted", "model": null, "effort": "default",
+            "permission": "auto", "mode": "exploit", "last_error": null
+        })];
+        app.selected_task = 0;
+        app.new_task = false;
+        app.composing = true;
+        app.input.clear();
+        app.input_history = vec!["old message".into()];
+        app.max_scroll.set(50);
+        app.auto_scroll = true;
+        app.scroll_top = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(!app.auto_scroll, "Up must leave follow mode");
+        assert_eq!(app.scroll_top, 49);
+        assert!(app.input.is_empty(), "Up must not fill the composer");
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.scroll_top, 39);
+        app.input = "draft".into();
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            app.scroll_top, 38,
+            "typing does not steal Up from scrolling"
+        );
+        app.input.clear();
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+        assert_eq!(app.input, "old message", "Ctrl+Up recalls history");
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
+        assert!(app.auto_scroll);
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn scroll_math_clamps_and_rearms_follow() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app =
+            DaemonApp::connect(PathBuf::from(root), 100, Some("scripted".into())).unwrap();
+        app.setup = None;
+        app.max_scroll.set(50);
+        app.auto_scroll = true;
+        app.scroll_top = 0;
+        app.scroll_up(3);
+        assert!(!app.auto_scroll);
+        assert_eq!(app.scroll_top, 47);
+        app.scroll_down(3);
+        assert!(app.auto_scroll);
+        assert_eq!(app.scroll_top, 50);
+        app.scroll_to_top();
+        assert_eq!(app.scroll_top, 0);
+        assert!(!app.auto_scroll);
+        app.follow_output();
+        assert!(app.auto_scroll);
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn long_transcript_draw_perf() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app =
+            DaemonApp::connect(PathBuf::from(root), 100, Some("scripted".into())).unwrap();
+        app.setup = None;
+        app.tasks = vec![json!({
+            "task_id": "task-a", "goal": "long transcript", "state": "waiting_input",
+            "provider": "scripted", "model": null, "effort": "default",
+            "permission": "auto", "mode": "exploit", "last_error": null
+        })];
+        app.selected_task = 0;
+        app.new_task = false;
+        app.chat = (0..4000)
+            .map(|index| ChatLine {
+                task_id: "task-a".into(),
+                role: if index % 2 == 0 {
+                    ChatRole::User
+                } else {
+                    ChatRole::Assistant
+                },
+                text: format!("line {index}: a moderately long message with `code` and some words"),
+                streaming: false,
+            })
+            .collect();
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let start = Instant::now();
+        for _ in 0..20 {
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+        }
+        let per_frame = start.elapsed() / 20;
+        println!("long transcript draw: {per_frame:?}/frame");
+        assert!(per_frame < Duration::from_millis(250), "{per_frame:?}");
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn layout_survives_small_terminals() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app =
+            DaemonApp::connect(PathBuf::from(root), 100, Some("scripted".into())).unwrap();
+        app.setup = None;
+        app.tasks = vec![json!({
+            "task_id": "task-a", "goal": "a very long challenge title that must truncate cleanly",
+            "state": "waiting_input", "provider": "scripted", "model": null,
+            "effort": "default", "permission": "auto", "mode": "exploit",
+            "last_error": null
+        })];
+        app.selected_task = 0;
+        app.new_task = false;
+        app.chat = vec![
+            ChatLine {
+                task_id: "task-a".into(),
+                role: ChatRole::User,
+                text: "inspect ./challenge and find the flag".into(),
+                streaming: false,
+            },
+            ChatLine {
+                task_id: "task-a".into(),
+                role: ChatRole::Assistant,
+                text: "# Findings\n- **TLS** on `443`\n```text\ncertificate expired\n```\nA long paragraph that should wrap without overflowing the terminal or panicking in narrow layouts.".into(),
+                streaming: false,
+            },
+            ChatLine {
+                task_id: "task-a".into(),
+                role: ChatRole::Tool,
+                text: "▸ session_exec id".into(),
+                streaming: false,
+            },
+        ];
+        for (width, height) in [(80, 24), (60, 20), (100, 30), (120, 40)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| app.draw(frame))
+                .unwrap_or_else(|err| panic!("{width}x{height}: {err}"));
+            let content: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(content.contains("MitnickSolve"), "{width}x{height}");
+        }
     }
 
     #[test]

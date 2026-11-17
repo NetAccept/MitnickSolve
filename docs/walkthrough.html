@@ -204,7 +204,7 @@
   <div class="hero">
     <div class="eyebrow">one command · real daemon · real tools</div>
     <h1>From a clean checkout to an approved tool call.</h1>
-    <p class="lede"><code>msk</code> opens a semi-graphical terminal app: a pixel wordmark, rounded composer, status chips, dimmed modal layers and live tool cards. Every session runs in a mode — <strong>plan</strong>, <strong>investigate</strong>, <strong>exploit</strong>, <strong>harden</strong>, or <strong>auto</strong> routing — which controls both the operating rules and the tools the kernel loads. This is a real run in a project directory: a mock OpenAI-compatible model asked the kernel to execute a command, the TUI paused for approval, and the tool result returned to the same conversation. The agent sees the files in the directory you launched from.</p>
+    <p class="lede"><code>msk</code> opens a semi-graphical terminal app: a pixel wordmark, rounded composer, status chips, a session rail, markdown-lite assistant text, readable tool summaries and dimmed modal layers. Every session runs in a mode — <strong>plan</strong>, <strong>investigate</strong>, <strong>exploit</strong>, <strong>harden</strong>, or <strong>auto</strong> routing — which controls both the operating rules and the tools the kernel loads. This is a real run in a project directory: a mock OpenAI-compatible model asked the kernel to execute a command, the TUI paused for approval, and the tool result returned to the same conversation. The agent sees the files in the directory you launched from.</p>
     <div class="hero-note">
       <span class="chip"><strong>msk</strong> opens the TUI</span>
       <span class="chip"><strong>mskd</strong> auto-starts</span>
@@ -241,24 +241,37 @@
                          █   █   █     █   █   █   █   █     █  █      █ █   █ █      █ █  █
                          █   █ █████   █   █   █ █████  ████ █   █ ████   ███  █████   █   █████
 
-                                                    ~   scripted-demo
+                                                      ~   scripted
 
                 ╭──────────────────────────────────────────────────────────────────────────────────────╮
-                │ Ask anything…  "inspect ./challenge and find the flag"                               │
+                │ Ask anything…  &quot;inspect ./challenge and find the flag&quot;                               │
                 │                                                                                      │
-                │  Build · scripted-demo                                                               │
+                │  自 动  · scripted                                                                     │
                 ╰──────────────────────────────────────────────────────────────────────────────────────╯
-                                                   tab sessions   ctrl+n new   ctrl+p commands   F1 help
-  ~                                                                                                 MitnickSolve 0.1.3</pre>
+                                                 tab sessions   ctrl+n new   ctrl+p commands   F1 help
+
+                            ╭ try ─────────────────────────────────────────────────────────╮
+                            │   › inspect ./challenge and find the flag                    │
+                            │   › map the services on 10.10.10.5                           │
+                            │   › triage ./evidence and summarize the findings             │
+                            │   /demo runs the offline tool demo                           │
+                            ╰──────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+  ~  ·  权 限  自 动                                                                                    MitnickSolve 0.1.4</pre>
       </div>
-      <p class="caption">The wordmark, workspace/provider chips and rounded composer are the whole first screen. The composer is focused: type a challenge and press Enter to create the session and send the first turn.</p>
+      <p class="caption">The wordmark, workspace/provider chips, rounded composer and a starter card make up the first screen. The composer is focused: type a challenge and press Enter to create the session and send the first turn.</p>
     </div>
   </section>
 
   <section id="setup">
     <div class="section-head"><div class="section-num">02</div><div>
       <h2>Provider, model and effort are chosen, not guessed.</h2>
-      <p><code>Ctrl+P</code> → <strong>Provider and model</strong>, or <code>/setup</code>, opens a full guided wizard with a step indicator. The selection is saved to <code>tui-config.json</code> and applied to every new session. The API key stays in <code>mskd</code>'s environment; the setup card only reports whether it is present.</p>
+      <p><code>Ctrl+P</code> → <strong>Provider and model</strong>, or <code>/setup</code>, opens a full guided wizard with a step indicator. The selection and key are saved as a provider profile in <code>tui-config.json</code> and reused for new sessions. <code>MSK_LLM_API_KEY</code> in <code>mskd</code>'s environment remains a fallback; keys you enter are masked and sent only to the daemon over local IPC.</p>
     </div></div>
     <div class="body">
       <div class="term">
@@ -283,7 +296,7 @@
                   │ ↑/↓ choose   Enter next   Esc back/close   Ctrl+U clear input                    │
                   │                                                                                  │
                   ╰──────────────────────────────────────────────────────────────────────────────────╯
-  ~                                                                                                 MitnickSolve 0.1.3</pre>
+  ~                                                                                                 MitnickSolve 0.1.4</pre>
       </div>
       <div class="term">
         <div class="term-head"><span class="dots"><i></i><i></i><i></i></span>setup · model · actual --snapshot output</div>
@@ -307,7 +320,7 @@
                   │ config  C:\Users\cy\MitnickSolve\.msk\ui-home2\tui-config.json                   │
                   │ ↑/↓ choose   Enter next   Esc back/close   Ctrl+U clear input                    │
                   ╰──────────────────────────────────────────────────────────────────────────────────╯
-  ~                                                                                                 MitnickSolve 0.1.3</pre>
+  ~                                                                                                 MitnickSolve 0.1.4</pre>
       </div>
       <div class="term">
         <div class="term-head"><span class="dots"><i></i><i></i><i></i></span>setup · effort · actual --snapshot output</div>
@@ -331,7 +344,7 @@
                   │ config  C:\Users\cy\MitnickSolve\.msk\ui-home2\tui-config.json                   │
                   │ ↑/↓ choose   Enter next   Esc back/close   Ctrl+U clear input                    │
                   ╰──────────────────────────────────────────────────────────────────────────────────╯
-  ~                                                                                                 MitnickSolve 0.1.3</pre>
+  ~                                                                                                 MitnickSolve 0.1.4</pre>
       </div>
       <p class="caption">The provider list distinguishes the offline demo, Chat Completions, Responses and component providers. The service step offers endpoint presets for OpenAI, DeepSeek, OpenRouter, Groq, Together, Ollama and LM Studio; model presets include a custom input; effort is sent as <code>reasoning_effort</code> or <code>reasoning.effort</code>. The final step accepts an API key (masked), and the result is saved as a provider profile. The header shows the active <code>provider / model / effort</code> at all times.</p>
       <div class="callout"><strong>No key, no fake success:</strong> if neither a saved profile key nor the daemon's <code>MSK_LLM_API_KEY</code> is available, the setup screen says so and session creation stops with an actionable message instead of spawning a task that immediately fails.</div>
@@ -341,18 +354,18 @@
   <section id="session">
     <div class="section-head"><div class="section-num">03</div><div>
       <h2>One session, one conversation.</h2>
-      <p>Tool calls, results, user turns and agent text share one borderless timeline. The session list opens only on <code>Tab</code>, and the raw event inspector stays out of the way until you ask for it.</p>
+      <p>Tool calls, results, user turns and agent text share one structured timeline with a session rail on wide terminals. The full session list still opens on <code>Tab</code>, and the raw event inspector stays out of the way until you ask for it.</p>
     </div></div>
     <div class="body">
       <div class="split">
         <div class="panel"><h3>What you see</h3><ul>
           <li><code>▸ exec …</code> — the agent requested a tool, with compact arguments.</li>
           <li><code>✓ exec …</code> — the result, in green; <code>✗</code> marks a failure.</li>
-          <li><code>❯</code> — your messages; agent text is plain, with a live block cursor while streaming.</li>
+          <li><code>❯</code> — your messages; agent text uses a <code>│</code> gutter with Markdown headings, lists, inline code and fenced blocks. Streaming text ends with a live block cursor.</li>
           <li>The header shows the goal, a spinner while running, and the model/effort.</li>
         </ul></div>
         <div class="panel"><h3>What stays available</h3><ul>
-          <li><code>PgUp</code>/<code>PgDn</code> or <code>↑</code>/<code>↓</code> scrolls; <code>End</code> follows the newest output.</li>
+          <li><code>↑</code>/<code>↓</code>, <code>PgUp</code>/<code>PgDn</code> and the mouse wheel scroll; <code>Ctrl+↑</code>/<code>Ctrl+↓</code> walk input history; <code>Ctrl+End</code> follows output.</li>
           <li><code>Tab</code> opens the session switcher and rehydrates each history.</li>
           <li><code>Ctrl+P</code> → Event inspector shows the raw events for debugging.</li>
           <li><code>Ctrl+P</code> → Terminal opens the daemon PTY; <code>Ctrl+Q</code> detaches.</li>
@@ -360,23 +373,46 @@
       </div>
       <div class="term">
         <div class="term-head"><span class="dots"><i></i><i></i><i></i></span>completed turn · mock model · actual --snapshot output</div>
-        <pre>  ▌ Find the flag in ./challenge  ● ready                                                scripted · - · effort default
-  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-    ▸ env_create {"kind":"managed","name":"session","profile":"dev","root":"."}
-
-    ✓ env_create
-
-  ❯ inspect ./challenge and find the flag
-
-    echo: inspect ./challenge and find the flag
-
-        ╭──────────────────────────────────────────────────────────────────────────────────────────────────────╮
-        │ Reply…   Shift+Enter for a new line                                                                  │
-        │                                                                                                      │
-        │  Build · scripted                                                                                    │
-        ╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯
-                                                           tab sessions   ctrl+n new   ctrl+p commands   F1 help
-  ~/.msk/ui-chat/ws                                                                                 MitnickSolve 0.1.3</pre>
+        <pre> ╭ sessions ──────────╮   ▌ Interactive markup test  ● ready                             scripted · - · effort default
+ │  ✓ Find the flag i…│   ────────────────────────────────────────────────────────────────────────────────────────────
+ │▌ ● Interactive mar…│     ▸ env_create {&quot;kind&quot;:&quot;managed&quot;,&quot;name&quot;:&quot;session&quot;,&quot;profile&quot;:&quot;dev&quot;,&quot;root&quot;:&quot;.&quot;}
+ │                    │
+ │＋  New session      │     ✓ env_create
+ │                    │
+ │                    │   ❯ hello **world** and `code`
+ │                    │
+ │                    │   │   echo: hello world and code
+ │                    │
+ │                    │   ❯ # Recon
+ │                    │     - found **TLS** on `443`
+ │                    │     - certificate expired
+ │                    │
+ │                    │
+ │                    │     ```text
+ │                    │     subject=challenge.local
+ │                    │     ```
+ │                    │
+ │                    │   │   echo: # Recon
+ │                    │   │   • found TLS on 443
+ │                    │   │   • certificate expired
+ │                    │   │
+ │                    │   │   ╭─ text
+ │                    │   │   │ subject=challenge.local
+ │                    │   │   ╰─
+ │                    │
+ │                    │
+ │                    │
+ │                    │
+ │                    │
+ │                    │
+ │                    │
+ │                    │   ╭──────────────────────────────────────────────────────────────────────────────────────────╮
+ │                    │   │ Reply…   Shift+Enter for a new line                                                      │
+ │                    │   │                                                                                          │
+ │                    │   │  攻 击  · scripted                                                                         │
+ │tab switch · ctrl+n │   ╰──────────────────────────────────────────────────────────────────────────────────────────╯
+ ╰────────────────────╯                                        tab sessions   ctrl+n new   ctrl+p commands   F1 help
+  ~  ·  权 限  手 动   ·  ↑ scrollback · End follows                                                    MitnickSolve 0.1.4</pre>
       </div>
       <p class="caption">The session is <code>waiting_input</code>; the tool card carries the exit code and stdout, and the next message can continue the same shell. <code>/resume</code> restores the latest checkpoint after a daemon restart.</p>
     </div>
@@ -435,7 +471,8 @@
         <div class="key"><kbd>Ctrl+P</kbd><span>command palette</span></div>
         <div class="key"><kbd>Tab</kbd><span>session switcher</span></div>
         <div class="key"><kbd>F1</kbd><span>keyboard shortcuts</span></div>
-        <div class="key"><kbd>PgUp/PgDn</kbd><span>scroll conversation</span></div>
+        <div class="key"><kbd>↑/↓</kbd><span>scroll conversation</span></div>
+        <div class="key"><kbd>Ctrl+N</kbd><span>new session</span></div>
         <div class="key"><kbd>y / n</kbd><span>approve / deny</span></div>
         <div class="key"><kbd>Ctrl+C</kbd><span>interrupt, then quit</span></div>
       </div>
@@ -470,28 +507,17 @@
                       │                                                                          │
                       │                                                                          │
                       ╰──────────────────────────────────────────────────────────────────────────╯
-  ~/.msk/ui-chat/ws                                                                                 MitnickSolve 0.1.3</pre>
+  ~/.msk/ui-chat/ws                                                                                 MitnickSolve 0.1.4</pre>
       </div>
       <div class="term">
         <div class="term-head"><span class="dots"><i></i><i></i><i></i></span>tab · sessions · actual --snapshot output</div>
-        <pre>  ▌ Find the flag in ./challenge  ● ready                                                scripted · - · effort default
-  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-    ▸ env_create {"kind":"managed","name":"session","profile":"dev","root":"."}
-
-    ✓ env_create
-
-  ❯ inspect ./challenge and find the flag
-
-    echo: inspect ./challenge and find the flag
-
-                      ╭ sessions ────────────────────────────────────────────────────────────────╮
-                      │› ● ready     Find the flag in ./challenge                                │
-                      │  ✗ cancelled Interactive session                                         │
-                      │                                                                          │
-                      │                                                                          │
-                      │                                    ↑/↓ select · Enter switch · Esc close │
-                      ╰──────────────────────────────────────────────────────────────────────────╯
-  ~/.msk/ui-chat/ws                                                                                 MitnickSolve 0.1.3</pre>
+        <pre>╭ sessions ────────────────────────────────────────────────────────────────╮
+│ Open a saved conversation or start a fresh one.                          │
+│   ＋  New session   start a fresh conversation                            │
+│     ✓ done        Find the flag in ./challenge                           │
+│ › ▌ ● ready       Interactive markup test                                │
+│                              ↑/↓ select · Enter open · n new · Esc close │
+╰──────────────────────────────────────────────────────────────────────────╯</pre>
       </div>
       <div class="cmd">
         <div class="cmd-head"><span>slash commands</span><button class="copy" data-copy="slash">Copy</button></div>
