@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
+#[command(name = "mskd", version)]
 struct Cli {
     /// Kernel state directory containing the socket and token.
     #[arg(long, default_value = ".msk")]

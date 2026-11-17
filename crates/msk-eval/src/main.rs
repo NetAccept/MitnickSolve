@@ -15,6 +15,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 #[derive(Debug, Parser)]
+#[command(name = "msk-eval", version)]
 struct Cli {
     /// Kernel state directory containing the IPC token.
     #[arg(long, default_value = ".msk")]

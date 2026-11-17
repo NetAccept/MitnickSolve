@@ -20,6 +20,7 @@ const MAX_BODY: u64 = 1 << 20;
 const UI: &str = include_str!("ui.html");
 
 #[derive(Debug, Parser)]
+#[command(name = "msk-web", version)]
 struct Cli {
     /// Kernel state directory containing the IPC token.
     #[arg(long, default_value = ".msk")]

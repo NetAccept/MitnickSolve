@@ -13,6 +13,7 @@ enum Format {
 }
 
 #[derive(Debug, Parser)]
+#[command(name = "msk-replay", version)]
 struct Cli {
     /// Event log produced by the kernel or mskd task.
     #[arg(long, default_value = ".msk/events.jsonl")]

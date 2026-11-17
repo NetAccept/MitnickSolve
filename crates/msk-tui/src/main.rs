@@ -532,7 +532,11 @@ fn finish_streaming(chat: &mut [ChatLine], task_id: &str) {
 }
 
 #[derive(Debug, Parser)]
-#[command(version, about = "MitnickSolve interactive CTF agent")]
+#[command(
+    name = "msk-tui",
+    version,
+    about = "MitnickSolve interactive CTF agent"
+)]
 struct Cli {
     /// Read a JSONL event log instead of opening the conversational daemon.
     #[arg(long)]

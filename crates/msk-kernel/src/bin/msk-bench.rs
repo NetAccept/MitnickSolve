@@ -11,6 +11,7 @@ use msk_wasm::{ToolContext, ToolHost, WasmtimeRuntime};
 use serde_json::{Value, json};
 
 #[derive(Debug, Parser)]
+#[command(name = "msk-bench", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

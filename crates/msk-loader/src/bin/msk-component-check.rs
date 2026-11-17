@@ -12,6 +12,7 @@ use msk_loader::{ComponentManifest, LoadedComponent, TrustStore, verify_componen
 use serde_json::Value;
 
 #[derive(Debug, Parser)]
+#[command(name = "msk-component-check", version)]
 struct Cli {
     /// Signed component manifest.
     #[arg(long)]

@@ -231,6 +231,39 @@ start envd with `--net-allow <CIDR|domain>...`; every network target is checked
 before a packet is sent. See [`docs/tools.md`](docs/tools.md) for schemas, hard
 limits, approval behavior, and end-to-end workflows.
 
+## Release binaries
+
+GitHub Releases contain ready-to-run archives for `windows-x64` and
+`linux-x64`. Each archive includes the kernel, daemon, TUI, web/eval tools,
+`envd`, `tools/wasm`, docs, scripts, `modes.example.json`, and a `SHA256SUMS`
+file.
+
+```powershell
+# Windows
+Expand-Archive mitnicksolve-<version>-windows-x64.zip -DestinationPath mitnicksolve
+cd mitnicksolve
+.\msk.exe
+```
+
+```sh
+# Linux
+tar -xzf mitnicksolve-<version>-linux-x64.tar.gz
+cd mitnicksolve-<version>-linux-x64
+./msk
+```
+
+Everything is resolved relative to the executable and the extracted directory;
+run from the extracted folder so the default `tools/wasm` manifests are found.
+`msk --version` reports the release version. Verify downloads with:
+
+```sh
+sha256sum -c mitnicksolve-<version>-linux-x64.tar.gz.sha256
+```
+
+The release workflow is [`.github/workflows/release.yml`](.github/workflows/release.yml)
+and runs on `v*` tags: it builds both platforms, packages archives, writes
+checksums, and publishes the GitHub release.
+
 ## Build
 
 ```sh

@@ -60,6 +60,7 @@ enum Approvals {
 }
 
 #[derive(Debug, Parser)]
+#[command(name = "msk", version)]
 struct Cli {
     /// Path to the envd binary built from tools/envd (embedded mode).
     #[arg(long)]

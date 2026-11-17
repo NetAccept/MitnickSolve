@@ -89,8 +89,6 @@ const PLAN_DENY: &[&str] = &[
     "session_close",
     "write_file",
     "http_request",
-    "spawn_agent",
-    "agent_result",
     "blackboard_set",
     "finding_add",
     "flag_add",

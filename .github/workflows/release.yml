@@ -1,0 +1,118 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            name: linux-x64
+          - os: windows-latest
+            name: windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build kernel and frontends
+        run: cargo build --release --workspace --bins
+
+      - name: Build envd (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p target/release
+          cd tools/envd
+          go build -o ../../target/release/envd ./cmd/envd
+
+      - name: Build envd (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force target/release | Out-Null
+          go build -C tools/envd -o ../../target/release/envd.exe ./cmd/envd
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKG="mitnicksolve-${VERSION}-linux-x64"
+          STAGE="dist/${PKG}"
+          rm -rf dist
+          mkdir -p "${STAGE}/tools"
+          for bin in msk mskd mskctl msk-tui msk-web msk-eval msk-replay msk-component-host msk-component-check; do
+            cp "target/release/${bin}" "${STAGE}/"
+          done
+          cp target/release/envd "${STAGE}/"
+          cp -r tools/wasm "${STAGE}/tools/wasm"
+          cp modes.example.json README.md LICENSE "${STAGE}/"
+          cp -r docs "${STAGE}/docs"
+          cp -r scripts "${STAGE}/scripts"
+          tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
+          (cd dist && sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256")
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $pkg = "mitnicksolve-$version-windows-x64"
+          $stage = "dist/$pkg"
+          Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force "$stage/tools" | Out-Null
+          foreach ($bin in @('msk','mskd','mskctl','msk-tui','msk-web','msk-eval','msk-replay','msk-component-host','msk-component-check')) {
+            Copy-Item "target/release/$bin.exe" "$stage/"
+          }
+          Copy-Item "target/release/envd.exe" "$stage/"
+          Copy-Item -Recurse "tools/wasm" "$stage/tools/wasm"
+          Copy-Item "modes.example.json","README.md","LICENSE" "$stage/"
+          Copy-Item -Recurse "docs" "$stage/docs"
+          Copy-Item -Recurse "scripts" "$stage/scripts"
+          Compress-Archive -Path $stage -DestinationPath "dist/$pkg.zip" -Force
+          $hash = (Get-FileHash "dist/$pkg.zip" -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "dist/$pkg.zip.sha256" -Value "$hash  $pkg.zip" -NoNewline
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "MitnickSolve ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            *.tar.gz *.zip *.sha256 SHA256SUMS

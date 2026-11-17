@@ -11,6 +11,7 @@ use msk_ipc::{Client, methods};
 use serde_json::json;
 
 #[derive(Debug, Parser)]
+#[command(name = "mskctl", version)]
 struct Cli {
     /// Kernel state directory containing the socket and token.
     #[arg(long, default_value = ".msk")]
