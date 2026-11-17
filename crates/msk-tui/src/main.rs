@@ -1184,7 +1184,11 @@ impl DaemonApp {
     }
 
     fn reload_tasks(&mut self) -> Result<()> {
-        let result = self.client.request(methods::TASK_LIST, json!({}))?;
+        let result = self.client.request_with_timeout(
+            methods::TASK_LIST,
+            json!({}),
+            Duration::from_secs(1),
+        )?;
         self.tasks = result
             .get("tasks")
             .and_then(Value::as_array)
@@ -1203,7 +1207,11 @@ impl DaemonApp {
     }
 
     fn reload_approvals(&mut self) -> Result<()> {
-        let result = self.client.request(methods::APPROVAL_LIST, json!({}))?;
+        let result = self.client.request_with_timeout(
+            methods::APPROVAL_LIST,
+            json!({}),
+            Duration::from_secs(1),
+        )?;
         self.approvals = result
             .get("approvals")
             .and_then(Value::as_array)
@@ -1227,7 +1235,11 @@ impl DaemonApp {
     }
 
     fn load_findings(&mut self) -> Result<()> {
-        let result = self.client.request(methods::BLACKBOARD_LIST, json!({}))?;
+        let result = self.client.request_with_timeout(
+            methods::BLACKBOARD_LIST,
+            json!({}),
+            Duration::from_secs(5),
+        )?;
         let mut findings: Vec<Value> = result
             .get("entries")
             .and_then(Value::as_array)
@@ -2075,13 +2087,11 @@ impl DaemonApp {
     ) {
         if requires_key(&self.provider) {
             if !self.daemon_llm_key {
-                self.status =
-                    "provider needs MSK_LLM_API_KEY in mskd; export it, restart mskd, or press p"
-                        .into();
+                self.status = "missing MSK_LLM_API_KEY · Ctrl+P → Provider".into();
                 return;
             }
             if self.model.trim().is_empty() && self.daemon_llm_model.is_none() {
-                self.status = "provider needs a model; press p to choose one".into();
+                self.status = "provider needs a model; use Ctrl+P → Model".into();
                 self.open_setup();
                 return;
             }
@@ -2259,6 +2269,7 @@ impl DaemonApp {
                 self.new_task = true;
             }
         }
+        self.input_cursor = self.input_cursor.min(self.input.len());
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         self.input.insert_str(self.input_cursor, &normalized);
         self.input_cursor += normalized.len();
@@ -2267,6 +2278,7 @@ impl DaemonApp {
     }
 
     fn compose_key(&mut self, key: KeyEvent) -> bool {
+        self.input_cursor = self.input_cursor.min(self.input.len());
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => {
@@ -2539,19 +2551,23 @@ impl DaemonApp {
             return self.setup_key(key);
         }
         if self.terminal_focus {
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
+            if self.terminal.is_none() {
                 self.terminal_focus = false;
-                self.status = "terminal detached".into();
-                return false;
-            }
-            if let Some(bytes) = terminal_key_bytes(key) {
-                if let Some(data) = self.terminal_data.as_ref() {
-                    if let Err(err) = data.send_data(&bytes) {
-                        self.status = format!("terminal write failed: {err}");
+            } else {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
+                    self.terminal_focus = false;
+                    self.status = "terminal detached".into();
+                    return false;
+                }
+                if let Some(bytes) = terminal_key_bytes(key) {
+                    if let Some(data) = self.terminal_data.as_ref() {
+                        if let Err(err) = data.send_data(&bytes) {
+                            self.status = format!("terminal write failed: {err}");
+                        }
                     }
                 }
+                return false;
             }
-            return false;
         }
 
         if self.palette.is_some() {
@@ -2587,6 +2603,11 @@ impl DaemonApp {
             if matches!(key.code, KeyCode::Esc | KeyCode::F(1)) {
                 self.show_help = false;
             }
+            return false;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+            self.open_palette();
             return false;
         }
 
@@ -2756,7 +2777,7 @@ impl DaemonApp {
         let area = frame.area();
         frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
 
-        if self.terminal_focus {
+        if self.terminal_focus && self.terminal.is_some() {
             self.draw_terminal(frame, area);
             return;
         }
@@ -3155,10 +3176,11 @@ impl DaemonApp {
                 frame.set_cursor_position((input_area.x, input_area.y));
             }
         } else {
-            let before = &self.input[..self.input_cursor];
+            let cursor = self.input_cursor.min(self.input.len());
+            let before = &self.input[..cursor];
             let row = before.matches('\n').count();
             let line_start = before.rfind('\n').map(|index| index + 1).unwrap_or(0);
-            let cursor_cols = UnicodeWidthStr::width(&self.input[line_start..self.input_cursor]);
+            let cursor_cols = UnicodeWidthStr::width(&self.input[line_start..cursor]);
             let lines: Vec<&str> = self.input.split('\n').collect();
             let start_line = row.saturating_sub(input_rows.saturating_sub(1) as usize);
             let display = lines
@@ -4708,6 +4730,37 @@ mod tests {
         );
         assert_eq!(mode_color("plan"), ACCENT);
         assert_eq!(mode_color("exploit"), RED);
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn daemon_input_recovers_from_stale_state() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app = DaemonApp::connect(PathBuf::from(root), 100, None).unwrap();
+        app.setup = None;
+
+        app.composing = true;
+        app.input.clear();
+        app.input_cursor = 24;
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(app.palette.is_some(), "Ctrl+P must work while composing");
+        app.palette = None;
+
+        app.composing = true;
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.input, "x");
+        assert_eq!(app.input_cursor, 1);
+
+        app.composing = false;
+        app.terminal_focus = true;
+        app.terminal = None;
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame))
+            .expect("a stale terminal focus must not freeze the UI");
     }
 
     #[test]

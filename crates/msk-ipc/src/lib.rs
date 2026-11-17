@@ -358,6 +358,15 @@ impl Client {
         method: &str,
         params: serde_json::Value,
     ) -> io::Result<serde_json::Value> {
+        self.request_with_timeout(method, params, Duration::from_secs(30))
+    }
+
+    pub fn request_with_timeout(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> io::Result<serde_json::Value> {
         let id = self.next_id;
         self.next_id += 1;
         let (sender, receiver) = mpsc::channel();
@@ -376,7 +385,7 @@ impl Client {
             write_json_line(&mut *writer, &value)?;
         }
         let response = receiver
-            .recv_timeout(Duration::from_secs(30))
+            .recv_timeout(timeout)
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "IPC response timeout"))?;
         if let Some(error) = response.get("error") {
             return Err(io::Error::other(error.to_string()));
