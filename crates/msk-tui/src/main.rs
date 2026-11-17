@@ -5194,14 +5194,17 @@ fn run_daemon(
                     dirty = true;
                     app.handle_paste(&text);
                 }
-                CrosstermEvent::Mouse(mouse) => {
-                    dirty = true;
-                    match mouse.kind {
-                        MouseEventKind::ScrollUp => app.scroll_up(3),
-                        MouseEventKind::ScrollDown => app.scroll_down(3),
-                        _ => {}
+                CrosstermEvent::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        app.scroll_up(3);
+                        dirty = true;
                     }
-                }
+                    MouseEventKind::ScrollDown => {
+                        app.scroll_down(3);
+                        dirty = true;
+                    }
+                    _ => {}
+                },
                 CrosstermEvent::Resize(_, _) => dirty = true,
                 _ => {}
             }
@@ -5264,6 +5267,10 @@ fn main() -> Result<()> {
         EnableBracketedPaste,
         EnableMouseCapture
     )?;
+    // crossterm enables any-motion tracking (?1003h). We only need wheel and
+    // button events; motion events would wake the loop on every mouse move.
+    write!(out, "\x1b[?1003l")?;
+    out.flush()?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
