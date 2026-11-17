@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Stdout, stdout};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Stdout, Write, stdout};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -4053,12 +4053,17 @@ fn snapshot_daemon(
     let mut terminal = Terminal::new(backend)?;
     terminal.draw(|frame| app.draw(frame))?;
     let buffer = terminal.backend().buffer();
+    let mut out = std::io::stdout().lock();
     for y in 0..buffer.area.height {
         let mut line = String::new();
         for x in 0..buffer.area.width {
             line.push_str(buffer[(x, y)].symbol());
         }
-        println!("{}", line.trim_end());
+        // A downstream `grep -q`/`head` may close the pipe early; that is not a
+        // reason to panic a release binary.
+        if writeln!(out, "{}", line.trim_end()).is_err() {
+            break;
+        }
     }
     Ok(())
 }
