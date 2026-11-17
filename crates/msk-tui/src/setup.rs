@@ -172,6 +172,14 @@ impl DaemonApp {
                 }
                 SetupStep::BaseUrl => {
                     if requires_key(setup.selected_provider()) {
+                        if setup.edit_profile.is_none()
+                            && setup.api_key.trim().is_empty()
+                            && is_local_endpoint(&setup.base_url)
+                        {
+                            // Local OpenAI-compatible servers ignore the header but
+                            // the client still refuses to start without a value.
+                            setup.api_key = "local".into();
+                        }
                         setup.input_cursor = setup.api_key.len();
                         setup.step = SetupStep::ApiKey;
                     } else {
@@ -551,7 +559,9 @@ impl DaemonApp {
                 input_line = Some(lines.len().saturating_sub(1));
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    if setup.api_key.is_empty() {
+                    if is_local_endpoint(&setup.base_url) {
+                        "Local endpoint: the placeholder key is enough unless your server checks it."
+                    } else if setup.api_key.is_empty() {
                         if self.daemon_llm_key {
                             "Empty keeps using mskd's MSK_LLM_API_KEY."
                         } else {
@@ -666,6 +676,13 @@ fn is_text_step(step: SetupStep) -> bool {
     )
 }
 
+fn is_local_endpoint(base_url: &str) -> bool {
+    let base = base_url.trim().to_ascii_lowercase();
+    base.starts_with("http://127.0.0.1")
+        || base.starts_with("http://localhost")
+        || base.starts_with("http://[::1]")
+}
+
 impl SetupState {
     fn text_len(&self) -> Option<usize> {
         match self.step {
@@ -726,5 +743,14 @@ mod tests {
         assert_eq!(clamp_cursor(24, 0), 0);
         assert_eq!(clamp_cursor(4, 0), 0);
         assert_eq!(clamp_cursor(2, 7), 2);
+    }
+
+    #[test]
+    fn local_model_endpoints_are_detected() {
+        assert!(is_local_endpoint("http://127.0.0.1:11434/v1"));
+        assert!(is_local_endpoint("http://localhost:1234/v1"));
+        assert!(is_local_endpoint("http://[::1]:8000/v1"));
+        assert!(!is_local_endpoint("https://api.deepseek.com/v1"));
+        assert!(!is_local_endpoint(""));
     }
 }

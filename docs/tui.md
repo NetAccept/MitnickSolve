@@ -105,8 +105,10 @@ With no configured provider, a full-screen setup card opens first. Choose
 5. **Endpoint** — optional OpenAI-compatible base URL. Empty uses
    `MSK_LLM_BASE_URL` or the provider default.
 6. **API key** — masked while you type or paste. Empty keeps using the daemon's
-   `MSK_LLM_API_KEY`. The wizard saves the result as a provider profile, so the
-   key does not need to be exported again.
+   `MSK_LLM_API_KEY`. Local presets (Ollama, LM Studio) insert a `local`
+   placeholder because the provider client requires a non-empty value; replace
+   it if your server checks keys. The wizard saves the result as a provider
+   profile, so the key does not need to be exported again.
 
 `scripted-demo` and `component` skip the service, model, effort, endpoint and
 key steps and save immediately.
