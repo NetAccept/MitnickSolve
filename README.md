@@ -164,12 +164,12 @@ target/debug/msk
 `msk` with no arguments opens the interactive terminal app and starts a local
 `mskd` if needed. The embedded envd uses the **current directory** as its
 workspace, so the agent sees `./challenge` immediately. Use `--workspace <dir>`
-on `msk`/`mskd` to point it elsewhere. With no API key it uses the offline
-`scripted-demo` provider; type a message and press Enter to create a task, or
-`/demo` for the canned tool demo. Press `Ctrl+P` (or `/setup`) to choose
-provider, model, reasoning effort and API key; the result is saved as a provider
-profile. `Ctrl+P` → **Providers** (`/providers`) switches between saved
-providers or edits their keys, and `/provider openai` is the quick switch.
+on `msk`/`mskd` to point it elsewhere. On first launch a setup card opens:
+choose `scripted-demo` to work offline with no key, or pick a provider, service
+endpoint, model, effort and paste an API key. The result is saved as a provider
+profile and reused. `/demo` runs the canned tool demo. `Ctrl+P` → **Providers**
+(`/providers`) switches between saved providers or edits their keys, and
+`/provider openai` is the quick switch.
 See [`docs/tui.md`](docs/tui.md) for keys, slash commands, approvals, history,
 diagnostics, and troubleshooting.
 
@@ -237,13 +237,13 @@ limits, approval behavior, and end-to-end workflows.
 
 GitHub Releases contain ready-to-run archives for `windows-x64` and
 `linux-x64`. Each archive includes the kernel, daemon, TUI, web/eval tools,
-`envd`, `tools/wasm`, docs, scripts, `modes.example.json`, and a `SHA256SUMS`
-file.
+`envd`, `tools/wasm`, `evals`, docs, scripts and `modes.example.json`. The release also
+publishes a `.sha256` file for each archive and a combined `SHA256SUMS`.
 
 ```powershell
 # Windows
-Expand-Archive mitnicksolve-<version>-windows-x64.zip -DestinationPath mitnicksolve
-cd mitnicksolve
+Expand-Archive mitnicksolve-<version>-windows-x64.zip -DestinationPath .
+cd mitnicksolve-<version>-windows-x64
 .\msk.exe
 ```
 
@@ -256,10 +256,16 @@ cd mitnicksolve-<version>-linux-x64
 
 Everything is resolved relative to the executable and the extracted directory;
 run from the extracted folder so the default `tools/wasm` manifests are found.
-`msk --version` reports the release version. Verify downloads with:
+`msk --version` reports the release version. Verify downloads against the
+published `.sha256` files:
 
 ```sh
 sha256sum -c mitnicksolve-<version>-linux-x64.tar.gz.sha256
+```
+
+```powershell
+Get-FileHash .\mitnicksolve-<version>-windows-x64.zip -Algorithm SHA256
+Get-Content .\mitnicksolve-<version>-windows-x64.zip.sha256
 ```
 
 The release workflow is [`.github/workflows/release.yml`](.github/workflows/release.yml)

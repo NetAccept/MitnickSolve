@@ -58,6 +58,7 @@ jobs:
           done
           cp target/release/envd "${STAGE}/"
           cp -r tools/wasm "${STAGE}/tools/wasm"
+          cp -r evals "${STAGE}/evals"
           cp modes.example.json README.md LICENSE "${STAGE}/"
           cp -r docs "${STAGE}/docs"
           cp -r scripts "${STAGE}/scripts"
@@ -79,6 +80,7 @@ jobs:
           }
           Copy-Item "target/release/envd.exe" "$stage/"
           Copy-Item -Recurse "tools/wasm" "$stage/tools/wasm"
+          Copy-Item -Recurse "evals" "$stage/evals"
           Copy-Item "modes.example.json","README.md","LICENSE" "$stage/"
           Copy-Item -Recurse "docs" "$stage/docs"
           Copy-Item -Recurse "scripts" "$stage/scripts"
@@ -113,7 +115,13 @@ jobs:
           set -euo pipefail
           cd dist
           sha256sum *.tar.gz *.zip > SHA256SUMS
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "MitnickSolve ${GITHUB_REF_NAME}" \
-            --generate-notes \
-            *.tar.gz *.zip *.sha256 SHA256SUMS
+          assets=(*.tar.gz *.zip *.sha256 SHA256SUMS)
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            # A retried or resumed tag push must replace assets, not fail.
+            gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "MitnickSolve ${GITHUB_REF_NAME}" \
+              --generate-notes \
+              "${assets[@]}"
+          fi
