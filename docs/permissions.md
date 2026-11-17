@@ -30,9 +30,10 @@ boundaries.
 
 - `Ctrl+P` → **Permission mode**, or `/permissions`, opens the picker.
 - `/permissions auto|manual|bypass` sets it directly.
-- The footer shows `权限 自动` / `手动` / `放行`.
-- Changing it while a session is open starts a fresh session on the next
-  message, because the approval posture is fixed when the agent process starts.
+- The footer shows the current session's posture: `权限 自动` / `手动` / `放行`.
+- Changing it while a session is open saves the posture for the next session;
+  the open conversation keeps its own posture. Press `Ctrl+N` (or `/new`) to
+  start one, because the posture is fixed when the agent process starts.
 
 The agent mode is shown in the composer's leading slot; permission is shown in
 the footer, so the two controls do not compete for the same space.

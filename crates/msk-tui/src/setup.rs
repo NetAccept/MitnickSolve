@@ -291,6 +291,9 @@ impl DaemonApp {
                 if requires_key(&self.provider) && !self.has_llm_key() {
                     status.push_str(" · API key missing");
                 }
+                if self.selected_task_id().is_some() && !self.new_task {
+                    status.push_str(" · next session · ctrl+n starts it");
+                }
                 self.status = status;
             }
             Err(err) => self.status = format!("save setup failed: {err}"),

@@ -1265,14 +1265,14 @@ dependencies = [
 
 [[package]]
 name = "msk-abi"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "msk-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1281,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "msk-data"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "msk-core",
  "serde_json",
@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "msk-eval"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1303,7 +1303,7 @@ dependencies = [
 
 [[package]]
 name = "msk-events"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1314,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "msk-ipc"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "interprocess",
  "serde",
@@ -1323,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "msk-kernel"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1352,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "msk-llm"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "msk-core",
  "serde",
@@ -1363,7 +1363,7 @@ dependencies = [
 
 [[package]]
 name = "msk-loader"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -1379,7 +1379,7 @@ dependencies = [
 
 [[package]]
 name = "msk-mcp"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "rcgen",
  "rustls",
@@ -1391,11 +1391,11 @@ dependencies = [
 
 [[package]]
 name = "msk-secret"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "msk-store"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "msk-events",
  "rusqlite",
@@ -1405,14 +1405,14 @@ dependencies = [
 
 [[package]]
 name = "msk-test-component"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "msk-abi",
 ]
 
 [[package]]
 name = "msk-testkit"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "msk-core",
  "serde_json",
@@ -1420,7 +1420,7 @@ dependencies = [
 
 [[package]]
 name = "msk-tui"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1436,7 +1436,7 @@ dependencies = [
 
 [[package]]
 name = "msk-wasm"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "msk-core",
  "serde",
@@ -1448,7 +1448,7 @@ dependencies = [
 
 [[package]]
 name = "msk-web"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "clap",

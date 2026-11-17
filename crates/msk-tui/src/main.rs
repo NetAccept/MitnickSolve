@@ -55,7 +55,7 @@ struct CommandEntry {
 const COMMANDS: &[CommandEntry] = &[
     CommandEntry {
         label: "New session",
-        hint: "start a fresh conversation",
+        hint: "start a fresh conversation (ctrl+n)",
         command: "/new",
     },
     CommandEntry {
@@ -630,6 +630,39 @@ fn clean_key_paste(text: &str) -> String {
         .collect()
 }
 
+/// Turns an agent/provider failure into one readable transcript block. The
+/// provider JSON is noisy; keep its message and code, not the whole body.
+fn turn_error_text(status: &str, message: &str) -> String {
+    let message = message.trim();
+    let mut detail = message.to_string();
+    if let Some(start) = message.find('{')
+        && let Ok(value) = serde_json::from_str::<Value>(&message[start..])
+        && let Some(error) = value.get("error")
+    {
+        let code = error.get("code").and_then(Value::as_str).unwrap_or("");
+        let text = error.get("message").and_then(Value::as_str).unwrap_or("");
+        if !text.is_empty() {
+            detail = if code.is_empty() {
+                text.to_string()
+            } else {
+                format!("{code}: {text}")
+            };
+        }
+    }
+    if detail.is_empty() {
+        detail = status.to_string();
+    }
+    let mut text = format!("✗ {}", truncate(&detail, 400));
+    if message.contains("LLM call failed")
+        || message.contains("model_not_found")
+        || message.contains("HTTP 4")
+        || message.contains("HTTP 5")
+    {
+        text.push_str("\ncheck the model id and endpoint · ctrl+p providers");
+    }
+    text
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatRole {
     User,
@@ -1197,6 +1230,7 @@ struct DaemonApp {
     history_index: Option<usize>,
     show_events: bool,
     show_sessions: bool,
+    session_selection: usize,
     palette: Option<PaletteState>,
     spin: Cell<usize>,
     findings: Vec<Value>,
@@ -1330,6 +1364,7 @@ impl DaemonApp {
             history_index: None,
             show_events: false,
             show_sessions: false,
+            session_selection: 0,
             palette: None,
             spin: Cell::new(0),
             findings: Vec::new(),
@@ -1632,18 +1667,11 @@ impl DaemonApp {
                             .get("message")
                             .and_then(Value::as_str)
                             .unwrap_or_default();
-                        let text = if message.is_empty() {
-                            format!("[{status}]")
+                        self.status = if message.is_empty() {
+                            format!("last turn {status}")
                         } else {
-                            format!("[{status}] {message}")
+                            format!("last turn {status}: {}", truncate(message, 160))
                         };
-                        self.chat.push(ChatLine {
-                            task_id: task_id.clone(),
-                            role: ChatRole::System,
-                            text,
-                            streaming: false,
-                        });
-                        self.trim_chat();
                     }
                     if self.selected_task_id().as_deref() == Some(task_id.as_str()) {
                         self.load_transcript(&task_id);
@@ -1773,12 +1801,18 @@ impl DaemonApp {
             }
             "turn.end" => {
                 let status = data.get("status").and_then(Value::as_str).unwrap_or("done");
-                self.chat.push(ChatLine {
-                    task_id: task_id.to_string(),
-                    role: ChatRole::System,
-                    text: format!("turn end: {status}"),
-                    streaming: false,
-                });
+                if status != "awaiting_input" {
+                    let message = data
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    self.chat.push(ChatLine {
+                        task_id: task_id.to_string(),
+                        role: ChatRole::System,
+                        text: turn_error_text(status, message),
+                        streaming: false,
+                    });
+                }
             }
             "approval.request" => {
                 let tool = data.get("tool").and_then(Value::as_str).unwrap_or("tool");
@@ -1794,15 +1828,17 @@ impl DaemonApp {
     }
 
     fn load_transcript(&mut self, task_id: &str) {
-        let result = match self
-            .client
-            .request(methods::TASK_HISTORY, json!({"task_id": task_id}))
-        {
+        let result = match self.client.request_with_timeout(
+            methods::TASK_HISTORY,
+            json!({"task_id": task_id}),
+            Duration::from_secs(5),
+        ) {
             Ok(result) => result,
-            Err(_) => match self
-                .client
-                .request(methods::TASK_RESULT, json!({"task_id": task_id}))
-            {
+            Err(_) => match self.client.request_with_timeout(
+                methods::TASK_RESULT,
+                json!({"task_id": task_id}),
+                Duration::from_secs(5),
+            ) {
                 Ok(result) => result,
                 Err(err) => {
                     self.status = format!("load transcript failed: {err}");
@@ -1858,20 +1894,54 @@ impl DaemonApp {
         self.scroll_from_bottom = 0;
     }
 
-    fn select_task(&mut self, delta: isize) {
-        if self.tasks.is_empty() {
-            return;
-        }
-        let len = self.tasks.len() as isize;
-        self.select_task_to((self.selected_task as isize + delta).clamp(0, len - 1) as usize);
+    fn open_sessions(&mut self) {
+        self.composing = false;
+        self.show_sessions = true;
+        self.session_selection = if self.new_task || self.tasks.is_empty() {
+            0
+        } else {
+            (self.selected_task + 1).min(self.tasks.len())
+        };
+        self.status = "sessions · ↑/↓ select · Enter open · n new · Esc close".into();
     }
 
-    fn select_task_to(&mut self, index: usize) {
+    fn toggle_sessions(&mut self) {
+        if self.show_sessions {
+            self.show_sessions = false;
+            self.status.clear();
+        } else {
+            self.open_sessions();
+        }
+    }
+
+    fn move_session_selection(&mut self, delta: isize) {
+        let rows = self.tasks.len() + 1;
+        let current = self.session_selection.min(rows - 1) as isize;
+        self.session_selection = (current + delta).clamp(0, rows as isize - 1) as usize;
+    }
+
+    fn start_new_session(&mut self) {
+        self.show_sessions = false;
+        self.new_task = true;
+        self.composing = true;
+        self.status = if self.mode.is_empty() {
+            "new session · describe the challenge".into()
+        } else {
+            format!(
+                "new session · mode {} · permission {} · send a message",
+                self.mode, self.permission
+            )
+        };
+    }
+
+    fn open_session_at(&mut self, index: usize) {
         if self.tasks.is_empty() {
             return;
         }
         self.selected_task = index.min(self.tasks.len() - 1);
         self.new_task = false;
+        self.show_sessions = false;
+        self.status.clear();
         if let Some(task_id) = self.selected_task_id() {
             self.load_transcript(&task_id);
         }
@@ -1907,6 +1977,15 @@ impl DaemonApp {
             .get(self.selected_task)
             .and_then(|task| task.get("task_id"))
             .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    fn selected_last_error(&self) -> Option<String> {
+        self.tasks
+            .get(self.selected_task)
+            .and_then(|task| task.get("last_error"))
+            .and_then(Value::as_str)
+            .filter(|error| !error.trim().is_empty())
             .map(str::to_string)
     }
 
@@ -1954,6 +2033,44 @@ impl DaemonApp {
         }
     }
 
+    /// Settings changes are for the next session. They must never silently
+    /// replace the session the user is reading.
+    fn announce_provider_saved(&mut self) {
+        if self.selected_task_id().is_some() && !self.new_task {
+            self.status = format!(
+                "provider for next session: {} · current stays {} · ctrl+n starts it",
+                self.provider,
+                self.display_provider()
+            );
+        } else {
+            self.status = format!("next session provider: {}", self.provider);
+        }
+    }
+
+    fn announce_mode_saved(&mut self) {
+        if self.new_task || self.selected_task_id().is_none() {
+            self.status = format!("next session mode: {}", self.mode);
+        } else {
+            self.status = format!(
+                "mode for next session: {} · current stays {} · ctrl+n starts it",
+                self.mode,
+                self.selected_mode()
+            );
+        }
+    }
+
+    fn announce_permission_saved(&mut self) {
+        if self.new_task || self.selected_task_id().is_none() {
+            self.status = format!("next session permission: {}", self.permission);
+        } else {
+            self.status = format!(
+                "permission for next session: {} · current stays {} · ctrl+n starts it",
+                self.permission,
+                self.display_permission()
+            );
+        }
+    }
+
     fn display_permission(&self) -> String {
         if self.new_task || self.selected_task_id().is_none() {
             self.permission.clone()
@@ -1964,6 +2081,36 @@ impl DaemonApp {
                 .and_then(Value::as_str)
                 .unwrap_or(&self.permission)
                 .to_string()
+        }
+    }
+
+    fn display_task_field(&self, field: &str, fallback: &str) -> String {
+        if self.new_task || self.selected_task_id().is_none() {
+            fallback.to_string()
+        } else {
+            self.tasks
+                .get(self.selected_task)
+                .and_then(|task| task.get(field))
+                .and_then(Value::as_str)
+                .unwrap_or(fallback)
+                .to_string()
+        }
+    }
+
+    fn display_provider(&self) -> String {
+        self.display_task_field("provider", &self.provider)
+    }
+
+    fn display_model(&self) -> String {
+        self.display_task_field("model", &self.model)
+    }
+
+    fn display_effort(&self) -> String {
+        let effort = self.display_task_field("effort", &self.effort);
+        if effort.is_empty() {
+            default_effort()
+        } else {
+            effort
         }
     }
 
@@ -2055,14 +2202,7 @@ impl DaemonApp {
             "/setup" => self.open_setup(),
             "/providers" => self.open_providers(),
             "/resume" => self.resume_latest(),
-            "/sessions" => {
-                self.show_sessions = !self.show_sessions;
-                self.status = if self.show_sessions {
-                    "sessions · ↑/↓ select · Enter switch · Esc close".into()
-                } else {
-                    String::new()
-                };
-            }
+            "/sessions" => self.toggle_sessions(),
             "/models" | "/model" if argument.is_empty() => self.open_setup_at(SetupStep::Model),
             "/model" => {
                 self.model = argument.to_string();
@@ -2092,14 +2232,7 @@ impl DaemonApp {
                 if let Some(mode) = self.find_mode(argument) {
                     self.mode = mode;
                     self.save_config();
-                    if self.selected_task_id().is_some() {
-                        self.new_task = true;
-                        self.composing = true;
-                        self.status =
-                            format!("new session mode: {} (send a message to start)", self.mode);
-                    } else {
-                        self.status = format!("next session mode: {}", self.mode);
-                    }
+                    self.announce_mode_saved();
                 } else {
                     self.status = "unknown mode; open /mode to list configured modes".into();
                 }
@@ -2117,16 +2250,7 @@ impl DaemonApp {
                 if let Some((id, _)) = found {
                     self.permission = (*id).to_string();
                     self.save_config();
-                    if self.selected_task_id().is_some() {
-                        self.new_task = true;
-                        self.composing = true;
-                        self.status = format!(
-                            "new session permission: {} (send a message to start)",
-                            self.permission
-                        );
-                    } else {
-                        self.status = format!("next session permission: {}", self.permission);
-                    }
+                    self.announce_permission_saved();
                 } else {
                     self.status = "usage: /permissions auto|manual|bypass".into();
                 }
@@ -2137,9 +2261,7 @@ impl DaemonApp {
             }
             "/new" => {
                 if argument.is_empty() {
-                    self.new_task = true;
-                    self.composing = true;
-                    self.status = "new task: describe the challenge".into();
+                    self.start_new_session();
                 } else {
                     self.start_new_task(argument);
                 }
@@ -2187,7 +2309,7 @@ impl DaemonApp {
                 ) {
                     self.provider = canonical.to_string();
                     self.save_config();
-                    self.status = format!("next task provider: {}", self.provider);
+                    self.announce_provider_saved();
                 } else {
                     self.status =
                         "usage: /provider scripted|scripted-demo|openai|openai-responses|component"
@@ -2615,20 +2737,20 @@ impl DaemonApp {
                 self.show_sessions = false;
                 self.status.clear();
             }
-            KeyCode::Up | KeyCode::Char('k') => self.select_task(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.select_task(1),
-            KeyCode::Home | KeyCode::Char('g') => self.select_task_to(0),
+            KeyCode::Up | KeyCode::Char('k') => self.move_session_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_session_selection(1),
+            KeyCode::Home | KeyCode::Char('g') => self.session_selection = 0,
             KeyCode::End | KeyCode::Char('G') => {
-                let last = self.tasks.len().saturating_sub(1);
-                self.select_task_to(last);
+                self.session_selection = self.tasks.len();
             }
             KeyCode::Enter => {
-                self.show_sessions = false;
-                self.status.clear();
-                if let Some(task_id) = self.selected_task_id() {
-                    self.load_transcript(&task_id);
+                if self.session_selection == 0 {
+                    self.start_new_session();
+                } else {
+                    self.open_session_at(self.session_selection - 1);
                 }
             }
+            KeyCode::Char('n') => self.start_new_session(),
             _ => {}
         }
         false
@@ -2723,10 +2845,11 @@ impl DaemonApp {
         };
         if requires_key(&self.provider) && !self.has_llm_key() {
             self.status = format!("{name} selected · API key missing · e to edit");
-        } else if self.selected_task_id().is_some() {
-            self.new_task = true;
-            self.composing = true;
-            self.status = format!("new session provider: {name} (send a message to start)");
+        } else if self.selected_task_id().is_some() && !self.new_task {
+            self.status = format!(
+                "provider for next session: {name} · current stays {} · ctrl+n starts it",
+                self.display_provider()
+            );
         } else {
             self.status = format!("next session provider: {name}");
         }
@@ -2829,14 +2952,7 @@ impl DaemonApp {
                 self.mode = self.modes[self.mode_selection].id.clone();
                 self.save_config();
                 self.show_modes = false;
-                if self.selected_task_id().is_some() {
-                    self.new_task = true;
-                    self.composing = true;
-                    self.status =
-                        format!("new session mode: {} (send a message to start)", self.mode);
-                } else {
-                    self.status = format!("next session mode: {}", self.mode);
-                }
+                self.announce_mode_saved();
             }
             _ => {}
         }
@@ -2860,16 +2976,7 @@ impl DaemonApp {
                 self.permission = PERMISSIONS[self.permission_selection].0.to_string();
                 self.save_config();
                 self.show_permissions = false;
-                if self.selected_task_id().is_some() {
-                    self.new_task = true;
-                    self.composing = true;
-                    self.status = format!(
-                        "new session permission: {} (send a message to start)",
-                        self.permission
-                    );
-                } else {
-                    self.status = format!("next session permission: {}", self.permission);
-                }
+                self.announce_permission_saved();
             }
             _ => {}
         }
@@ -2944,17 +3051,16 @@ impl DaemonApp {
             self.open_palette();
             return false;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
+            self.start_new_session();
+            return false;
+        }
         if key.code == KeyCode::F(1) {
             self.show_help = !self.show_help;
             return false;
         }
         if key.code == KeyCode::Tab {
-            self.show_sessions = !self.show_sessions;
-            self.status = if self.show_sessions {
-                "sessions · ↑/↓ select · Enter switch · Esc close".into()
-            } else {
-                String::new()
-            };
+            self.toggle_sessions();
             return false;
         }
 
@@ -2989,14 +3095,7 @@ impl DaemonApp {
                     self.status.clear();
                 }
             }
-            KeyCode::Tab => {
-                self.show_sessions = !self.show_sessions;
-                self.status = if self.show_sessions {
-                    "sessions · ↑/↓ select · Enter switch · Esc close".into()
-                } else {
-                    String::new()
-                };
-            }
+            KeyCode::Tab => self.toggle_sessions(),
             KeyCode::F(1) => self.show_help = !self.show_help,
             KeyCode::PageUp | KeyCode::Up => {
                 self.auto_scroll = false;
@@ -3279,23 +3378,26 @@ impl DaemonApp {
             Color::Rgb(49, 49, 56),
         ));
         chips.push(Span::raw(" "));
+        let display_provider = self.display_provider();
+        let display_model = self.display_model();
+        let display_effort = self.display_effort();
         chips.push(chip(
-            format!(" {} ", self.provider),
+            format!(" {} ", display_provider),
             ACCENT,
             Color::Rgb(24, 38, 58),
         ));
-        if !self.model.is_empty() {
+        if !display_model.is_empty() {
             chips.push(Span::raw(" "));
             chips.push(chip(
-                format!(" {} ", self.model),
+                format!(" {} ", display_model),
                 GREEN,
                 Color::Rgb(20, 42, 30),
             ));
         }
-        if self.effort != "default" && !self.effort.is_empty() {
+        if display_effort != "default" {
             chips.push(Span::raw(" "));
             chips.push(chip(
-                format!(" {} ", self.effort),
+                format!(" {} ", display_effort),
                 YELLOW,
                 Color::Rgb(43, 37, 20),
             ));
@@ -3320,12 +3422,14 @@ impl DaemonApp {
             height: 1,
         };
         let state = self.selected_state();
+        let last_error = self.selected_last_error();
         let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         let (state_text, state_color) = match state {
             "running" => (
                 format!("{} running", spinner[(self.spin.get() / 2) % spinner.len()]),
                 ACCENT,
             ),
+            "waiting_input" if last_error.is_some() => ("✗ last turn failed".to_string(), RED),
             "waiting_input" => ("● ready".to_string(), GREEN),
             "failed" => ("✗ failed".to_string(), RED),
             "cancelled" => ("✗ cancelled".to_string(), RED),
@@ -3333,15 +3437,18 @@ impl DaemonApp {
             other => (format!("● {other}"), DIM),
         };
         self.spin.set(self.spin.get().wrapping_add(1));
+        let display_provider = self.display_provider();
+        let display_model = self.display_model();
+        let display_effort = self.display_effort();
         let right_text = format!(
             "{} · {} · effort {}",
-            self.provider,
-            if self.model.is_empty() {
+            display_provider,
+            if display_model.is_empty() {
                 "-"
             } else {
-                &self.model
+                &display_model
             },
-            self.effort
+            display_effort
         );
         let right_width = right_text.chars().count() as u16;
         let left_width = header_area.width.saturating_sub(right_width + 2).max(12);
@@ -3441,10 +3548,12 @@ impl DaemonApp {
                     if line.text.starts_with("turn end:") {
                         continue;
                     }
-                    for part in parts {
+                    let is_error = line.text.starts_with('✗');
+                    for (index, part) in parts.iter().enumerate() {
+                        let color = if is_error && index == 0 { RED } else { FAINT };
                         transcript.push(Line::from(Span::styled(
                             format!("  {part}"),
-                            Style::default().fg(FAINT).add_modifier(Modifier::ITALIC),
+                            Style::default().fg(color).add_modifier(Modifier::ITALIC),
                         )));
                     }
                 }
@@ -3563,26 +3672,29 @@ impl DaemonApp {
                 .bg(PANEL)
                 .add_modifier(Modifier::BOLD),
         )];
+        let display_provider = self.display_provider();
+        let display_model = self.display_model();
+        let display_effort = self.display_effort();
         meta.push(Span::styled(" · ", Style::default().fg(FAINT).bg(PANEL)));
         meta.push(Span::styled(
-            self.provider.clone(),
+            display_provider.clone(),
             Style::default().fg(TEXT).bg(PANEL),
         ));
-        if !self.model.is_empty() {
+        if !display_model.is_empty() {
             meta.push(Span::styled(" · ", Style::default().fg(FAINT).bg(PANEL)));
             meta.push(Span::styled(
-                self.model.clone(),
+                display_model.clone(),
                 Style::default().fg(GREEN).bg(PANEL),
             ));
         }
-        if self.effort != "default" && !self.effort.is_empty() {
+        if display_effort != "default" {
             meta.push(Span::styled(" · ", Style::default().fg(FAINT).bg(PANEL)));
             meta.push(Span::styled(
-                format!("effort {}", self.effort),
+                format!("effort {display_effort}"),
                 Style::default().fg(DIM).bg(PANEL),
             ));
         }
-        if requires_key(&self.provider) && !self.has_llm_key() {
+        if requires_key(&display_provider) && !self.has_llm_key() {
             meta.push(Span::styled("  ·  ", Style::default().fg(FAINT).bg(PANEL)));
             meta.push(Span::styled(
                 "missing API key · ctrl+p providers",
@@ -3601,13 +3713,18 @@ impl DaemonApp {
     }
 
     fn draw_hints(&self, frame: &mut ratatui::Frame, input_area: Rect, hints_area: Rect) {
-        let hints_width = 40.min(hints_area.width).max(1);
+        let hints_width = 54.min(hints_area.width).max(1);
         let hints = Line::from(vec![
             Span::styled(
                 "tab",
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(" sessions   ", Style::default().fg(DIM)),
+            Span::styled(
+                "ctrl+n",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" new   ", Style::default().fg(DIM)),
             Span::styled(
                 "ctrl+p",
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -3716,6 +3833,7 @@ impl DaemonApp {
             help_line("Shift+Enter", "insert a newline"),
             help_line("Esc", "interrupt a running turn or close the editor"),
             help_line("Tab", "open the session switcher"),
+            help_line("Ctrl+N", "start a new session"),
             help_line("Ctrl+P", "command palette"),
             help_line("F1", "toggle this help"),
             help_line("↑ / ↓", "scroll the transcript"),
@@ -3838,45 +3956,63 @@ impl DaemonApp {
         let block = panel_block("sessions", ACCENT);
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        if self.tasks.is_empty() {
-            frame.render_widget(
-                Paragraph::new(Span::styled(
-                    "  No sessions yet. Esc to start one.",
-                    Style::default().fg(DIM),
-                )),
-                inner,
-            );
+        if inner.height < 3 {
             return;
         }
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "Open a saved conversation or start a fresh one.",
+                Style::default().fg(DIM),
+            )),
+            Rect {
+                x: inner.x + 1,
+                y: inner.y,
+                width: inner.width.saturating_sub(2),
+                height: 1,
+            },
+        );
         let list_area = Rect {
-            x: inner.x,
-            y: inner.y,
-            width: inner.width,
-            height: inner.height.saturating_sub(1),
+            x: inner.x + 1,
+            y: inner.y + 1,
+            width: inner.width.saturating_sub(2),
+            height: inner.height.saturating_sub(2),
         };
-        let items: Vec<ListItem> = self
-            .tasks
-            .iter()
-            .map(|task| {
-                let state = task.get("state").and_then(Value::as_str).unwrap_or("?");
-                let state_color = state_color(state);
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{:<12}", state_label(state)),
-                        Style::default().fg(state_color),
-                    ),
-                    Span::styled(
-                        truncate(
-                            task.get("goal").and_then(Value::as_str).unwrap_or(""),
-                            list_area.width.saturating_sub(16) as usize,
-                        ),
-                        Style::default().fg(TEXT),
-                    ),
-                ]))
-            })
-            .collect();
+        let mut items: Vec<ListItem> = Vec::with_capacity(self.tasks.len() + 1);
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(
+                if self.new_task { "● " } else { "＋ " },
+                Style::default().fg(if self.new_task { GREEN } else { ACCENT }),
+            ),
+            Span::styled(
+                format!("{:<14}", "New session"),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("start a fresh conversation", Style::default().fg(DIM)),
+        ])));
+        for (index, task) in self.tasks.iter().enumerate() {
+            let state = task.get("state").and_then(Value::as_str).unwrap_or("?");
+            let state_color = state_color(state);
+            let current = !self.new_task && index == self.selected_task;
+            let title = task.get("goal").and_then(Value::as_str).unwrap_or("");
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(
+                    if current { "● " } else { "  " },
+                    Style::default().fg(if current { GREEN } else { FAINT }),
+                ),
+                Span::styled(
+                    format!("{:<14}", state_label(state)),
+                    Style::default().fg(state_color),
+                ),
+                Span::styled(
+                    truncate(title, list_area.width.saturating_sub(19) as usize),
+                    Style::default().fg(TEXT),
+                ),
+            ])));
+        }
         let mut state = ListState::default();
-        state.select(Some(self.selected_task.min(items.len() - 1)));
+        state.select(Some(
+            self.session_selection.min(items.len().saturating_sub(1)),
+        ));
         let list = List::new(items)
             .highlight_style(
                 Style::default()
@@ -3888,7 +4024,7 @@ impl DaemonApp {
         frame.render_stateful_widget(list, list_area, &mut state);
         frame.render_widget(
             Paragraph::new(Span::styled(
-                "↑/↓ select · Enter switch · Esc close",
+                "↑/↓ select · Enter open · n new · Esc close",
                 Style::default().fg(FAINT),
             ))
             .alignment(Alignment::Right),
@@ -4550,7 +4686,7 @@ fn snapshot_daemon(
         app.open_palette();
     }
     if sessions {
-        app.show_sessions = true;
+        app.open_sessions();
     }
     if findings {
         let _ = app.load_findings();
@@ -5238,6 +5374,15 @@ mod tests {
     }
 
     #[test]
+    fn turn_errors_are_readable() {
+        let message = r#"LLM call failed: http: HTTP 503: {"error":{"code":"model_not_found","message":"no channel for deepseek-v4.1-flash","type":"new_api_error"}}"#;
+        let text = turn_error_text("error", message);
+        assert!(text.starts_with("✗ model_not_found: no channel"));
+        assert!(text.contains("ctrl+p providers"));
+        assert_eq!(turn_error_text("error", ""), "✗ error");
+    }
+
+    #[test]
     fn provider_profile_helpers() {
         assert_eq!(profile_name("openai", ""), "openai");
         assert_eq!(profile_name("openai", " gpt-5 "), "openai · gpt-5");
@@ -5633,6 +5778,106 @@ mod tests {
         assert!(content.contains("setup"));
         assert!(content.contains("scripted-demo"));
         assert!(content.contains("MSK_LLM_API_KEY"));
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn failed_turn_is_visible_in_the_transcript() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app = DaemonApp::connect(PathBuf::from(root), 100, Some("openai".into())).unwrap();
+        app.setup = None;
+        let message = r#"LLM call failed: http: HTTP 503: {"error":{"code":"model_not_found","message":"no channel for deepseek-v4.1-flash","type":"new_api_error"}}"#;
+        app.tasks = vec![json!({
+            "task_id": "task-a", "goal": "failed turn", "state": "waiting_input",
+            "provider": "openai", "model": "gpt-5", "effort": "default",
+            "permission": "auto", "mode": "auto", "last_error": message
+        })];
+        app.selected_task = 0;
+        app.new_task = false;
+        app.chat = vec![ChatLine {
+            task_id: "task-a".into(),
+            role: ChatRole::System,
+            text: turn_error_text("error", message),
+            streaming: false,
+        }];
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(content.contains("last turn failed"));
+        assert!(content.contains("model_not_found"));
+        assert!(content.contains("ctrl+p providers"));
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn session_switcher_moves_before_opening() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app =
+            DaemonApp::connect(PathBuf::from(root), 100, Some("scripted".into())).unwrap();
+        app.setup = None;
+        app.tasks = vec![
+            json!({
+                "task_id": "task-a", "goal": "first", "state": "waiting_input",
+                "provider": "scripted", "model": null, "effort": "default",
+                "permission": "auto", "mode": "auto"
+            }),
+            json!({
+                "task_id": "task-b", "goal": "second", "state": "waiting_input",
+                "provider": "scripted", "model": null, "effort": "default",
+                "permission": "auto", "mode": "auto"
+            }),
+        ];
+        app.selected_task = 1;
+        app.new_task = false;
+        app.open_sessions();
+        assert_eq!(app.session_selection, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.session_selection, 1);
+        assert_eq!(app.selected_task, 1, "moving must not switch immediately");
+        assert!(app.show_sessions, "the switcher stays open until Enter");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.selected_task, 0);
+        assert!(!app.show_sessions);
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn mode_change_does_not_replace_the_open_session() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app =
+            DaemonApp::connect(PathBuf::from(root), 100, Some("scripted".into())).unwrap();
+        app.setup = None;
+        app.tasks = vec![json!({
+            "task_id": "task-a", "goal": "first", "state": "waiting_input",
+            "provider": "scripted", "model": null, "effort": "default",
+            "permission": "auto", "mode": "auto"
+        })];
+        app.selected_task = 0;
+        app.new_task = false;
+        let replacement = app
+            .modes
+            .iter()
+            .position(|mode| mode.id != app.mode)
+            .expect("another mode");
+        app.mode_selection = replacement;
+        app.show_modes = true;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.new_task, "changing a mode must not open a session");
+        assert_eq!(app.selected_task, 0);
+        assert!(app.status.contains("next session"));
     }
 
     #[test]

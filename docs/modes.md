@@ -142,10 +142,11 @@ TUI:
 
 - `Ctrl+P` → **Agent mode** (or `/mode`) opens the mode picker.
 - `/mode <id|label>` sets the mode for the next session and saves it.
-- Selecting a different mode while a session is open starts a fresh session on
-  the next message; the old session remains in the session switcher.
-- The composer's leading slot shows the active/pending mode label; there is no
-  separate mode chip or header suffix.
+- Selecting a different mode while a session is open saves it for the next
+  session; the open conversation keeps its own mode and stays in the switcher.
+  Press `Ctrl+N` (or `Tab` → New session) to start one.
+- The composer's leading slot shows the open session's mode, or the pending mode
+  on the home/new-session screen; there is no separate mode chip or header suffix.
 - A scripted offline demo or a resumed checkpoint with `auto` defaults to the
   active `exploit` mode; pass an explicit mode to override it.
 

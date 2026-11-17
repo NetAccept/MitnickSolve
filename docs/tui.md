@@ -49,9 +49,9 @@ This is an actual `--snapshot` frame (120×40):
                 │                                                                                      │
                 │  Build · scripted-demo                                                               │
                 ╰──────────────────────────────────────────────────────────────────────────────────────╯
-                                                               tab sessions   ctrl+p commands   F1 help
+                                                   tab sessions   ctrl+n new   ctrl+p commands   F1 help
 
-  ~                                                                                 MitnickSolve 0.1.2
+  ~                                                                                 MitnickSolve 0.1.3
 ```
 
 - The large wordmark is drawn from Unicode blocks with a left-to-right gradient.
@@ -140,15 +140,17 @@ shows the provider, model, effort, base URL and whether a key is set.
 | `d` | delete; press `d` again on the same row to confirm |
 | `↑` / `↓`, `j` / `k` | move; `g` / `G` jump to the first or last profile |
 
-Switching profiles loads its provider, model, effort, endpoint and key, and
-starts a fresh session on the next message. Active settings are also written to
-`<root>/tui-config.json`; the profiles list lives under the same file's
-`profiles` array. Keys are stored locally in that file (mode `0600` on Unix,
-the usual user-profile ACL on Windows) and are sent to `mskd` over the local IPC
-socket only when creating a task; the daemon passes the key to the agent
-subprocess through its environment. Nothing is sent anywhere else. If you do not
-want keys on disk, leave the key empty and export `MSK_LLM_API_KEY` where `mskd`
-starts. `msk-tui --doctor` checks daemon, envd, tools and key presence.
+Switching profiles loads its provider, model, effort, endpoint and key for the
+next session; the conversation you are reading keeps the provider it started
+with. Press `Ctrl+N` to start a session with the selected profile. Active
+settings are also written to `<root>/tui-config.json`; the profiles list lives
+under the same file's `profiles` array. Keys are stored locally in that file
+(mode `0600` on Unix, the usual user-profile ACL on Windows) and are sent to
+`mskd` over the local IPC socket only when creating a task; the daemon passes the
+key to the agent subprocess through its environment. Nothing is sent anywhere
+else. If you do not want keys on disk, leave the key empty and export
+`MSK_LLM_API_KEY` where `mskd` starts. `msk-tui --doctor` checks daemon, envd,
+tools and key presence.
 
 ## Command palette and sessions
 
@@ -178,15 +180,20 @@ Enter to run, Esc to close.
                       ╰──────────────────────────────────────────────────────────────────────────╯
 ```
 
-`Tab` opens the session switcher. Sessions are titled by their goal; internal
-task ids stay out of the way. Up/down selects, Enter switches, Esc closes.
+`Tab` opens the session switcher. The first row starts a fresh session; saved
+sessions follow, titled by their goal (internal task ids stay out of the way).
+Up/down only moves the highlight, Enter opens the selected row, `n` starts a new
+session, Esc closes. `Ctrl+N` starts a new session from anywhere without
+replacing the conversation you are reading.
 
 ```text
-                      ╭ sessions ────────────────────────────────────────────────────────────────╮
-                      │ › ● ready     Find the flag in ./challenge                                │
-                      │   ✗ cancelled Interactive session                                         │
-                      │                                    ↑/↓ select · Enter switch · Esc close │
-                      ╰──────────────────────────────────────────────────────────────────────────╯
+╭ sessions ────────────────────────────────────────────────────────────────╮
+│ Open a saved conversation or start a fresh one.                          │
+│   ＋  New session   start a fresh conversation                            │
+│     ✓ done        Find the flag in ./challenge                           │
+│ › ● ✓ done        Map the target service                                 │
+│                              ↑/↓ select · Enter open · n new · Esc close │
+╰──────────────────────────────────────────────────────────────────────────╯
 ```
 
 ## Conversation
@@ -210,8 +217,8 @@ composer at the bottom:
         │                                                                                                      │
         │  Build · scripted                                                                                    │
         ╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯
-                                                                       tab sessions   ctrl+p commands   F1 help
-  ~/.msk/ui-chat/ws                                                                                 MitnickSolve 0.1.2
+                                                           tab sessions   ctrl+n new   ctrl+p commands   F1 help
+  ~/.msk/ui-chat/ws                                                                                 MitnickSolve 0.1.3
 ```
 
 - `▌` and `❯` mark the active session and your messages; agent text is plain.
@@ -266,6 +273,7 @@ Press `y` to approve or `n`/`Esc` to deny. Approvals are also hydrated from
 | `Esc` | interrupt a running turn, or close the editor / overlay |
 | `Ctrl+C` | interrupt a running turn; when idle, quit |
 | `Tab` | session switcher |
+| `Ctrl+N` | start a new session |
 | `Ctrl+P` | command palette |
 | `F1` | keyboard shortcuts |
 | `PgUp` / `PgDn`, `↑` / `↓` | scroll the conversation |
@@ -293,9 +301,11 @@ running each line, and pasted text never triggers a shortcut.
 
 `Ctrl+P` → **Agent mode** (or `/mode`) opens the mode picker. The mode is shown
 in exactly one place: the leading slot of the composer, where opencode shows
-`Build` — for example `自动 · openai · gpt-5 · effort high`. Enter applies the
-selected mode (the configured label changes in that slot) and saves it. The list
-comes from the daemon's `modes.json`, so custom modes appear automatically.
+`Build` — for example `自动 · openai · gpt-5 · effort high`. Enter saves the
+selected mode for the **next** session; it never replaces the session you are
+reading. The composer keeps showing the current session's mode. Press `Ctrl+N`
+to start a session with the new mode. The list comes from the daemon's
+`modes.json`, so custom modes appear automatically.
 
 The mode is a tool-level boundary, not a label: `plan`/`investigate` cannot call
 `exec`, `write_file`, `session_*`, `net_dial` or `archive_extract`, and subagents
@@ -307,9 +317,9 @@ definitions, the full matrix and auto-routing rules.
 `Ctrl+P` → **Permission mode** (or `/permissions`) opens `auto`, `manual`, and
 `bypass`. This is separate from the agent mode: the agent mode decides which
 tools exist, the permission mode decides which calls pause for approval. The
-footer shows `权限 自动`, `手动`, or `放行`. Changing it while a session is open
-starts a fresh session on the next message. See
-[`docs/permissions.md`](docs/permissions.md).
+footer shows the current session's posture (`权限 自动`, `手动`, or `放行`).
+Changing it saves the posture for the next session; press `Ctrl+N` to start one.
+See [`docs/permissions.md`](docs/permissions.md).
 
 ## Findings and reports
 
@@ -427,6 +437,12 @@ target/debug/msk-tui --events .msk/events.jsonl
   A saved key is sent per task, so an already running daemon picks it up without
   a restart. `Ctrl+P` still works while typing; choose `scripted-demo` to work
   offline.
+- **`model_not_found` / HTTP 4xx or 5xx from the provider** — the turn now shows
+  a red error block and the header reads `last turn failed`. The model id must
+  match the provider's catalog exactly (some gateways suffix a release date,
+  e.g. `deepseek-v4.1-flash-1017`, not `deepseek-v4.1-flash`). Open `Ctrl+P` →
+  **Providers**, press `e`, choose `custom…`, and enter the exact id. A wrong
+  model name does not break the session; correct it and send again.
 - **A saved key is not used** — check that the active row in **Providers** has
   `●` and `key set`; `Enter` activates it, then send a message to start the new
   session. `--doctor` reports whether it found an environment key or a profile
