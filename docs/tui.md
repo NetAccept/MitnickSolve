@@ -51,7 +51,7 @@ This is an actual `--snapshot` frame (120×40):
                 ╰──────────────────────────────────────────────────────────────────────────────────────╯
                                                                tab sessions   ctrl+p commands   F1 help
 
-  ~                                                                                 MitnickSolve 0.1.1
+  ~                                                                                 MitnickSolve 0.1.2
 ```
 
 - The large wordmark is drawn from Unicode blocks with a left-to-right gradient.
@@ -211,7 +211,7 @@ composer at the bottom:
         │  Build · scripted                                                                                    │
         ╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯
                                                                        tab sessions   ctrl+p commands   F1 help
-  ~/.msk/ui-chat/ws                                                                                 MitnickSolve 0.1.1
+  ~/.msk/ui-chat/ws                                                                                 MitnickSolve 0.1.2
 ```
 
 - `▌` and `❯` mark the active session and your messages; agent text is plain.
