@@ -371,6 +371,13 @@ target/debug/msk-tui --events .msk/events.jsonl
 - **OpenAI task fails immediately** — run `--doctor`; check `MSK_LLM_MODEL`,
   `MSK_LLM_API_KEY` and `MSK_LLM_BASE_URL`. See `.msk/mskd.log` and the task's
   `agent.stderr.log`.
+- **`missing MSK_LLM_API_KEY` in the composer** — the key must be in the
+  daemon's environment, not the TUI's. Export it before `msk` starts, or stop the
+  running `mskd` and relaunch. `Ctrl+P` still works while typing; use
+  **Provider and model** or choose `scripted-demo` to work offline.
+- **Keys seem ignored** — `Ctrl+P`, `Tab` and `F1` are handled even while the
+  composer has focus. If a terminal focus lost its PTY, press `Ctrl+Q`; the TUI
+  also clears that state automatically on the next key.
 - **Approval modal does not appear** — approvals are hydrated every second. If
   it still does not, run `mskctl --root .msk approvals`.
 - **Stale daemon** — stop `mskd`, or use `--no-autostart` and start it manually
