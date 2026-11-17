@@ -118,7 +118,10 @@ jobs:
           mkdir -p .msk
           cat > .msk/envd-launcher.sh <<'EOF'
           #!/bin/sh
+          echo "$@" >> /tmp/envd-launcher.log
+          mkdir -p .msk/ci
           echo '{"provider":"scripted-demo","model":"","effort":"default","base_url":""}' > .msk/ci/tui-config.json
+          exec "$@"
           EOF
           chmod +x .msk/envd-launcher.sh
           target/debug/envd --service --root .msk/envd-ci2 \

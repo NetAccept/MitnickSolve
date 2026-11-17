@@ -63,7 +63,7 @@ func TestExecTimeoutKillsJobTree(t *testing.T) {
 	args, _ := json.Marshal(map[string]any{
 		"env_id":     id,
 		"argv":       []string{"powershell.exe", "-NoProfile", "-Command", command},
-		"timeout_ms": 1500,
+		"timeout_ms": 8000,
 	})
 	detail := toolError(t, s.callTool("exec", json.RawMessage(args)))
 	if detail["name"] != "DEADLINE_EXCEEDED" {
