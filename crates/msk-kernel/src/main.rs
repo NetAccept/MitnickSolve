@@ -831,10 +831,18 @@ fn main() -> Result<()> {
             println!("llm: {}", response.text);
         }
         if response.tool_calls.is_empty() {
-            context.push(Role::Assistant, response.text.clone());
+            context.push_assistant_tool_calls(
+                response.text.clone(),
+                Vec::new(),
+                response.provider_items.clone(),
+            );
             break;
         }
-        context.push_assistant_tool_calls(response.text.clone(), response.tool_calls.clone());
+        context.push_assistant_tool_calls(
+            response.text.clone(),
+            response.tool_calls.clone(),
+            response.provider_items.clone(),
+        );
 
         for call in response.tool_calls {
             let mut args = call.args.clone();
@@ -1121,7 +1129,7 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         let mut context = ContextManager::new(limits.clone());
         context.push_pinned(
             Role::System,
-            "You are MitnickSolve, an autonomous security engineering and network operations agent. \
+            "You are Mitnick, the autonomous security engineering and network operations agent inside MitnickSolve. \
              Work only on the authorized challenge, target, or infrastructure in front of you; never \
              scan or attack hosts outside that scope. Use the provided tools for all machine access. \
              Prefer structured tools before raw commands: net_info/net_dns/net_tls/net_dial/net_scan \
@@ -1471,11 +1479,15 @@ fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
                     args: json!({"message": "hello from echo"}),
                 }],
                 usage_tokens: 5,
+
+                provider_items: Vec::new(),
             },
             LlmResponse {
                 text: "echo demo complete".into(),
                 tool_calls: Vec::new(),
                 usage_tokens: 5,
+
+                provider_items: Vec::new(),
             },
         ],
         Demo::Session => {
@@ -1498,6 +1510,8 @@ fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
                         args: json!({"env_id": "$ENV"}),
                     }],
                     usage_tokens: 10,
+
+                    provider_items: Vec::new(),
                 },
                 LlmResponse {
                     text: "run a command".into(),
@@ -1507,6 +1521,8 @@ fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
                         args: json!({"session_id": "$SESSION", "command": "echo session-one"}),
                     }],
                     usage_tokens: 10,
+
+                    provider_items: Vec::new(),
                 },
                 LlmResponse {
                     text: "verify shell state persists".into(),
@@ -1516,6 +1532,8 @@ fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
                         args: json!({"session_id": "$SESSION", "command": state_command}),
                     }],
                     usage_tokens: 10,
+
+                    provider_items: Vec::new(),
                 },
                 LlmResponse {
                     text: "produce a large output".into(),
@@ -1525,6 +1543,8 @@ fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
                         args: json!({"session_id": "$SESSION", "command": large_command}),
                     }],
                     usage_tokens: 10,
+
+                    provider_items: Vec::new(),
                 },
                 LlmResponse {
                     text: "read the artifact head".into(),
@@ -1534,6 +1554,8 @@ fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
                         args: json!({"id": "$ARTIFACT", "offset": 0, "limit": 200}),
                     }],
                     usage_tokens: 10,
+
+                    provider_items: Vec::new(),
                 },
                 LlmResponse {
                     text: "close the session".into(),
@@ -1543,11 +1565,15 @@ fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
                         args: json!({"session_id": "$SESSION"}),
                     }],
                     usage_tokens: 10,
+
+                    provider_items: Vec::new(),
                 },
                 LlmResponse {
                     text: "session demo complete".into(),
                     tool_calls: Vec::new(),
                     usage_tokens: 10,
+
+                    provider_items: Vec::new(),
                 },
             ]
         }
@@ -1560,6 +1586,8 @@ fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
                     args: json!({"flag": "flag{eval_demo}", "source": "ctf-demo"}),
                 }],
                 usage_tokens: 10,
+
+                provider_items: Vec::new(),
             },
             LlmResponse {
                 text: "list recorded flags".into(),
@@ -1569,11 +1597,15 @@ fn demo_responses(demo: Demo) -> Vec<LlmResponse> {
                     args: json!({}),
                 }],
                 usage_tokens: 10,
+
+                provider_items: Vec::new(),
             },
             LlmResponse {
                 text: "ctf demo complete".into(),
                 tool_calls: Vec::new(),
                 usage_tokens: 10,
+
+                provider_items: Vec::new(),
             },
         ],
     }
@@ -1607,6 +1639,8 @@ fn replay_responses(events: &[msk_events::Event]) -> Result<Vec<LlmResponse>> {
             text,
             tool_calls,
             usage_tokens,
+
+            provider_items: Vec::new(),
         });
     }
     Ok(responses)

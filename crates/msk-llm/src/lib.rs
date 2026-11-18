@@ -22,6 +22,10 @@ pub struct Message {
     pub tool_name: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
+    /// Provider-specific items (Responses API reasoning items) that belong to
+    /// this assistant message and must be sent back with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_items: Vec<Value>,
 }
 
 impl Message {
@@ -32,6 +36,7 @@ impl Message {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            provider_items: Vec::new(),
         }
     }
 
@@ -42,7 +47,13 @@ impl Message {
             tool_call_id: None,
             tool_name: None,
             tool_calls,
+            provider_items: Vec::new(),
         }
+    }
+
+    pub fn with_provider_items(mut self, items: Vec<Value>) -> Self {
+        self.provider_items = items;
+        self
     }
 
     pub fn tool_result(
@@ -56,6 +67,7 @@ impl Message {
             tool_call_id: Some(call_id.into()),
             tool_name: Some(tool_name.into()),
             tool_calls: Vec::new(),
+            provider_items: Vec::new(),
         }
     }
 }
@@ -79,6 +91,10 @@ pub struct LlmResponse {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage_tokens: u64,
+    /// Opaque provider output items that must be replayed on the next request,
+    /// notably Responses API `reasoning` items in thinking mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_items: Vec<Value>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -182,6 +198,8 @@ impl LlmProvider for EchoProvider {
             text: format!("echo: {text}"),
             tool_calls: Vec::new(),
             usage_tokens: 0,
+
+            provider_items: Vec::new(),
         })
     }
 }
@@ -437,6 +455,8 @@ impl LlmProvider for OpenAiProvider {
             text,
             tool_calls,
             usage_tokens,
+
+            provider_items: Vec::new(),
         })
     }
 }
@@ -601,6 +621,8 @@ pub fn parse_openai_response(value: &Value) -> Result<LlmResponse, LlmError> {
         text,
         tool_calls,
         usage_tokens,
+
+        provider_items: Vec::new(),
     })
 }
 
@@ -615,6 +637,9 @@ fn responses_request(model: &str, effort: Option<&str>, request: &LlmRequest) ->
                 "output": message.content
             }));
         } else if !message.tool_calls.is_empty() {
+            for item in &message.provider_items {
+                input.push(item.clone());
+            }
             if !message.content.is_empty() {
                 input.push(json!({
                     "role": "assistant",
@@ -628,6 +653,16 @@ fn responses_request(model: &str, effort: Option<&str>, request: &LlmRequest) ->
                     "name": call.tool,
                     "arguments": serde_json::to_string(&call.args)
                         .unwrap_or_else(|_| "{}".to_string())
+                }));
+            }
+        } else if message.role == "assistant" && !message.provider_items.is_empty() {
+            for item in &message.provider_items {
+                input.push(item.clone());
+            }
+            if !message.content.is_empty() {
+                input.push(json!({
+                    "role": "assistant",
+                    "content": message.content
                 }));
             }
         } else if message.role == "system" {
@@ -678,8 +713,10 @@ pub fn parse_responses_response(value: &Value) -> Result<LlmResponse, LlmError> 
 
     let mut text = String::new();
     let mut tool_calls = Vec::new();
+    let mut provider_items = Vec::new();
     for (index, item) in output.iter().enumerate() {
         match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => provider_items.push(item.clone()),
             Some("message") => {
                 if let Some(content) = item.get("content").and_then(Value::as_array) {
                     for part in content {
@@ -696,12 +733,14 @@ pub fn parse_responses_response(value: &Value) -> Result<LlmResponse, LlmError> 
                     .get("name")
                     .and_then(Value::as_str)
                     .ok_or_else(|| LlmError::Provider("function_call has no name".into()))?;
-                let arguments = item
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .unwrap_or("{}");
-                let args = serde_json::from_str(arguments)
-                    .map_err(|err| LlmError::Provider(format!("function arguments: {err}")))?;
+                let args = match item.get("arguments") {
+                    Some(Value::String(arguments)) => serde_json::from_str(arguments)
+                        .map_err(|err| LlmError::Provider(format!("function arguments: {err}")))?,
+                    Some(Value::Object(_)) => {
+                        item.get("arguments").cloned().unwrap_or_else(|| json!({}))
+                    }
+                    _ => json!({}),
+                };
                 let call_id = item
                     .get("call_id")
                     .and_then(Value::as_str)
@@ -727,6 +766,7 @@ pub fn parse_responses_response(value: &Value) -> Result<LlmResponse, LlmError> 
         text,
         tool_calls,
         usage_tokens,
+        provider_items,
     })
 }
 
@@ -754,6 +794,8 @@ mod tests {
                     args: serde_json::json!({"argv": ["echo", "hi"]}),
                 }],
                 usage_tokens: 10,
+
+                provider_items: Vec::new(),
             }],
         );
         let request = LlmRequest {
@@ -833,6 +875,110 @@ mod tests {
         assert_eq!(response.tool_calls[0].tool, "session_exec");
         assert_eq!(response.tool_calls[0].args["command"], "echo hi");
         assert_eq!(response.usage_tokens, 9);
+    }
+
+    #[test]
+    #[ignore = "requires MSK_LIVE_BASE_URL, MSK_LIVE_MODEL and MSK_LIVE_API_KEY"]
+    fn live_responses_replays_reasoning_items() {
+        let (Ok(base_url), Ok(model), Ok(api_key)) = (
+            std::env::var("MSK_LIVE_BASE_URL"),
+            std::env::var("MSK_LIVE_MODEL"),
+            std::env::var("MSK_LIVE_API_KEY"),
+        ) else {
+            return;
+        };
+        let provider = OpenAiResponsesProvider::new(OpenAiConfig {
+            base_url,
+            model,
+            api_key,
+            effort: Some("minimal".into()),
+        })
+        .unwrap();
+        let tools = vec![ToolSchema {
+            name: "echo".into(),
+            description: "Echo a message".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"message": {"type": "string"}},
+                "required": ["message"]
+            }),
+        }];
+        let first = provider
+            .complete(&LlmRequest {
+                messages: vec![Message::text(
+                    "user",
+                    "Call the echo tool with message ping. Do not answer in text.",
+                )],
+                tools: tools.clone(),
+                max_tokens: None,
+            })
+            .unwrap();
+        assert!(
+            !first.provider_items.is_empty(),
+            "thinking mode should return reasoning items"
+        );
+        let call = first.tool_calls.first().expect("tool call").clone();
+        let mut messages = vec![
+            Message::text(
+                "user",
+                "Call the echo tool with message ping. Do not answer in text.",
+            ),
+            Message::assistant_tool_calls(first.text, first.tool_calls)
+                .with_provider_items(first.provider_items),
+            Message::tool_result(call.id, call.tool, "{\"ok\":true}"),
+            Message::text("user", "Reply with the single word done."),
+        ];
+        let second = provider
+            .complete(&LlmRequest {
+                messages: std::mem::take(&mut messages),
+                tools,
+                max_tokens: None,
+            })
+            .unwrap();
+        assert!(!second.text.trim().is_empty());
+    }
+
+    #[test]
+    fn responses_replays_reasoning_items() {
+        let reasoning = json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "thinking"}],
+            "encrypted_content": "opaque"
+        });
+        let value = json!({
+            "output": [
+                reasoning.clone(),
+                {
+                    "type": "function_call",
+                    "name": "echo",
+                    "arguments": "{\"x\":1}",
+                    "call_id": "call_1"
+                }
+            ]
+        });
+        let response = parse_responses_response(&value).unwrap();
+        assert_eq!(response.provider_items, vec![reasoning.clone()]);
+        let request = LlmRequest {
+            messages: vec![
+                Message::assistant_tool_calls(
+                    "",
+                    vec![ToolCall {
+                        id: "call_1".into(),
+                        tool: "echo".into(),
+                        args: json!({"x": 1}),
+                    }],
+                )
+                .with_provider_items(response.provider_items),
+                Message::tool_result("call_1", "echo", "{\"ok\":true}"),
+            ],
+            tools: vec![],
+            max_tokens: None,
+        };
+        let body = responses_request("m", None, &request);
+        assert_eq!(body["input"][0]["type"], "reasoning");
+        assert_eq!(body["input"][1]["type"], "function_call");
+        assert_eq!(body["input"][2]["type"], "function_call_output");
     }
 
     #[test]

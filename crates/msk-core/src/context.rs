@@ -92,6 +92,10 @@ pub struct ContextMessage {
     pub tool_call_id: Option<String>,
     pub tool_name: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    /// Provider-specific items that belong to an assistant message and must be
+    /// replayed with it (Responses API reasoning items).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_items: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +136,7 @@ impl ContextManager {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            provider_items: Vec::new(),
         });
     }
 
@@ -144,6 +149,7 @@ impl ContextManager {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            provider_items: Vec::new(),
         });
     }
 
@@ -156,6 +162,7 @@ impl ContextManager {
             tool_call_id: None,
             tool_name: None,
             tool_calls: Vec::new(),
+            provider_items: Vec::new(),
         });
     }
 
@@ -163,6 +170,7 @@ impl ContextManager {
         &mut self,
         content: impl Into<String>,
         tool_calls: Vec<ToolCall>,
+        provider_items: Vec<serde_json::Value>,
     ) {
         self.messages.push(ContextMessage {
             role: Role::Assistant,
@@ -172,6 +180,7 @@ impl ContextManager {
             tool_call_id: None,
             tool_name: None,
             tool_calls,
+            provider_items,
         });
     }
 
@@ -189,6 +198,7 @@ impl ContextManager {
             tool_call_id: Some(call_id.into()),
             tool_name: Some(tool_name.into()),
             tool_calls: Vec::new(),
+            provider_items: Vec::new(),
         });
     }
 
@@ -448,6 +458,7 @@ mod tests {
                     tool: "exec".into(),
                     args: serde_json::json!({"command": "echo hi"}),
                 }],
+                Vec::new(),
             );
             context.push_tool_result(
                 format!("call-{index}"),

@@ -352,6 +352,8 @@ impl LlmProvider for ComponentLlmProvider {
             text: response.text,
             tool_calls: response.tool_calls,
             usage_tokens: response.usage_tokens,
+
+            provider_items: Vec::new(),
         })
     }
 }

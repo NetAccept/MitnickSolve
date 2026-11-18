@@ -2,7 +2,7 @@
 
 `msk` with no arguments opens the conversational app. It is a semi-graphical
 terminal UI: a pixel wordmark, rounded composer, status chips, a session rail,
-markdown-lite assistant text, readable tool summaries, a scrollback bar, modal
+Mitnick's markdown-lite replies, readable tool summaries, a scrollback bar, modal
 approvals and a command palette. It starts a local `mskd` daemon if one is
 not already listening, and it is a normal client of that daemon — the same one
 used by `mskctl`, the browser UI and the eval harness.
@@ -64,7 +64,7 @@ This is an actual `--snapshot` frame (120×40):
 
 
 
-  ~  ·  权 限  自 动                                                                                    MitnickSolve 0.1.5
+  ~  ·  权 限  自 动                                                                                    MitnickSolve 0.1.6
 ```
 
 - The large wordmark is drawn from Unicode blocks with a left-to-right gradient.
@@ -118,6 +118,7 @@ With no configured provider, a full-screen setup card opens first. Choose
    model id.
 4. **Effort** — `default`, `minimal`, `low`, `medium`, `high`. It is sent as
    `reasoning_effort` (Chat Completions) or `reasoning.effort` (Responses).
+   Press `F2` to cycle it, or `Shift+F2` to go back, without opening a dialog.
 5. **Endpoint** — optional OpenAI-compatible base URL. Empty uses
    `MSK_LLM_BASE_URL` or the provider default.
 6. **API key** — masked while you type or paste. Empty keeps using the daemon's
@@ -220,47 +221,40 @@ markdown rendering and the composer at the bottom:
 ```text
  ╭ sessions ──────────╮   ▌ Find the flag in ./challenge  ● ready                        scripted · - · effort default
  │▌ ● Find the flag i…│   ────────────────────────────────────────────────────────────────────────────────────────────
- │                    │     agent
+ │                    │     Mitnick
  │＋  New session      │     ▸ env_create managed session
  │                    │     ✓ env_create
  │                    │
  │                    │     you
  │                    │   ❯ # Recon
  │                    │     - found **TLS** on `443`
- │                    │     - certificate expired
  │                    │
- │                    │
- │                    │     ```text
- │                    │     subject=challenge.local
- │                    │     ```
- │                    │
- │                    │     agent
+ │                    │     Mitnick
  │                    │   │   echo: # Recon
  │                    │   │   • found TLS on 443
- │                    │   │   • certificate expired
- │                    │   │
- │                    │   │   ╭─ text
- │                    │   │   │ subject=challenge.local
- │                    │   │   ╰─
  │                    │
+ │                    │   ─────────────── ✓ turn complete · 10:28:07 · scripted · - · effort default ────────────────
  │                    │   ╭──────────────────────────────────────────────────────────────────────────────────────────╮
  │                    │   │ Reply…   Shift+Enter for a new line                                                      │
  │                    │   │                                                                                          │
  │                    │   │  攻 击  · scripted                                                                         │
  │tab switch · ctrl+n │   ╰──────────────────────────────────────────────────────────────────────────────────────────╯
  ╰────────────────────╯                                        tab sessions   ctrl+n new   ctrl+p commands   F1 help
-  ~  ·  权 限  手 动   ·  ↑ scrollback · End follows                                                    MitnickSolve 0.1.5
+  ~  ·  权 限  手 动   ·  ↑ scrollback · End follows                                                    MitnickSolve 0.1.6
 ```
 
 - On wide terminals the left rail lists sessions; `▌` marks the open one and the
   glyph shows its state. `＋ New session` sits below it.
-- Each turn starts with a small `you` or `agent` label. Your messages sit on a
-  tinted row with `❯`; agent text uses a `│` gutter and a small Markdown
+- Each turn starts with a small `you` or `Mitnick` label. Your messages sit on a
+  tinted row with `❯`; Mitnick uses a `│` gutter and a small Markdown
   renderer: headings, bullets, **bold**, `inline code` and fenced code blocks
   are styled.
 - Tool calls appear as `▸ tool summary` (the shell command, target, path or URL),
   with the matching `✓ tool` (green) or `✗ tool` (red) result immediately
   below. Streaming text ends with a blinking block.
+- Every finished turn closes with a `✓ turn complete` rule showing the time,
+  provider, model, effort and elapsed time. It is recorded in the event log, so
+  reopening the session shows the same marker.
 - Typing `/` above the composer opens a filtered command popup; keep typing to
   narrow it, then press Enter to run the command.
 - The header is a status bar: goal, a live state chip (`⠋ running`, `● ready`,
@@ -319,6 +313,7 @@ Press `y` to approve or `n`/`Esc` to deny. Approvals are also hydrated from
 | `Ctrl+N` | start a new session |
 | `Ctrl+P` | command palette |
 | `F1` | keyboard shortcuts |
+| `F2` / `Shift+F2` | cycle reasoning effort forward / back |
 | `↑` / `↓` | scroll the conversation one line |
 | `PgUp` / `PgDn` | scroll ten lines |
 | `Ctrl/Alt+↑` / `Ctrl/Alt+↓` | older / newer input history |
@@ -379,7 +374,7 @@ client. `Ctrl+P` → **Assessment findings** (or `/findings`) opens a
 severity-ranked overlay: `j`/`k` scroll, `r` reloads, Esc closes. Each row shows
 severity, title, asset, status, tags and a short description.
 
-Use `Ctrl+P` → **Terminal** for the PTY, and ask the agent for `report_generate`
+Use `Ctrl+P` → **Terminal** for the PTY, and ask Mitnick for `report_generate`
 when you want a Markdown report assembled from the finding ledger and captured
 flags; it saves with `write_file`.
 

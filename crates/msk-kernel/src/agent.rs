@@ -134,6 +134,7 @@ pub struct Session {
     last_session: Option<String>,
     last_artifact: Option<String>,
     turns: u64,
+    turn_started: Instant,
 }
 
 impl Session {
@@ -156,6 +157,7 @@ impl Session {
             last_session: None,
             last_artifact: None,
             turns: options.initial_turns,
+            turn_started: Instant::now(),
         }
     }
 
@@ -186,6 +188,7 @@ impl Session {
 
     fn run_turn_inner<F: FnMut(&str)>(&mut self, user: &str, mut on_text: F) -> TurnOutcome {
         self.turns += 1;
+        self.turn_started = Instant::now();
         self.emit("turn.start", json!({"turn": self.turns, "user": user}));
         self.context.push(Role::User, user.to_string());
         self.compact();
@@ -209,7 +212,7 @@ impl Session {
                     let message = format!("LLM call failed: {err}");
                     self.emit(
                         "turn.end",
-                        json!({"turn": self.turns, "status": "error", "message": message}),
+                        json!({"turn": self.turns, "status": "error", "message": message, "duration_ms": self.turn_started.elapsed().as_millis() as u64}),
                     );
                     return TurnOutcome::Error(message);
                 }
@@ -234,17 +237,24 @@ impl Session {
                 return self.finish_interrupted();
             }
             if response.tool_calls.is_empty() {
-                self.context.push(Role::Assistant, response.text);
+                self.context.push_assistant_tool_calls(
+                    response.text,
+                    Vec::new(),
+                    response.provider_items,
+                );
                 self.compact();
                 self.emit(
                     "turn.end",
-                    json!({"turn": self.turns, "status": "awaiting_input"}),
+                    json!({"turn": self.turns, "status": "awaiting_input", "duration_ms": self.turn_started.elapsed().as_millis() as u64}),
                 );
                 return TurnOutcome::AwaitingInput;
             }
 
-            self.context
-                .push_assistant_tool_calls(response.text, response.tool_calls.clone());
+            self.context.push_assistant_tool_calls(
+                response.text,
+                response.tool_calls.clone(),
+                response.provider_items,
+            );
             let mut interrupted = false;
             for call in response.tool_calls {
                 if interrupted || self.cancel.is_cancelled() {
@@ -269,7 +279,7 @@ impl Session {
         let message = format!("turn exceeded {} steps", self.max_steps);
         self.emit(
             "turn.end",
-            json!({"turn": self.turns, "status": "stopped", "message": message}),
+            json!({"turn": self.turns, "status": "stopped", "message": message, "duration_ms": self.turn_started.elapsed().as_millis() as u64}),
         );
         TurnOutcome::Stopped(message)
     }
@@ -277,7 +287,7 @@ impl Session {
     fn finish_interrupted(&mut self) -> TurnOutcome {
         self.emit(
             "turn.end",
-            json!({"turn": self.turns, "status": "interrupted"}),
+            json!({"turn": self.turns, "status": "interrupted", "duration_ms": self.turn_started.elapsed().as_millis() as u64}),
         );
         TurnOutcome::Interrupted
     }
@@ -652,11 +662,15 @@ mod tests {
                     args: json!({}),
                 }],
                 usage_tokens: 1,
+
+                provider_items: Vec::new(),
             },
             LlmResponse {
                 text: "recovered".into(),
                 tool_calls: Vec::new(),
                 usage_tokens: 1,
+
+                provider_items: Vec::new(),
             },
         ]);
 
@@ -704,11 +718,15 @@ mod tests {
                         args: json!({"command": "rm -rf /"}),
                     }],
                     usage_tokens: 1,
+
+                    provider_items: Vec::new(),
                 },
                 LlmResponse {
                     text: "done".into(),
                     tool_calls: Vec::new(),
                     usage_tokens: 1,
+
+                    provider_items: Vec::new(),
                 },
             ],
             PolicyDecision::Ask,
@@ -934,6 +952,8 @@ mod tests {
                         },
                     ],
                     usage_tokens: 1,
+
+                    provider_items: Vec::new(),
                 }],
             )),
             context: ContextManager::new(limits.clone()),

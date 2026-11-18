@@ -810,7 +810,7 @@ fn chat_lines(line: &ChatLine, width: u16, show_label: bool) -> Vec<Line<'static
         ChatRole::Assistant => {
             if show_label {
                 rendered.push(Line::from(Span::styled(
-                    "  agent",
+                    "  Mitnick",
                     Style::default().fg(DIM).add_modifier(Modifier::BOLD),
                 )));
             }
@@ -828,7 +828,7 @@ fn chat_lines(line: &ChatLine, width: u16, show_label: bool) -> Vec<Line<'static
         ChatRole::Tool => {
             if show_label {
                 rendered.push(Line::from(Span::styled(
-                    "  agent",
+                    "  Mitnick",
                     Style::default().fg(DIM).add_modifier(Modifier::BOLD),
                 )));
             }
@@ -849,6 +849,21 @@ fn chat_lines(line: &ChatLine, width: u16, show_label: bool) -> Vec<Line<'static
                 ),
                 Span::styled(format!(" {detail}"), Style::default().fg(DIM)),
             ]));
+        }
+        ChatRole::Meta => {
+            let label = format!(" ✓ {} ", truncate(&line.text, width as usize));
+            let label_width = UnicodeWidthStr::width(label.as_str());
+            if label_width < width as usize {
+                let left = (width as usize - label_width) / 2;
+                let right = width as usize - label_width - left;
+                rendered.push(Line::from(vec![
+                    Span::styled("─".repeat(left), Style::default().fg(FAINT)),
+                    Span::styled(label, Style::default().fg(DIM)),
+                    Span::styled("─".repeat(right), Style::default().fg(FAINT)),
+                ]));
+            } else {
+                rendered.push(Line::from(Span::styled(label, Style::default().fg(DIM))));
+            }
         }
         ChatRole::System => {
             let is_error = line.text.starts_with('✗');
@@ -935,7 +950,11 @@ fn turn_error_text(status: &str, message: &str) -> String {
         detail = status.to_string();
     }
     let mut text = format!("✗ {}", truncate(&detail, 400));
-    if message.contains("LLM call failed")
+    if message.contains("function arguments") || message.contains("tool arguments") {
+        text.push_str("\nprovider returned incomplete tool arguments · retry the turn");
+    } else if message.contains("reasoning_text") || message.contains("thinking mode") {
+        text.push_str("\nreasoning context was rejected · retry, or start a fresh session");
+    } else if message.contains("LLM call failed")
         || message.contains("model_not_found")
         || message.contains("HTTP 4")
         || message.contains("HTTP 5")
@@ -951,6 +970,7 @@ enum ChatRole {
     Assistant,
     Tool,
     System,
+    Meta,
 }
 
 #[derive(Debug, Clone)]
@@ -2127,6 +2147,41 @@ impl DaemonApp {
                         text: turn_error_text(status, message),
                         streaming: false,
                     });
+                } else {
+                    let task = self
+                        .tasks
+                        .iter()
+                        .find(|task| task.get("task_id").and_then(Value::as_str) == Some(task_id));
+                    let provider = task
+                        .and_then(|task| task.get("provider"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(&self.provider)
+                        .to_string();
+                    let model = task
+                        .and_then(|task| task.get("model"))
+                        .and_then(Value::as_str)
+                        .filter(|model| !model.is_empty())
+                        .unwrap_or("-")
+                        .to_string();
+                    let effort = task
+                        .and_then(|task| task.get("effort"))
+                        .and_then(Value::as_str)
+                        .filter(|effort| !effort.is_empty())
+                        .unwrap_or("default")
+                        .to_string();
+                    let mut text = format!(
+                        "turn complete · {} · {provider} · {model} · effort {effort}",
+                        short_time(&event.ts)
+                    );
+                    if let Some(ms) = data.get("duration_ms").and_then(Value::as_u64) {
+                        text.push_str(&format!(" · {:.1}s", ms as f64 / 1000.0));
+                    }
+                    self.chat.push(ChatLine {
+                        task_id: task_id.to_string(),
+                        role: ChatRole::Meta,
+                        text,
+                        streaming: false,
+                    });
                 }
             }
             "approval.request" => {
@@ -2464,6 +2519,23 @@ impl DaemonApp {
                 "permission for next session: {} · current stays {} · ctrl+n starts it",
                 self.permission,
                 self.display_permission()
+            );
+        }
+    }
+
+    fn cycle_effort(&mut self, delta: isize) {
+        let index = effort_index(&self.effort) as isize;
+        let length = EFFORTS.len() as isize;
+        let next = (index + delta).rem_euclid(length) as usize;
+        self.effort = EFFORTS[next].0.to_string();
+        self.save_config();
+        if self.new_task || self.selected_task_id().is_none() {
+            self.status = format!("next session effort: {}", self.effort);
+        } else {
+            self.status = format!(
+                "effort for next session: {} · current stays {} · ctrl+n starts it",
+                self.effort,
+                self.display_effort()
             );
         }
     }
@@ -3479,6 +3551,15 @@ impl DaemonApp {
             self.show_help = !self.show_help;
             return false;
         }
+        if key.code == KeyCode::F(2) {
+            let delta = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                -1
+            } else {
+                1
+            };
+            self.cycle_effort(delta);
+            return false;
+        }
         if key.code == KeyCode::Tab {
             self.toggle_sessions();
             return false;
@@ -4449,6 +4530,7 @@ impl DaemonApp {
             help_line("Ctrl+N", "start a new session"),
             help_line("Ctrl+P", "command palette"),
             help_line("F1", "toggle this help"),
+            help_line("F2 / Shift+F2", "cycle reasoning effort forward / back"),
             help_line("↑ / ↓", "scroll the transcript one line"),
             help_line("PgUp / PgDn", "scroll ten lines"),
             help_line("Ctrl/Alt+↑/↓", "older / newer input history"),
@@ -6725,6 +6807,49 @@ mod tests {
 
     #[test]
     #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn turn_complete_line_and_effort_cycle() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app =
+            DaemonApp::connect(PathBuf::from(root), 100, Some("openai-responses".into())).unwrap();
+        app.setup = None;
+        app.tasks = vec![json!({
+            "task_id": "task-a", "goal": "meta", "state": "waiting_input",
+            "provider": "openai-responses", "model": "deepseek-v4.1-flash-1017",
+            "effort": "high", "permission": "auto", "mode": "investigate",
+            "last_error": null
+        })];
+        app.selected_task = 0;
+        app.new_task = false;
+        app.chat.clear();
+        let mut event = Event::new(
+            "turn.end",
+            "agent",
+            json!({"turn": 1, "status": "awaiting_input", "duration_ms": 2400}),
+        );
+        event.ts = "2026-11-18T10:11:12Z".into();
+        app.append_history_event("task-a", &event);
+        let meta = app
+            .chat
+            .iter()
+            .find(|line| line.role == ChatRole::Meta)
+            .expect("turn complete line");
+        assert!(meta.text.contains("turn complete"));
+        assert!(meta.text.contains("10:11:12"), "{}", meta.text);
+        assert!(meta.text.contains("deepseek-v4.1-flash-1017"));
+        assert!(meta.text.contains("effort high"));
+        assert!(meta.text.contains("2.4s"));
+
+        app.effort = "default".into();
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        assert_eq!(app.effort, "minimal");
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::SHIFT));
+        assert_eq!(app.effort, "default");
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
     fn slash_popup_and_role_labels_render() {
         let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
             return;
@@ -6769,7 +6894,7 @@ mod tests {
         assert!(content.contains("commands"));
         assert!(content.contains("Agent mode"));
         assert_eq!(content.matches("you").count(), 1);
-        assert_eq!(content.matches("agent").count(), 1);
+        assert!(content.contains("  Mitnick"));
     }
 
     #[test]

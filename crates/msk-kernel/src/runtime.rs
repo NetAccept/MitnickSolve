@@ -671,18 +671,21 @@ pub fn llm_request(
                         message.tool_name.clone().unwrap_or_default(),
                         message.content.clone(),
                     )
-                } else if !message.tool_calls.is_empty() {
+                } else if !message.tool_calls.is_empty() || !message.provider_items.is_empty() {
                     Message::assistant_tool_calls(
                         message.content.clone(),
                         message.tool_calls.clone(),
                     )
+                    .with_provider_items(message.provider_items.clone())
                 } else {
                     Message::text(message.role.as_llm_role(), message.content.clone())
                 }
             })
             .collect(),
         tools,
-        max_tokens: Some(512),
+        // Let the provider choose an output budget. A small fixed cap (512)
+        // truncates reasoning models and produces invalid tool-call JSON.
+        max_tokens: None,
     }
 }
 

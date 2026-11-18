@@ -1,11 +1,12 @@
 # MitnickSolve
 
-MitnickSolve is a security engineering and network operations workbench: an
-autonomous agent for CTF challenges, authorized penetration tests, host and web
-triage, incident response, and day-to-day network operations. It pairs a
-lightweight Rust kernel with WASM-only tools and a uniform execution backend
-(`envd`). Design documents live in [`docs/`](docs/); the structured toolset is
-documented in [`docs/tools.md`](docs/tools.md).
+MitnickSolve is a security engineering and network operations workbench.
+Mitnick — the autonomous agent inside it — handles CTF challenges, authorized
+penetration tests, host and web triage, incident response, and day-to-day
+network operations. The workbench pairs a lightweight Rust kernel with WASM-only
+tools and a uniform execution backend (`envd`). Design documents live in
+[`docs/`](docs/); the structured toolset is documented in
+[`docs/tools.md`](docs/tools.md).
 
 ## Status
 
@@ -165,7 +166,7 @@ target/debug/msk
 
 `msk` with no arguments opens the interactive terminal app and starts a local
 `mskd` if needed. The embedded envd uses the **current directory** as its
-workspace, so the agent sees `./challenge` immediately. Use `--workspace <dir>`
+workspace, so Mitnick sees `./challenge` immediately. Use `--workspace <dir>`
 on `msk`/`mskd` to point it elsewhere. On first launch a setup card opens:
 choose `scripted-demo` to work offline with no key, or pick a provider, service
 endpoint, model, effort and paste an API key. The result is saved as a provider
@@ -467,8 +468,10 @@ cargo run -p msk-kernel --bin msk -- --envd target/debug/envd \
 ```
 
 Use `--provider openai-responses` for the Responses API, and
-`--llm-base-url` or `MSK_LLM_BASE_URL` for compatible endpoints. A local mock is
-included for offline testing:
+`--llm-base-url` or `MSK_LLM_BASE_URL` for compatible endpoints. Reasoning
+output items (including Responses `reasoning` items) are replayed with the next
+request, and the output budget is left to the provider, so thinking models do
+not truncate tool-call JSON. A local mock is included for offline testing:
 
 ```sh
 python bench/mock_llm.py 8765
