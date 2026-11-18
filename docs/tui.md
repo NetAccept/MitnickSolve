@@ -64,7 +64,7 @@ This is an actual `--snapshot` frame (120×40):
 
 
 
-  ~  ·  权 限  自 动                                                                                    MitnickSolve 0.1.4
+  ~  ·  权 限  自 动                                                                                    MitnickSolve 0.1.5
 ```
 
 - The large wordmark is drawn from Unicode blocks with a left-to-right gradient.
@@ -218,16 +218,13 @@ A real frame after a turn, with the session rail, status bar, role gutters,
 markdown rendering and the composer at the bottom:
 
 ```text
- ╭ sessions ──────────╮   ▌ Interactive markup test  ● ready                             scripted · - · effort default
- │  ✓ Find the flag i…│   ────────────────────────────────────────────────────────────────────────────────────────────
- │▌ ● Interactive mar…│     ▸ env_create {"kind":"managed","name":"session","profile":"dev","root":"."}
+ ╭ sessions ──────────╮   ▌ Find the flag in ./challenge  ● ready                        scripted · - · effort default
+ │▌ ● Find the flag i…│   ────────────────────────────────────────────────────────────────────────────────────────────
+ │                    │     agent
+ │＋  New session      │     ▸ env_create managed session
+ │                    │     ✓ env_create
  │                    │
- │＋  New session      │     ✓ env_create
- │                    │
- │                    │   ❯ hello **world** and `code`
- │                    │
- │                    │   │   echo: hello world and code
- │                    │
+ │                    │     you
  │                    │   ❯ # Recon
  │                    │     - found **TLS** on `443`
  │                    │     - certificate expired
@@ -237,6 +234,7 @@ markdown rendering and the composer at the bottom:
  │                    │     subject=challenge.local
  │                    │     ```
  │                    │
+ │                    │     agent
  │                    │   │   echo: # Recon
  │                    │   │   • found TLS on 443
  │                    │   │   • certificate expired
@@ -244,22 +242,27 @@ markdown rendering and the composer at the bottom:
  │                    │   │   ╭─ text
  │                    │   │   │ subject=challenge.local
  │                    │   │   ╰─
+ │                    │
  │                    │   ╭──────────────────────────────────────────────────────────────────────────────────────────╮
  │                    │   │ Reply…   Shift+Enter for a new line                                                      │
  │                    │   │                                                                                          │
  │                    │   │  攻 击  · scripted                                                                         │
  │tab switch · ctrl+n │   ╰──────────────────────────────────────────────────────────────────────────────────────────╯
  ╰────────────────────╯                                        tab sessions   ctrl+n new   ctrl+p commands   F1 help
+  ~  ·  权 限  手 动   ·  ↑ scrollback · End follows                                                    MitnickSolve 0.1.5
 ```
 
 - On wide terminals the left rail lists sessions; `▌` marks the open one and the
   glyph shows its state. `＋ New session` sits below it.
-- `❯` marks your messages (on a tinted row); agent text uses a `│` gutter and a
-  small Markdown renderer: headings, bullets, **bold**, `inline code` and fenced
-  code blocks are styled.
-- Tool calls appear as `▸ tool summary` (e.g. the shell command or target path),
-  results as `✓ tool` (green) or `✗ tool` (red) with a short observation.
-  Streaming text ends with a blinking block.
+- Each turn starts with a small `you` or `agent` label. Your messages sit on a
+  tinted row with `❯`; agent text uses a `│` gutter and a small Markdown
+  renderer: headings, bullets, **bold**, `inline code` and fenced code blocks
+  are styled.
+- Tool calls appear as `▸ tool summary` (the shell command, target, path or URL),
+  with the matching `✓ tool` (green) or `✗ tool` (red) result immediately
+  below. Streaming text ends with a blinking block.
+- Typing `/` above the composer opens a filtered command popup; keep typing to
+  narrow it, then press Enter to run the command.
 - The header is a status bar: goal, a live state chip (`⠋ running`, `● ready`,
   `✗ failed`, `✓ done`), and provider/model/effort.
 - `↑` / `↓` scroll one line (even while the composer is focused), `PgUp` /

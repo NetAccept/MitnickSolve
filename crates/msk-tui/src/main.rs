@@ -779,7 +779,7 @@ fn chat_hash(line: &ChatLine) -> u64 {
     hasher.finish()
 }
 
-fn chat_lines(line: &ChatLine) -> Vec<Line<'static>> {
+fn chat_lines(line: &ChatLine, width: u16, show_label: bool) -> Vec<Line<'static>> {
     if line.role == ChatRole::System && line.text.starts_with("turn end:") {
         return Vec::new();
     }
@@ -787,15 +787,33 @@ fn chat_lines(line: &ChatLine) -> Vec<Line<'static>> {
     let mut rendered = Vec::new();
     match line.role {
         ChatRole::User => {
+            rendered.push(Line::from(Span::styled(
+                "  you",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )));
             for (index, part) in parts.iter().enumerate() {
                 let prefix = if index == 0 { "❯ " } else { "  " };
-                rendered.push(Line::from(vec![
+                let mut spans = vec![
                     Span::styled(prefix, Style::default().fg(ACCENT).bg(USER_BG)),
                     Span::styled((*part).to_string(), Style::default().fg(TEXT).bg(USER_BG)),
-                ]));
+                ];
+                let used = 2 + UnicodeWidthStr::width(*part);
+                if (used as u16) < width {
+                    spans.push(Span::styled(
+                        " ".repeat(width as usize - used),
+                        Style::default().bg(USER_BG),
+                    ));
+                }
+                rendered.push(Line::from(spans));
             }
         }
         ChatRole::Assistant => {
+            if show_label {
+                rendered.push(Line::from(Span::styled(
+                    "  agent",
+                    Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+                )));
+            }
             let markdown = markdown_lite(&line.text);
             let last = markdown.len().saturating_sub(1);
             for (index, rendered_line) in markdown.into_iter().enumerate() {
@@ -808,6 +826,12 @@ fn chat_lines(line: &ChatLine) -> Vec<Line<'static>> {
             }
         }
         ChatRole::Tool => {
+            if show_label {
+                rendered.push(Line::from(Span::styled(
+                    "  agent",
+                    Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+                )));
+            }
             let first = line.text.chars().next().unwrap_or('·');
             let color = match first {
                 '✓' => GREEN,
@@ -849,12 +873,19 @@ fn chat_lines(line: &ChatLine) -> Vec<Line<'static>> {
             }
         }
     }
-    rendered.push(Line::from(""));
+    if !(line.role == ChatRole::Tool && line.text.starts_with('▸')) {
+        rendered.push(Line::from(""));
+    }
     rendered
 }
 
-fn build_chat_group(line: &ChatLine, width: u16) -> ChatGroup {
-    let lines = chat_lines(line);
+fn group_label_needed(previous: Option<&ChatGroup>, role: ChatRole) -> bool {
+    matches!(role, ChatRole::Assistant | ChatRole::Tool)
+        && !previous.is_some_and(|group| matches!(group.role, ChatRole::Assistant | ChatRole::Tool))
+}
+
+fn build_chat_group(line: &ChatLine, width: u16, show_label: bool) -> ChatGroup {
+    let lines = chat_lines(line, width, show_label);
     let height = if lines.is_empty() {
         0
     } else {
@@ -865,9 +896,20 @@ fn build_chat_group(line: &ChatLine, width: u16) -> ChatGroup {
     };
     ChatGroup {
         hash: chat_hash(line),
+        role: line.role,
+        show_label,
         lines,
         height,
     }
+}
+
+fn build_chat_groups(selected: &[&ChatLine], width: u16) -> Vec<ChatGroup> {
+    let mut groups: Vec<ChatGroup> = Vec::with_capacity(selected.len());
+    for line in selected {
+        let show_label = group_label_needed(groups.last(), line.role);
+        groups.push(build_chat_group(line, width, show_label));
+    }
+    groups
 }
 
 /// Turns an agent/provider failure into one readable transcript block. The
@@ -921,6 +963,8 @@ struct ChatLine {
 
 struct ChatGroup {
     hash: u64,
+    role: ChatRole,
+    show_label: bool,
     lines: Vec<Line<'static>>,
     height: usize,
 }
@@ -3687,6 +3731,7 @@ impl DaemonApp {
         let modal = !focused;
         if !modal {
             self.draw_prompt(frame, input_area, focused);
+            self.draw_slash_popup(frame, input_area);
             self.draw_hints(frame, input_area, hints_area);
         }
         self.draw_footer(frame, footer_area);
@@ -3964,10 +4009,7 @@ impl DaemonApp {
             if cache.task != cache_task || cache.width != text_width {
                 cache.task = cache_task.to_string();
                 cache.width = text_width;
-                cache.groups = selected
-                    .iter()
-                    .map(|line| build_chat_group(line, text_width))
-                    .collect();
+                cache.groups = build_chat_groups(&selected, text_width);
             } else {
                 let old = cache.groups.len();
                 let common = old.min(hashes.len());
@@ -3978,7 +4020,10 @@ impl DaemonApp {
                 if prefix_matches {
                     cache.groups.truncate(hashes.len());
                     for line in selected.iter().skip(common) {
-                        cache.groups.push(build_chat_group(line, text_width));
+                        let show_label = group_label_needed(cache.groups.last(), line.role);
+                        cache
+                            .groups
+                            .push(build_chat_group(line, text_width, show_label));
                     }
                 } else if old == hashes.len()
                     && old > 0
@@ -3987,12 +4032,11 @@ impl DaemonApp {
                         .zip(hashes.iter().take(old - 1))
                         .all(|(group, hash)| group.hash == *hash)
                 {
-                    cache.groups[old - 1] = build_chat_group(selected[old - 1], text_width);
+                    let show_label = cache.groups[old - 1].show_label;
+                    cache.groups[old - 1] =
+                        build_chat_group(selected[old - 1], text_width, show_label);
                 } else {
-                    cache.groups = selected
-                        .iter()
-                        .map(|line| build_chat_group(line, text_width))
-                        .collect();
+                    cache.groups = build_chat_groups(&selected, text_width);
                 }
             }
             cache.prefix.clear();
@@ -4198,6 +4242,57 @@ impl DaemonApp {
                 height: 1,
             },
         );
+    }
+
+    fn draw_slash_popup(&self, frame: &mut ratatui::Frame, input_area: Rect) {
+        let Some(query) = self.input.strip_prefix('/') else {
+            return;
+        };
+        if query.contains(char::is_whitespace) {
+            return;
+        }
+        let matches = filtered_commands(query);
+        if matches.is_empty() {
+            return;
+        }
+        let rows = matches.len().min(6) as u16;
+        let height = rows + 2;
+        if input_area.y < height + 1 || input_area.width < 30 {
+            return;
+        }
+        let width = 68.min(input_area.width);
+        let area = Rect {
+            x: input_area.x + input_area.width.saturating_sub(width) / 2,
+            y: input_area.y.saturating_sub(height + 1),
+            width,
+            height,
+        };
+        frame.render_widget(Clear, area);
+        let block = panel_block("commands", ACCENT);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let items: Vec<ListItem> = matches
+            .iter()
+            .take(rows as usize)
+            .enumerate()
+            .map(|(index, command)| {
+                let command = &COMMANDS[*command];
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<24}", command.label),
+                        Style::default()
+                            .fg(if index == 0 { TEXT } else { DIM })
+                            .add_modifier(if index == 0 {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::styled(command.hint, Style::default().fg(FAINT)),
+                ]))
+            })
+            .collect();
+        frame.render_widget(List::new(items), inner);
     }
 
     fn draw_hints(&self, frame: &mut ratatui::Frame, input_area: Rect, hints_area: Rect) {
@@ -6630,6 +6725,55 @@ mod tests {
 
     #[test]
     #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn slash_popup_and_role_labels_render() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app =
+            DaemonApp::connect(PathBuf::from(root), 100, Some("scripted".into())).unwrap();
+        app.setup = None;
+        app.tasks = vec![json!({
+            "task_id": "task-a", "goal": "chat roles", "state": "waiting_input",
+            "provider": "scripted", "model": null, "effort": "default",
+            "permission": "auto", "mode": "exploit", "last_error": null
+        })];
+        app.selected_task = 0;
+        app.new_task = false;
+        app.composing = true;
+        app.chat = vec![
+            ChatLine {
+                task_id: "task-a".into(),
+                role: ChatRole::User,
+                text: "find the flag".into(),
+                streaming: false,
+            },
+            ChatLine {
+                task_id: "task-a".into(),
+                role: ChatRole::Assistant,
+                text: "I will inspect `./challenge` first.".into(),
+                streaming: false,
+            },
+        ];
+        app.input = "/mod".into();
+        app.input_cursor = 4;
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(content.contains("commands"));
+        assert!(content.contains("Agent mode"));
+        assert_eq!(content.matches("you").count(), 1);
+        assert_eq!(content.matches("agent").count(), 1);
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
     fn arrows_scroll_while_the_composer_is_focused() {
         let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
             return;
@@ -6724,12 +6868,14 @@ mod tests {
             .collect();
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
+        // The first draw builds the cache; measure steady-state scrolling redraws.
+        terminal.draw(|frame| app.draw(frame)).unwrap();
         let start = Instant::now();
         for _ in 0..20 {
             terminal.draw(|frame| app.draw(frame)).unwrap();
         }
         let per_frame = start.elapsed() / 20;
-        println!("long transcript draw: {per_frame:?}/frame");
+        println!("long transcript draw cache-hit: {per_frame:?}/frame");
         assert!(per_frame < Duration::from_millis(250), "{per_frame:?}");
     }
 
