@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -418,6 +418,9 @@ fn main() -> Result<()> {
     let envd_data_addr = cli.envd_data_addr.clone();
     if envd_url.is_some() && envd_token.is_none() {
         bail!("--envd-token or ENVD_TOKEN is required with --envd-url");
+    }
+    if cli.envd_data_addr.is_some() && envd_url.is_none() {
+        bail!("--envd-data-addr requires --envd-url");
     }
     if cli.envd_data_tls && envd_data_addr.is_none() {
         bail!("--envd-data-tls requires --envd-data-addr");
@@ -930,6 +933,20 @@ impl Daemon {
                     Err(err) => (RpcResponse::err(id, -32002, err.to_string()), None),
                 }
             }
+            methods::TASK_MODE => {
+                let task_id = params
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let mode = params
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                match self.set_task_mode(task_id, mode) {
+                    Ok(snapshot) => (RpcResponse::ok(id, snapshot), None),
+                    Err(err) => (RpcResponse::err(id, -32602, err.to_string()), None),
+                }
+            }
             methods::EVENTS_QUERY => match self.event_query(&params) {
                 Ok(value) => (RpcResponse::ok(id, value), None),
                 Err(err) => (RpcResponse::err(id, -32000, err.to_string()), None),
@@ -992,10 +1009,10 @@ impl Daemon {
         goal: String,
         demo: String,
         provider: String,
-        model: Option<String>,
-        effort: Option<String>,
-        base_url: Option<String>,
-        api_key: Option<String>,
+        mut model: Option<String>,
+        mut effort: Option<String>,
+        mut base_url: Option<String>,
+        mut api_key: Option<String>,
         interactive: bool,
         stream: bool,
         approvals: String,
@@ -1011,6 +1028,27 @@ impl Daemon {
     ) -> Result<Value> {
         if !matches!(approvals.as_str(), "allow" | "ask") {
             bail!("approvals must be allow or ask");
+        }
+        // A delegated subagent defaults to the provider override only; carry
+        // the parent endpoint, model and key over when the provider matches so
+        // per-task credentials also work for agent.spawn children.
+        if let Some(parent_id) = &parent_task
+            && let Ok(inner) = self.inner.lock()
+            && let Some(parent) = inner.tasks.get(parent_id)
+            && parent.provider == provider
+        {
+            if model.is_none() {
+                model = parent.model.clone();
+            }
+            if effort.is_none() {
+                effort = parent.effort.clone();
+            }
+            if base_url.is_none() {
+                base_url = parent.base_url.clone();
+            }
+            if api_key.is_none() {
+                api_key = parent.api_key.clone();
+            }
         }
         let requested = if requested_mode.trim().is_empty() {
             "auto".to_string()
@@ -1335,13 +1373,21 @@ impl Daemon {
                 command.arg("--stream");
             }
         } else if headless {
+            // Headless runs speak the same protocol as interactive sessions so
+            // the daemon can surface approval requests and read the final
+            // turn status instead of inferring it from the exit code alone.
             command
                 .arg("--headless")
                 .arg("--demo")
                 .arg(&demo)
                 .arg("--goal")
                 .arg(&goal)
-                .stdout(Stdio::null());
+                .arg("--stdio-json")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            if stream {
+                command.arg("--stream");
+            }
         } else {
             command
                 .arg("--demo")
@@ -1360,7 +1406,7 @@ impl Daemon {
             }
         };
 
-        if interactive {
+        if interactive || headless {
             let stdout = match child.stdout.take() {
                 Some(stdout) => stdout,
                 None => {
@@ -1382,7 +1428,9 @@ impl Daemon {
             let daemon = self.clone();
             let reader_task = task_id.clone();
             thread::spawn(move || daemon.read_agent_stdout(&reader_task, stdout));
-            self.set_state(&task_id, TaskState::WaitingInput, None);
+            if interactive {
+                self.set_state(&task_id, TaskState::WaitingInput, None);
+            }
         } else if let Ok(mut slot) = child_handle.lock() {
             *slot = Some(child);
         }
@@ -1421,24 +1469,40 @@ impl Daemon {
                         })
                     })
                     .unwrap_or((false, None));
-                let mut error = result.as_ref().err().cloned();
+                let failed_exit = match &result {
+                    Ok(status) => !status.success(),
+                    Err(_) => true,
+                };
+                let mut error = match &result {
+                    Ok(status) if !status.success() => Some(format!("agent exited with {status}")),
+                    Ok(_) => None,
+                    Err(err) => Some(err.clone()),
+                };
+                // The reported turn error is more useful than an exit status.
+                if last_error.is_some() {
+                    error = last_error;
+                }
+                if !cancelled
+                    && failed_exit
+                    && error
+                        .as_deref()
+                        .is_none_or(|message| message.starts_with("agent exited with"))
+                    && let Some(message) = last_log_line(&dir.join("agent.stderr.log"))
+                {
+                    error = Some(message);
+                }
                 let state = if cancelled {
                     TaskState::Cancelled
-                } else {
-                    match &result {
-                        Ok(status) if status.success() && !interactive => TaskState::Done,
-                        Ok(status) if status.success() => {
-                            // A session that exited after an error is still a
-                            // failed task, even if the process returned 0.
-                            if last_error.is_some() {
-                                error = last_error;
-                                TaskState::Failed
-                            } else {
-                                TaskState::Done
-                            }
-                        }
-                        _ => TaskState::Failed,
+                } else if let Ok(status) = &result {
+                    // A run that exited after a failed turn is still a failed
+                    // task, even if the process returned 0.
+                    if status.success() && error.is_none() {
+                        TaskState::Done
+                    } else {
+                        TaskState::Failed
                     }
+                } else {
+                    TaskState::Failed
                 };
                 if let Ok(mut slot) = child_handle.lock() {
                     *slot = None;
@@ -1500,7 +1564,8 @@ impl Daemon {
                         .get("message")
                         .and_then(Value::as_str)
                         .map(str::to_string);
-                    let snapshot = self.record_turn_end(task_id, status, message.clone());
+                    let turns = value.get("turns").and_then(Value::as_u64);
+                    let snapshot = self.record_turn_end(task_id, status, message.clone(), turns);
                     let notification = serde_json::to_value(RpcNotification::new(
                         "turn.end",
                         json!({
@@ -1519,12 +1584,79 @@ impl Daemon {
                 "approval.request" => {
                     self.record_approval_request(task_id, &value);
                 }
+                "mode.updated" => {}
                 "pong" => {}
                 other => {
                     eprintln!("mskd task {task_id}: unknown protocol frame: {other}");
                 }
             }
         }
+    }
+
+    /// Changes the mode used by the next turn of an interactive session. The
+    /// agent process reloads its permitted tool set from the same modes file.
+    fn set_task_mode(&self, task_id: &str, requested: &str) -> Result<Value> {
+        let requested = requested.trim();
+        if requested.is_empty() {
+            bail!("mode is required");
+        }
+        let (input, goal) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("task map poisoned"))?;
+            let task = inner
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            if !task.interactive {
+                bail!("task {task_id} is not interactive");
+            }
+            match task.state {
+                TaskState::Done | TaskState::Failed | TaskState::Cancelled => {
+                    bail!("task {task_id} has exited");
+                }
+                TaskState::Running | TaskState::WaitingInput => {}
+            }
+            (task.input.clone(), task.goal.clone())
+        };
+        let decision = self
+            .modes
+            .resolve(requested, &goal)
+            .with_context(|| format!("resolve mode {requested}"))?;
+        let mode = decision.mode.clone();
+        let line = serde_json::to_string(&json!({"type": "mode", "mode": mode}))?;
+        let write_result = (|| -> Result<()> {
+            let mut slot = input
+                .lock()
+                .map_err(|_| anyhow::anyhow!("task input poisoned"))?;
+            let stdin = slot
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("task {task_id} stdin is not available"))?;
+            writeln!(stdin, "{line}")?;
+            stdin.flush()?;
+            Ok(())
+        })();
+        if let Err(err) = write_result {
+            self.set_state(task_id, TaskState::Failed, Some(err.to_string()));
+            return Err(err);
+        }
+        let snapshot = {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("task map poisoned"))?;
+            let task = inner
+                .tasks
+                .get_mut(task_id)
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            task.requested_mode = requested.to_string();
+            task.mode = mode.clone();
+            task.mode_reason = decision.reason;
+            task.snapshot()
+        };
+        self.broadcast_state(task_id, &snapshot);
+        Ok(snapshot)
     }
 
     fn interrupt_task(&self, task_id: &str) -> Result<Value> {
@@ -1665,7 +1797,8 @@ impl Daemon {
                 .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
             (task.snapshot(), task.dir.clone())
         };
-        let mut events = msk_events::read_events(dir.join("events.jsonl")).unwrap_or_default();
+        let (mut events, skipped) =
+            msk_events::read_events_lenient(dir.join("events.jsonl")).unwrap_or_default();
         let truncated = events.len() > limit;
         if truncated {
             events.drain(0..events.len() - limit);
@@ -1673,7 +1806,8 @@ impl Daemon {
         Ok(json!({
             "task": snapshot,
             "history": events,
-            "truncated": truncated
+            "truncated": truncated,
+            "skipped": skipped
         }))
     }
 
@@ -1689,11 +1823,13 @@ impl Daemon {
                 .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
             (task.snapshot(), task.dir.clone())
         };
-        let events = msk_events::read_events(dir.join("events.jsonl")).unwrap_or_default();
+        let (events, skipped) =
+            msk_events::read_events_lenient(dir.join("events.jsonl")).unwrap_or_default();
         let transcript = msk_kernel::replay::summarize(&events, Some(task_id), 8_000);
         Ok(json!({
             "task": snapshot,
             "events": events.len(),
+            "skipped": skipped,
             "transcript": transcript
         }))
     }
@@ -1703,6 +1839,7 @@ impl Daemon {
         task_id: &str,
         status: &str,
         message: Option<String>,
+        reported_turns: Option<u64>,
     ) -> Option<Value> {
         let snapshot = {
             let mut inner = self.inner.lock().ok()?;
@@ -1711,8 +1848,17 @@ impl Daemon {
                 TaskState::Done | TaskState::Failed | TaskState::Cancelled => return None,
                 TaskState::Running | TaskState::WaitingInput => {}
             }
-            task.turns += 1;
-            task.state = TaskState::WaitingInput;
+            // The event tailer also observes turn.end. Adopt the child counter
+            // instead of incrementing so the two paths cannot double-count.
+            task.turns = match reported_turns {
+                Some(turns) => task.turns.max(turns),
+                None => task.turns.saturating_add(1),
+            };
+            // A headless task is still executing its turn until the process
+            // exits; only interactive sessions become message-ready here.
+            if task.interactive {
+                task.state = TaskState::WaitingInput;
+            }
             if status == "awaiting_input" {
                 task.last_error = None;
             } else {
@@ -1872,7 +2018,12 @@ impl Daemon {
             };
             match inner.tasks.get_mut(task_id) {
                 Some(task) => {
-                    if task.state != TaskState::Cancelled {
+                    // A late approval or stdin write must not rewrite an
+                    // outcome the task already reached.
+                    if !matches!(
+                        task.state,
+                        TaskState::Done | TaskState::Failed | TaskState::Cancelled
+                    ) {
                         task.state = state;
                         if let Some(error) = error {
                             task.last_error = Some(error);
@@ -1921,10 +2072,33 @@ impl Daemon {
                                 .get("turn")
                                 .and_then(Value::as_u64)
                                 .unwrap_or_default();
+                            let status = event
+                                .data
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let message = event
+                                .data
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
                             if let Ok(mut inner) = self.inner.lock()
                                 && let Some(task) = inner.tasks.get_mut(task_id)
                             {
                                 task.turns = task.turns.max(turn);
+                                // The log is authoritative: keep the failure
+                                // reason even if the protocol frame is late.
+                                if matches!(
+                                    task.state,
+                                    TaskState::Running | TaskState::WaitingInput
+                                ) {
+                                    if status == "awaiting_input" {
+                                        task.last_error = None;
+                                    } else if let Some(message) = message {
+                                        task.last_error = Some(message);
+                                    }
+                                }
                             }
                         }
                         self.record_event(task_id, event);
@@ -2009,6 +2183,12 @@ impl Daemon {
                 .tasks
                 .get_mut(task_id)
                 .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            match task.state {
+                TaskState::Done | TaskState::Failed | TaskState::Cancelled => {
+                    return Ok(task.snapshot());
+                }
+                TaskState::Running | TaskState::WaitingInput => {}
+            }
             task.state = TaskState::Cancelled;
             (task.snapshot(), task.child.clone())
         };
@@ -2032,6 +2212,9 @@ impl Daemon {
                 Some(task) => {
                     if task.state != TaskState::Cancelled {
                         task.state = state;
+                    }
+                    if let Some(error) = &error {
+                        task.last_error = Some(error.clone());
                     }
                     task.snapshot()
                 }
@@ -2064,8 +2247,8 @@ impl Daemon {
             }));
         }
 
-        let cols = params.get("cols").and_then(Value::as_u64).unwrap_or(100) as u16;
-        let rows = params.get("rows").and_then(Value::as_u64).unwrap_or(30) as u16;
+        let cols = terminal_dimension(params.get("cols"), 100);
+        let rows = terminal_dimension(params.get("rows"), 30);
         let mut client: Box<dyn EnvTransport> = if let Some(url) = &self.envd_url {
             let ca_pem = match &self.envd_ca {
                 Some(path) => Some(
@@ -2213,11 +2396,13 @@ impl Daemon {
         let max_bytes = params
             .get("max_bytes")
             .and_then(Value::as_u64)
-            .unwrap_or(64 * 1024);
+            .unwrap_or(64 * 1024)
+            .clamp(1, 1024 * 1024);
         let timeout_ms = params
             .get("timeout_ms")
             .and_then(Value::as_u64)
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .min(300_000);
         let mut guard = self
             .terminal
             .lock()
@@ -2252,8 +2437,8 @@ impl Daemon {
             .and_then(Value::as_str)
             .context("session_id")?
             .to_string();
-        let cols = params.get("cols").and_then(Value::as_u64).context("cols")? as u16;
-        let rows = params.get("rows").and_then(Value::as_u64).context("rows")? as u16;
+        let cols = terminal_dimension(Some(params.get("cols").context("cols")?), 100);
+        let rows = terminal_dimension(Some(params.get("rows").context("rows")?), 30);
         let mut guard = self
             .terminal
             .lock()
@@ -2365,115 +2550,131 @@ fn handle_data_client(stream: Stream, daemon: Arc<Daemon>) -> Result<()> {
     let credit = Arc::new(Mutex::new(262_144u64));
     let stop = Arc::new(AtomicBool::new(false));
     let mut session_id: Option<String> = None;
+    let mut owns_active = false;
 
-    while let Some(frame) = DataFrame::decode(&mut reader, DATA_MAX_FRAME)? {
-        match frame.kind {
-            DataKind::Open => {
-                if session_id.is_some() {
-                    send_data_error(&writer, "stream already open");
-                    continue;
+    // Any early return (bad frame, envd failure, broken pipe) must still
+    // release the single-stream flag and close the terminal it opened;
+    // otherwise every later terminal connection is refused until restart.
+    let result = (|| -> Result<()> {
+        while let Some(frame) = DataFrame::decode(&mut reader, DATA_MAX_FRAME)? {
+            match frame.kind {
+                DataKind::Open => {
+                    if session_id.is_some() {
+                        send_data_error(&writer, "stream already open");
+                        continue;
+                    }
+                    if daemon.data_active.swap(true, Ordering::SeqCst) {
+                        send_data_error(&writer, "another terminal data stream is active");
+                        continue;
+                    }
+                    owns_active = true;
+                    let open = frame.json_value()?;
+                    let cols = terminal_dimension(open.get("cols"), 100);
+                    let rows = terminal_dimension(open.get("rows"), 30);
+                    let opened = daemon.terminal_open(&json!({"cols": cols, "rows": rows}))?;
+                    let sid = opened
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .context("terminal session_id")?
+                        .to_string();
+                    // Remember the session before writing anything else so a
+                    // failure below still closes it.
+                    session_id = Some(sid.clone());
+                    let ack = DataFrame::json(
+                        DataKind::OpenAck,
+                        1,
+                        &json!({
+                            "session_id": sid,
+                            "cols": terminal_dimension(opened.get("cols"), cols),
+                            "rows": terminal_dimension(opened.get("rows"), rows),
+                            "credits_initial": 262144
+                        }),
+                    )?;
+                    {
+                        let mut writer = writer
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("data writer poisoned"))?;
+                        write_frame(&mut *writer, &ack)?;
+                    }
+                    let pump_daemon = daemon.clone();
+                    let pump_writer = writer.clone();
+                    let pump_credit = credit.clone();
+                    let pump_stop = stop.clone();
+                    thread::spawn(move || {
+                        pump_terminal(pump_daemon, pump_writer, pump_credit, pump_stop, sid)
+                    });
                 }
-                if daemon.data_active.swap(true, Ordering::SeqCst) {
-                    send_data_error(&writer, "another terminal data stream is active");
-                    continue;
-                }
-                let open = frame.json_value()?;
-                let cols = open.get("cols").and_then(Value::as_u64).unwrap_or(100) as u16;
-                let rows = open.get("rows").and_then(Value::as_u64).unwrap_or(30) as u16;
-                let opened = daemon.terminal_open(&json!({"cols": cols, "rows": rows}))?;
-                let sid = opened
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .context("terminal session_id")?
-                    .to_string();
-                let ack = DataFrame::json(
-                    DataKind::OpenAck,
-                    1,
-                    &json!({
-                        "session_id": sid,
-                        "cols": cols,
-                        "rows": rows,
-                        "credits_initial": 262144
-                    }),
-                )?;
-                {
-                    let mut writer = writer
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("data writer poisoned"))?;
-                    write_frame(&mut *writer, &ack)?;
-                }
-                session_id = Some(sid.clone());
-                let pump_daemon = daemon.clone();
-                let pump_writer = writer.clone();
-                let pump_credit = credit.clone();
-                let pump_stop = stop.clone();
-                thread::spawn(move || {
-                    pump_terminal(pump_daemon, pump_writer, pump_credit, pump_stop, sid)
-                });
-            }
-            DataKind::Data => {
-                let Some(sid) = session_id.as_ref() else {
-                    send_data_error(&writer, "stream not open");
-                    continue;
-                };
-                let encoded = STANDARD.encode(&frame.payload);
-                if let Err(err) =
-                    daemon.terminal_write(&json!({"session_id": sid, "data_base64": encoded}))
-                {
-                    send_data_error(&writer, &err.to_string());
-                }
-            }
-            DataKind::Resize => {
-                let Some(sid) = session_id.as_ref() else {
-                    send_data_error(&writer, "stream not open");
-                    continue;
-                };
-                let value = frame.json_value()?;
-                let cols = value.get("cols").and_then(Value::as_u64).unwrap_or(100);
-                let rows = value.get("rows").and_then(Value::as_u64).unwrap_or(30);
-                if let Err(err) =
-                    daemon.terminal_resize(&json!({"session_id": sid, "cols": cols, "rows": rows}))
-                {
-                    send_data_error(&writer, &err.to_string());
-                }
-            }
-            DataKind::Credit => {
-                if frame.payload.len() == 8 {
-                    let amount = u64::from_be_bytes(frame.payload[..8].try_into().unwrap());
-                    if let Ok(mut credit) = credit.lock() {
-                        *credit = credit.saturating_add(amount);
+                DataKind::Data => {
+                    let Some(sid) = session_id.as_ref() else {
+                        send_data_error(&writer, "stream not open");
+                        continue;
+                    };
+                    let encoded = STANDARD.encode(&frame.payload);
+                    if let Err(err) =
+                        daemon.terminal_write(&json!({"session_id": sid, "data_base64": encoded}))
+                    {
+                        send_data_error(&writer, &err.to_string());
                     }
                 }
-            }
-            DataKind::Close => {
-                stop.store(true, Ordering::SeqCst);
-                daemon.data_active.store(false, Ordering::SeqCst);
-                if let Some(sid) = session_id.take() {
-                    let _ = daemon.terminal_close(&json!({"session_id": sid}));
+                DataKind::Resize => {
+                    let Some(sid) = session_id.as_ref() else {
+                        send_data_error(&writer, "stream not open");
+                        continue;
+                    };
+                    let value = frame.json_value()?;
+                    let cols = terminal_dimension(value.get("cols"), 100);
+                    let rows = terminal_dimension(value.get("rows"), 30);
+                    if let Err(err) = daemon
+                        .terminal_resize(&json!({"session_id": sid, "cols": cols, "rows": rows}))
+                    {
+                        send_data_error(&writer, &err.to_string());
+                    }
                 }
-                let close =
-                    DataFrame::json(DataKind::Close, 1, &json!({"reason": "server_close"}))?;
-                if let Ok(mut writer) = writer.lock() {
-                    let _ = write_frame(&mut *writer, &close);
+                DataKind::Credit => {
+                    if frame.payload.len() == 8 {
+                        let amount = u64::from_be_bytes(frame.payload[..8].try_into().unwrap());
+                        if let Ok(mut credit) = credit.lock() {
+                            *credit = credit.saturating_add(amount);
+                        }
+                    }
                 }
-                return Ok(());
-            }
-            DataKind::Ping => {
-                let pong = DataFrame::new(DataKind::Pong, 0, Vec::new());
-                if let Ok(mut writer) = writer.lock() {
-                    let _ = write_frame(&mut *writer, &pong);
+                DataKind::Close => {
+                    let close =
+                        DataFrame::json(DataKind::Close, 1, &json!({"reason": "server_close"}))?;
+                    if let Ok(mut writer) = writer.lock() {
+                        let _ = write_frame(&mut *writer, &close);
+                    }
+                    break;
                 }
+                DataKind::Ping => {
+                    let pong = DataFrame::new(DataKind::Pong, 0, Vec::new());
+                    if let Ok(mut writer) = writer.lock() {
+                        let _ = write_frame(&mut *writer, &pong);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
-    }
+        Ok(())
+    })();
 
     stop.store(true, Ordering::SeqCst);
-    daemon.data_active.store(false, Ordering::SeqCst);
+    if owns_active {
+        daemon.data_active.store(false, Ordering::SeqCst);
+    }
     if let Some(sid) = session_id {
         let _ = daemon.terminal_close(&json!({"session_id": sid}));
     }
-    Ok(())
+    result
+}
+
+/// Terminal geometry arrives as unbounded JSON numbers. Keep every value in
+/// the u16 range the PTY APIs accept instead of silently truncating.
+fn terminal_dimension(value: Option<&Value>, default: u16) -> u16 {
+    match value.and_then(Value::as_u64) {
+        Some(value) => value.clamp(1, 1000) as u16,
+        None => default,
+    }
 }
 
 fn pump_terminal(
@@ -2562,6 +2763,32 @@ fn token_eq(left: &str, right: &str) -> bool {
         difference |= left ^ right;
     }
     difference == 0
+}
+
+/// Last non-empty line of the agent's stderr log, used as a fallback failure
+/// reason when the child exits before emitting a protocol turn.end.
+fn last_log_line(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(8192);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    if start > 0
+        && let Some((_, rest)) = text.split_once('\n')
+    {
+        text = rest.to_string();
+    }
+    let line = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    if line.chars().count() <= 400 {
+        Some(line.to_string())
+    } else {
+        Some(format!("{}…", line.chars().take(400).collect::<String>()))
+    }
 }
 
 fn now_ms() -> u128 {

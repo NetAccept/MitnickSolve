@@ -208,6 +208,7 @@ impl EventSink for TaggedSink {
 
 enum SessionInput {
     User(String),
+    Mode(String),
     Interrupt,
     Ping,
     Shutdown,
@@ -372,6 +373,19 @@ fn spawn_stdin_reader(
                             let _ = tx.send(SessionInput::Invalid("empty user message".into()));
                         } else {
                             let _ = tx.send(SessionInput::User(text));
+                        }
+                    }
+                    "mode" => {
+                        let mode = value
+                            .get("mode")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
+                        if mode.is_empty() {
+                            let _ = tx.send(SessionInput::Invalid("empty mode".into()));
+                        } else {
+                            let _ = tx.send(SessionInput::Mode(mode));
                         }
                     }
                     "interrupt" => {
@@ -756,7 +770,7 @@ fn main() -> Result<()> {
         agent_depth: 0,
         task_id: cli.task_id.clone(),
         default_provider: "scripted".into(),
-        mode: "investigate".into(),
+        mode: Arc::new(Mutex::new("investigate".into())),
         modes: Arc::new(ModeRegistry::builtin()?),
         permission: PermissionMode::Bypass,
     });
@@ -798,7 +812,7 @@ fn main() -> Result<()> {
     let provider = build_provider(&cli, true)?;
     let mut response = complete_or_stream(
         provider.as_ref(),
-        &llm_request(&context, &registry),
+        &llm_request(&context, &registry, None),
         cli.stream,
         &mut |delta| {
             let LlmDelta::Text(text) = delta;
@@ -953,7 +967,7 @@ fn main() -> Result<()> {
 
         match complete_or_stream(
             provider.as_ref(),
-            &llm_request(&context, &registry),
+            &llm_request(&context, &registry, None),
             cli.stream,
             &mut |delta| {
                 let LlmDelta::Text(text) = delta;
@@ -1064,6 +1078,7 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
             json!({"mode": agent_mode, "requested": requested_mode, "permission": permission.as_str()}),
         )?;
     }
+    let current_mode = Arc::new(Mutex::new(agent_mode.clone()));
     let env_host = Arc::new(EnvHost {
         client,
         artifacts: object_store.clone(),
@@ -1072,12 +1087,21 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         agent_depth: cli.agent_depth,
         task_id: cli.task_id.clone(),
         default_provider: provider_kind_str(cli.provider).into(),
-        mode: agent_mode.clone(),
+        mode: current_mode.clone(),
         modes: modes.clone(),
         permission,
     });
     let host: Arc<dyn ToolHost> = env_host.clone();
-    let tool_names = modes.tool_names(&agent_mode);
+    // Load the union of tools used by any mode so a session can switch mode
+    // between turns. The session filters this registry by the active mode and
+    // rejects calls outside it.
+    let mut tool_names: Vec<&'static str> = modes
+        .modes()
+        .iter()
+        .flat_map(|spec| modes.tool_names(&spec.id))
+        .collect();
+    tool_names.sort_unstable();
+    tool_names.dedup();
     let registry_policy = policy::policy_for_permission(permission);
     let registry = load_registry_with_policy(
         &cli.tools_dir,
@@ -1203,6 +1227,9 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         provider,
         context,
         limits,
+        modes: Some(modes.clone()),
+        mode: agent_mode.clone(),
+        mode_handle: Some(current_mode),
         objects: object_store,
         sink: sink.clone(),
         max_steps: cli.max_steps,
@@ -1223,6 +1250,9 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
     )?;
 
     if cli.headless {
+        // Headless runs still accept approval responses (and a direct
+        // interactive y/n answer); the receiver is only used by that thread.
+        let _inputs = spawn_stdin_reader(session.cancel_token(), cli.stdio_json, gate.clone());
         let stdio = cli.stdio_json;
         let stream = cli.stream;
         let mut printed = false;
@@ -1254,6 +1284,7 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         } else if let Some(message) = outcome.message() {
             eprintln!("{}: {message}", outcome.status());
         }
+        let failure = outcome.message().map(str::to_string);
         env_host.shutdown();
         emit(
             sink.as_ref(),
@@ -1263,6 +1294,11 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
                 "messages": session.context().messages().len()
             }),
         )?;
+        // A one-shot run that failed or ran out of steps must exit non-zero so
+        // the daemon records the task as failed instead of done.
+        if let Some(message) = failure {
+            bail!("{message}");
+        }
         return Ok(());
     }
 
@@ -1278,6 +1314,28 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         };
         let text = match input {
             SessionInput::Shutdown => break,
+            SessionInput::Mode(mode) => {
+                match session.set_mode(&mode) {
+                    Ok(()) => {
+                        if cli.stdio_json {
+                            emit_protocol(json!({
+                                "type": "mode.updated",
+                                "mode": session.mode()
+                            }));
+                        } else {
+                            eprintln!("mode: {}", session.mode());
+                        }
+                    }
+                    Err(err) => {
+                        if cli.stdio_json {
+                            emit_protocol(json!({"type": "error", "message": err}));
+                        } else {
+                            eprintln!("mode switch: {err}");
+                        }
+                    }
+                }
+                continue;
+            }
             SessionInput::Interrupt => {
                 // The reader already set the token. If no turn was running,
                 // clear it so the next user message starts cleanly.

@@ -371,11 +371,20 @@ impl ModeRegistry {
     }
 
     pub fn load(root: &Path, explicit: Option<&Path>) -> Result<Self> {
-        let path = explicit
-            .map(Path::to_path_buf)
-            .or_else(|| std::env::var_os("MSK_MODES").map(PathBuf::from))
-            .unwrap_or_else(|| root.join("modes.json"));
+        // Only the implicit <root>/modes.json is optional. A path the caller
+        // named explicitly must exist; silently falling back to the built-in
+        // modes would ignore the configured tool and spawn policy.
+        let (path, required) = match explicit {
+            Some(path) => (path.to_path_buf(), true),
+            None => match std::env::var_os("MSK_MODES") {
+                Some(path) => (PathBuf::from(path), true),
+                None => (root.join("modes.json"), false),
+            },
+        };
         if !path.exists() {
+            if required {
+                bail!("modes file not found: {}", path.display());
+            }
             return Self::builtin();
         }
         let text = std::fs::read_to_string(&path)
@@ -718,6 +727,20 @@ mod tests {
     fn registry_with(json: &str) -> ModeRegistry {
         let file: ModesFile = serde_json::from_str(json).unwrap();
         ModeRegistry::from_file(file).unwrap()
+    }
+
+    #[test]
+    fn an_explicit_missing_modes_file_is_rejected() {
+        let missing = std::env::temp_dir().join(format!(
+            "msk-modes-missing-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        assert!(ModeRegistry::load(Path::new("."), Some(&missing)).is_err());
     }
 
     #[test]

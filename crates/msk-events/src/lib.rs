@@ -133,6 +133,33 @@ pub fn read_events(path: impl AsRef<Path>) -> Result<Vec<Event>, EventError> {
     Ok(events)
 }
 
+/// Read-only variant for frontends. A torn or corrupt line (for example after
+/// a crash mid-append) is counted and skipped instead of discarding every
+/// valid event that follows it. Replay and audit paths keep the strict reader.
+pub fn read_events_lenient(path: impl AsRef<Path>) -> Result<(Vec<Event>, usize), EventError> {
+    let path = path.as_ref();
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), 0));
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let mut events = Vec::new();
+    let mut skipped = 0usize;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str(&line) {
+            Ok(event) => events.push(event),
+            Err(_) => skipped += 1,
+        }
+    }
+    Ok((events, skipped))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssueSeverity {
     Error,
@@ -266,6 +293,24 @@ mod tests {
         let event: Event = serde_json::from_str(line).unwrap();
         assert_eq!(event.schema_version, SCHEMA_VERSION);
         assert_eq!(event.seq, 0);
+    }
+
+    #[test]
+    fn lenient_reader_skips_a_torn_line() {
+        let path =
+            std::env::temp_dir().join(format!("msk-events-lenient-{}.jsonl", Uuid::new_v4()));
+        let mut first = Event::new("a", "test", serde_json::json!({}));
+        first.seq = 1;
+        let text = format!(
+            "{}\n{{\"id\":\"torn",
+            serde_json::to_string(&first).unwrap()
+        );
+        std::fs::write(&path, text).unwrap();
+        let (events, skipped) = read_events_lenient(&path).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(skipped, 1);
+        assert!(read_events(&path).is_err());
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

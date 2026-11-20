@@ -85,6 +85,13 @@ enum Command {
     },
     /// Cooperatively interrupt the running turn of an interactive task.
     Interrupt { task: String },
+    /// Change the agent mode used by the next turn of an interactive task.
+    Mode {
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        mode: String,
+    },
     /// List pending approval requests.
     Approvals,
     /// Approve a pending request.
@@ -265,6 +272,11 @@ fn main() -> Result<()> {
         }
         Command::Interrupt { task } => {
             let result = client.request(methods::TASK_INTERRUPT, json!({"task_id": task}))?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::Mode { task, mode } => {
+            let result =
+                client.request(methods::TASK_MODE, json!({"task_id": task, "mode": mode}))?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Approvals => {

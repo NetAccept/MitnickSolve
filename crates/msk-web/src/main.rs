@@ -108,9 +108,10 @@ fn handle(mut request: Request, app: &App) {
             &[
                 (
                     "Content-Security-Policy",
-                    "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'",
+                    "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
                 ),
                 ("Referrer-Policy", "no-referrer"),
+                ("X-Frame-Options", "DENY"),
             ],
         );
         return;

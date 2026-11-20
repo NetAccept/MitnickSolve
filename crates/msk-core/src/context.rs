@@ -347,6 +347,12 @@ fn message_tokens(message: &ContextMessage) -> usize {
         tokens += approx_tokens(&call.id) + approx_tokens(&call.tool);
         tokens += approx_tokens(&call.args.to_string());
     }
+    for item in &message.provider_items {
+        tokens += approx_tokens(&item.to_string());
+    }
+    if let Some(tool) = &message.tool_name {
+        tokens += approx_tokens(tool);
+    }
     tokens
 }
 
@@ -385,6 +391,17 @@ mod tests {
         assert!(summary.starts_with("0123"));
         assert!(summary.ends_with("cdef"));
         assert!(summary.contains("chars omitted"));
+    }
+
+    #[test]
+    fn provider_items_count_toward_the_budget() {
+        let mut context = ContextManager::new(ContextLimits::default());
+        context.push_assistant_tool_calls(
+            "",
+            Vec::new(),
+            vec![serde_json::json!({"type": "reasoning", "summary": "x".repeat(400)})],
+        );
+        assert!(context.approx_tokens() >= 100);
     }
 
     #[test]

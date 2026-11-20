@@ -343,7 +343,10 @@ impl EnvDataClient {
     /// Returns up to `max_bytes`, collecting until the buffer is full, the
     /// stream closes, or the timeout expires.
     pub fn read(&mut self, max_bytes: usize, timeout: Duration) -> io::Result<Vec<u8>> {
-        let deadline = Instant::now() + timeout;
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(timeout)
+            .unwrap_or_else(|| now + Duration::from_secs(3600));
         while self.buffer.len() < max_bytes && !self.closed {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {

@@ -317,31 +317,33 @@ impl DataClient {
             .to_string();
         Ok(TerminalOpen {
             session_id,
-            cols: value
-                .get("cols")
-                .and_then(Value::as_u64)
-                .unwrap_or(cols as u64) as u16,
-            rows: value
-                .get("rows")
-                .and_then(Value::as_u64)
-                .unwrap_or(rows as u64) as u16,
+            cols: terminal_dimension(value.get("cols"), cols),
+            rows: terminal_dimension(value.get("rows"), rows),
         })
     }
 
     pub fn send_data(&self, bytes: &[u8]) -> io::Result<()> {
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
-        let frame = DataFrame {
-            kind: DataKind::Data,
-            flags: 0,
-            stream_id: self.stream_id,
-            seq,
-            payload: bytes.to_vec(),
-        };
+        if bytes.is_empty() {
+            return Ok(());
+        }
         let mut writer = self
             .writer
             .lock()
             .map_err(|_| io::Error::other("data writer poisoned"))?;
-        write_frame(&mut *writer, &frame)
+        // A single paste can exceed the frame cap; split it so one large
+        // input never poisons the stream.
+        for chunk in bytes.chunks(64 * 1024) {
+            let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+            let frame = DataFrame {
+                kind: DataKind::Data,
+                flags: 0,
+                stream_id: self.stream_id,
+                seq,
+                payload: chunk.to_vec(),
+            };
+            write_frame(&mut *writer, &frame)?;
+        }
+        Ok(())
     }
 
     pub fn credit(&self, bytes: usize) -> io::Result<()> {
@@ -397,6 +399,13 @@ impl DataClient {
 impl Drop for DataClient {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+fn terminal_dimension(value: Option<&Value>, default: u16) -> u16 {
+    match value.and_then(Value::as_u64) {
+        Some(value) => value.clamp(1, 1000) as u16,
+        None => default,
     }
 }
 

@@ -43,10 +43,13 @@ This is an actual `--snapshot` frame (120×40):
                          █   █   █     █   █   █   █   █     █  █      █ █   █ █      █ █  █
                          █   █ █████   █   █   █ █████  ████ █   █ ████   ███  █████   █   █████
 
-                                                      ~   scripted
+                                 authorized security & network operations workbench
+                            recon  ·  web  ·  forensics  ·  findings  ·  reports  ·  PTY
+
+                                       ~/.msk/workspace   scripted
 
                 ╭──────────────────────────────────────────────────────────────────────────────────────╮
-                │ Ask anything…  "inspect ./challenge and find the flag"                               │
+                │ ❯ Ask anything…  "inspect ./challenge and find the flag"                             │
                 │                                                                                      │
                 │  自 动  · scripted                                                                     │
                 ╰──────────────────────────────────────────────────────────────────────────────────────╯
@@ -68,12 +71,19 @@ This is an actual `--snapshot` frame (120×40):
 ```
 
 - The large wordmark is drawn from Unicode blocks with a left-to-right gradient.
-- The chips under it show the workspace, provider, model and effort.
+  Below it, a one-line positioning statement and capability strip summarize the
+  workbench; the chips show the workspace, provider, model and effort.
+- Below 80 columns, or when the terminal is short, the layout degrades to a
+  compact wordmark and skips the capability strip rather than dropping the
+  composer. At 80×24 the brand, tagline and status chips still fit.
 - The rounded composer is always the focused input. Just start typing; Enter
   sends. `Shift+Enter` inserts a newline, bracketed paste inserts whole scripts.
-- The leading slot of the composer shows the mode, then provider, model and
-  effort. The `try` card below it suggests starter prompts; `/demo` runs the
-  offline tool demo.
+- The composer uses a `❯` prompt. Its status line shows the mode, provider,
+  model and effort. The `try` card below suggests starter prompts; `/demo` runs
+  the offline tool demo.
+- The footer shows the workspace, permission posture, context tokens with a
+  small usage bar, tool count, a scrollback indicator and the version. Optional
+  items are dropped before the line is clipped or collides with the version.
 - `Tab` opens the session switcher, `Ctrl+N` starts a new session, `Ctrl+P`
   opens the command palette, `F1` shows every shortcut.
 - The footer shows the workspace, permission posture, context tokens, tool
@@ -213,45 +223,56 @@ replacing the conversation you are reading.
 ╰──────────────────────────────────────────────────────────────────────────╯
 ```
 
+## Language and settings
+
+`Ctrl+P` → **Language** (or `/language`) switches the interface between English,
+简体中文, 日本語, Español, Français and Deutsch. The choice is stored in
+`tui-config.json`; `MSK_LANG=zh-CN` overrides it for one run. Missing
+translations fall back to English. `Ctrl+P` → **Settings** (or `/settings`)
+groups language, permission mode, agent mode, provider profiles and the model
+wizard in one place.
+
 ## Conversation
 
 A real frame after a turn, with the session rail, status bar, role gutters,
 markdown rendering and the composer at the bottom:
 
 ```text
- ╭ sessions ──────────╮   ▌ Find the flag in ./challenge  ● ready                        scripted · - · effort default
+ ╭ sessions · 1 ──────╮   ▌ Find the flag in ./challenge  ● ready                        scripted · - · effort default
  │▌ ● Find the flag i…│   ────────────────────────────────────────────────────────────────────────────────────────────
- │                    │     Mitnick
- │＋  New session      │     ▸ env_create managed session
- │                    │     ✓ env_create
- │                    │
  │                    │     you
- │                    │   ❯ # Recon
+ │＋  New session      │   ❯ # Recon
  │                    │     - found **TLS** on `443`
  │                    │
  │                    │     Mitnick
- │                    │   │   echo: # Recon
- │                    │   │   • found TLS on 443
+ │                    │   │ echo: # Recon
+ │                    │   │ • found TLS on 443
  │                    │
  │                    │   ─────────────── ✓ turn complete · 10:28:07 · scripted · - · effort default ────────────────
  │                    │   ╭──────────────────────────────────────────────────────────────────────────────────────────╮
- │                    │   │ Reply…   Shift+Enter for a new line                                                      │
+ │                    │   │ ❯ Reply…   Shift+Enter for a new line                                                    │
  │                    │   │                                                                                          │
  │                    │   │  攻 击  · scripted                                                                         │
  │tab switch · ctrl+n │   ╰──────────────────────────────────────────────────────────────────────────────────────────╯
  ╰────────────────────╯                                        tab sessions   ctrl+n new   ctrl+p commands   F1 help
-  ~  ·  权 限  手 动   ·  ↑ scrollback · End follows                                                    MitnickSolve 0.1.6
+  ~  ·  权 限  手 动   ·  ctx 12.3k ▰▱▱▱▱▱▱▱  ·  tools 7                                              MitnickSolve 0.1.6
 ```
 
-- On wide terminals the left rail lists sessions; `▌` marks the open one and the
-  glyph shows its state. `＋ New session` sits below it.
+- On wide terminals the left rail lists sessions and the session count; `▌`
+  marks the open one and the glyph shows its state. `＋ New session` sits below.
 - Each turn starts with a small `you` or `Mitnick` label. Your messages sit on a
   tinted row with `❯`; Mitnick uses a `│` gutter and a small Markdown
-  renderer: headings, bullets, **bold**, `inline code` and fenced code blocks
-  are styled.
+  renderer: headings get a `▌` marker, bullets, **bold**, `inline code` and
+  fenced code blocks are styled.
 - Tool calls appear as `▸ tool summary` (the shell command, target, path or URL),
   with the matching `✓ tool` (green) or `✗ tool` (red) result immediately
-  below. Streaming text ends with a blinking block.
+  below. Results are compact and structured (`exit 0 · session-one · 3ms`,
+  `200 B · offset 200 · utf8`); long artifact/session hashes are shortened to
+  a recognizable prefix. Streaming text ends with a blinking block.
+- Approval events render inline as `⧗ approval requested · tool` and
+  `⧗ approval approved` / `⧗ approval denied` between the call and its result.
+  System lines do not break the Mitnick/tool grouping, so labels are not
+  repeated after every approval.
 - Every finished turn closes with a `✓ turn complete` rule showing the time,
   provider, model, effort and elapsed time. It is recorded in the event log, so
   reopening the session shows the same marker.
@@ -281,6 +302,7 @@ over the dimmed conversation:
 
             ╭ approval required · 1 of 1 · #1 ─────────────────────────────────────────────────────────────╮
             │tool  exec                                                                                    │
+            │task  run the approved command check                                                          │
             │why   execute a command                                                                       │
             │                                                                                              │
             │arguments                                                                                     │
@@ -345,12 +367,17 @@ running each line, and pasted text never triggers a shortcut.
 ## Agent modes
 
 `Ctrl+P` → **Agent mode** (or `/mode`) opens the mode picker. The mode is shown
-in exactly one place: the leading slot of the composer, where opencode shows
-`Build` — for example `自动 · openai · gpt-5 · effort high`. Enter saves the
-selected mode for the **next** session; it never replaces the session you are
-reading. The composer keeps showing the current session's mode. Press `Ctrl+N`
-to start a session with the new mode. The list comes from the daemon's
-`modes.json`, so custom modes appear automatically.
+in the leading slot of the composer — for example `自动 · openai · gpt-5 ·
+effort high`. Enter switches the mode used by the **next turn** of the open
+session: the conversation, context and environment stay, and the agent reloads
+that mode's tool set. With no open session, or after a session has finished, it
+saves the mode for the next session instead.
+
+Until the switch is acknowledged the composer keeps showing the current mode and
+adds a yellow `→ next` marker; the settings overlay shows both values, e.g.
+`计划 (当前 攻击)`. A successful switch writes a `mode.switch` event and notes it
+in the transcript. Press `Ctrl+N` to start a fresh session instead. The mode list
+comes from the daemon's `modes.json`, so custom modes appear automatically.
 
 The mode is a tool-level boundary, not a label: `plan`/`investigate` cannot call
 `exec`, `write_file`, `session_*`, `net_dial` or `archive_extract`, and subagents
@@ -363,7 +390,8 @@ definitions, the full matrix and auto-routing rules.
 `bypass`. This is separate from the agent mode: the agent mode decides which
 tools exist, the permission mode decides which calls pause for approval. The
 footer shows the current session's posture (`权限 自动`, `手动`, or `放行`).
-Changing it saves the posture for the next session; press `Ctrl+N` to start one.
+Changing it saves the posture for the next session; the footer then shows the
+pending value as `手动 → 放行`. Press `Ctrl+N` to start a session with it.
 See [`docs/permissions.md`](docs/permissions.md).
 
 ## Findings and reports

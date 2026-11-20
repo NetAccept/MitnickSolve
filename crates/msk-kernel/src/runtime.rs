@@ -2,7 +2,7 @@
 //! session engine. Keeping the host bridge and tool registry here means both
 //! paths exercise the same WASM/policy boundary.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -34,7 +34,7 @@ pub struct EnvHost {
     pub agent_depth: u32,
     pub task_id: Option<String>,
     pub default_provider: String,
-    pub mode: String,
+    pub mode: Arc<Mutex<String>>,
     pub modes: Arc<ModeRegistry>,
     pub permission: PermissionMode,
 }
@@ -269,6 +269,13 @@ fn http_request(
 }
 
 impl EnvHost {
+    fn current_mode(&self) -> String {
+        self.mode
+            .lock()
+            .map(|mode| mode.clone())
+            .unwrap_or_default()
+    }
+
     fn read_artifact(&self, input: &[u8]) -> Result<Vec<u8>, String> {
         let args: ReadArtifactArgs = serde_json::from_slice(input)
             .map_err(|err| format!("invalid artifact read input: {err}"))?;
@@ -441,17 +448,18 @@ impl ToolHost for EnvHost {
                     .and_then(Value::as_u64)
                     .unwrap_or(50_000)
                     .clamp(4_096, 1_000_000) as usize;
+                let current_mode = self.current_mode();
                 let child_mode = args
                     .get("mode")
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|mode| !mode.is_empty())
-                    .unwrap_or(&self.mode)
+                    .unwrap_or(current_mode.as_str())
                     .to_string();
-                if !self.modes.can_spawn(&self.mode, &child_mode) {
+                if !self.modes.can_spawn(&current_mode, &child_mode) {
                     return Err(format!(
                         "denied: {} mode cannot spawn a {} subagent",
-                        self.mode, child_mode
+                        current_mode, child_mode
                     ));
                 }
                 control.spawn_agent(
@@ -546,7 +554,8 @@ impl ToolHost for EnvHost {
                 return Err(format!("denied: {} not granted", capability.as_str()));
             }
         }
-        if ctx.tool == "web_request" && !self.modes.write_capable(&self.mode) {
+        let current_mode = self.current_mode();
+        if ctx.tool == "web_request" && !self.modes.write_capable(&current_mode) {
             let args: Value = serde_json::from_slice(input)
                 .map_err(|err| format!("invalid web request input: {err}"))?;
             let method = args
@@ -566,7 +575,7 @@ impl ToolHost for EnvHost {
             if !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") || has_body {
                 return Err(format!(
                     "denied: {} mode allows only GET/HEAD/OPTIONS web requests without a body",
-                    self.mode
+                    current_mode
                 ));
             }
         }
@@ -651,15 +660,20 @@ pub fn load_registry_with_policy(
 pub fn llm_request(
     context: &ContextManager,
     registry: &HashMap<String, RegisteredTool>,
+    allowed: Option<&HashSet<String>>,
 ) -> LlmRequest {
-    let tools = registry
+    let mut tools: Vec<ToolSchema> = registry
         .values()
+        .filter(|tool| allowed.is_none_or(|allowed| allowed.contains(&tool.manifest.name)))
         .map(|tool| ToolSchema {
             name: tool.manifest.name.clone(),
             description: tool.manifest.description.clone(),
             parameters: tool.manifest.input_schema.clone(),
         })
         .collect();
+    // HashMap iteration order is not stable across processes; a deterministic
+    // tool list keeps provider prompt caches useful and runs reproducible.
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
     LlmRequest {
         messages: context
             .messages()
@@ -781,6 +795,23 @@ fn clean_field(value: &str, max: usize) -> String {
     }
 }
 
+/// Multi-line text keeps paragraph breaks (evidence and code samples are
+/// more useful that way) while dropping control bytes that could rewrite a
+/// terminal or a Markdown report.
+fn clean_multiline(value: &str, max: usize) -> String {
+    let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+    let filtered: String = normalized
+        .chars()
+        .filter(|character| !character.is_control() || *character == '\n' || *character == '\t')
+        .collect();
+    let text = filtered.trim();
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        text.chars().take(max).collect()
+    }
+}
+
 fn optional_field(args: &Value, name: &str, max: usize) -> Option<String> {
     args.get(name)
         .and_then(Value::as_str)
@@ -816,7 +847,12 @@ fn add_finding(control: &ControlPlane, args: &Value) -> Result<Value, String> {
     }
     let asset = optional_field(args, "asset", 512).unwrap_or_default();
     let description = optional_field(args, "description", 8192).unwrap_or_default();
-    let evidence = optional_field(args, "evidence", 32768).unwrap_or_default();
+    let evidence = args
+        .get("evidence")
+        .and_then(Value::as_str)
+        .map(|value| clean_multiline(value, 32768))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
     let source = optional_field(args, "source", 200).unwrap_or_default();
     let tags: Vec<String> = args
         .get("tags")
@@ -1253,7 +1289,7 @@ mod tests {
                 agent_depth: 0,
                 task_id: None,
                 default_provider: "scripted".into(),
-                mode: "investigate".into(),
+                mode: Arc::new(Mutex::new("investigate".into())),
                 modes: Arc::new(ModeRegistry::builtin().unwrap()),
                 permission: PermissionMode::Bypass,
             },
@@ -1336,6 +1372,10 @@ mod tests {
     #[test]
     fn report_fields_are_sanitized() {
         assert_eq!(clean_field("  a\nb\tc  ", 200), "a b c");
+        assert_eq!(
+            clean_multiline("  GET /admin -> 200\r\nSet-Cookie: x  ", 200),
+            "GET /admin -> 200\nSet-Cookie: x"
+        );
         assert_eq!(severity_rank("critical"), 5);
         assert_eq!(severity_rank("info"), 1);
         assert_eq!(severity_rank("nope"), 0);

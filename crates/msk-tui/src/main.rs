@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
@@ -31,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use unicode_width::UnicodeWidthStr;
 
+mod i18n;
 mod setup;
 
 const MAX_EVENTS: usize = 5000;
@@ -47,100 +49,121 @@ const FAINT: Color = Color::Rgb(72, 72, 82);
 const GREEN: Color = Color::Rgb(74, 222, 128);
 const YELLOW: Color = Color::Rgb(250, 204, 21);
 const RED: Color = Color::Rgb(248, 113, 113);
+const AGENT: Color = Color::Rgb(165, 180, 252);
 const TOOL: Color = Color::Rgb(167, 139, 250);
 const USER_BG: Color = Color::Rgb(26, 28, 36);
 const ERR_BG: Color = Color::Rgb(42, 22, 26);
 
 struct CommandEntry {
-    label: &'static str,
-    hint: &'static str,
+    label_key: &'static str,
+    hint_key: &'static str,
     command: &'static str,
+}
+
+impl CommandEntry {
+    fn label(&self) -> &'static str {
+        i18n::t(self.label_key)
+    }
+
+    fn hint(&self) -> &'static str {
+        i18n::t(self.hint_key)
+    }
 }
 
 const COMMANDS: &[CommandEntry] = &[
     CommandEntry {
-        label: "New session",
-        hint: "start a fresh conversation (ctrl+n)",
+        label_key: "cmd.new.label",
+        hint_key: "cmd.new.hint",
         command: "/new",
     },
     CommandEntry {
-        label: "Sessions",
-        hint: "switch to another session (tab)",
+        label_key: "cmd.sessions.label",
+        hint_key: "cmd.sessions.hint",
         command: "/sessions",
     },
     CommandEntry {
-        label: "Resume latest",
-        hint: "restore the newest checkpoint",
+        label_key: "cmd.resume.label",
+        hint_key: "cmd.resume.hint",
         command: "/resume",
     },
     CommandEntry {
-        label: "Providers",
-        hint: "saved provider profiles and API keys",
+        label_key: "cmd.providers.label",
+        hint_key: "cmd.providers.hint",
         command: "/providers",
     },
     CommandEntry {
-        label: "Provider and model",
-        hint: "choose provider, model, effort, key",
+        label_key: "cmd.setup.label",
+        hint_key: "cmd.setup.hint",
         command: "/setup",
     },
     CommandEntry {
-        label: "Model",
-        hint: "pick a model preset",
+        label_key: "cmd.models.label",
+        hint_key: "cmd.models.hint",
         command: "/models",
     },
     CommandEntry {
-        label: "Reasoning effort",
-        hint: "minimal, low, medium, high",
+        label_key: "cmd.effort.label",
+        hint_key: "cmd.effort.hint",
         command: "/effort",
     },
     CommandEntry {
-        label: "Agent mode",
-        hint: "plan, investigate, exploit, harden, auto",
+        label_key: "cmd.mode.label",
+        hint_key: "cmd.mode.hint",
         command: "/mode",
     },
     CommandEntry {
-        label: "Permission mode",
-        hint: "auto, manual, bypass",
+        label_key: "cmd.permissions.label",
+        hint_key: "cmd.permissions.hint",
         command: "/permissions",
     },
     CommandEntry {
-        label: "Offline demo",
-        hint: "run a canned tool session",
+        label_key: "cmd.settings.label",
+        hint_key: "cmd.settings.hint",
+        command: "/settings",
+    },
+    CommandEntry {
+        label_key: "cmd.language.label",
+        hint_key: "cmd.language.hint",
+        command: "/language",
+    },
+    CommandEntry {
+        label_key: "cmd.demo.label",
+        hint_key: "cmd.demo.hint",
         command: "/demo",
     },
     CommandEntry {
-        label: "Terminal",
-        hint: "open the PTY workspace",
+        label_key: "cmd.terminal.label",
+        hint_key: "cmd.terminal.hint",
         command: "/terminal",
     },
     CommandEntry {
-        label: "Event inspector",
-        hint: "show the raw event stream",
+        label_key: "cmd.events.label",
+        hint_key: "cmd.events.hint",
         command: "/events",
     },
     CommandEntry {
-        label: "Pending approvals",
-        hint: "check queued tool approvals",
+        label_key: "cmd.approvals.label",
+        hint_key: "cmd.approvals.hint",
         command: "/approvals",
     },
     CommandEntry {
-        label: "Assessment findings",
-        hint: "review severity-ranked findings",
+        label_key: "cmd.findings.label",
+        hint_key: "cmd.findings.hint",
         command: "/findings",
     },
     CommandEntry {
-        label: "Clear transcript",
-        hint: "hide messages in this view",
+        label_key: "cmd.clear.label",
+        hint_key: "cmd.clear.hint",
         command: "/clear",
     },
     CommandEntry {
-        label: "Keyboard shortcuts",
-        hint: "open the help overlay",
+        label_key: "cmd.help.label",
+        hint_key: "cmd.help.hint",
         command: "/help",
     },
     CommandEntry {
-        label: "Quit",
-        hint: "leave MitnickSolve",
+        label_key: "cmd.quit.label",
+        hint_key: "cmd.quit.hint",
         command: "/quit",
     },
 ];
@@ -271,14 +294,7 @@ const SERVICE_PRESETS: &[(&str, &str, &str, &str)] = &[
     ),
     ("custom", "Custom endpoint", "", ""),
 ];
-const PERMISSIONS: &[(&str, &str)] = &[
-    (
-        "auto",
-        "自动：写入/扫描/HTTP 自动放行，命令和原始连接需审批",
-    ),
-    ("manual", "手动：所有受控工具都询问"),
-    ("bypass", "放行：不弹审批；硬性策略拒绝仍然有效"),
-];
+const PERMISSIONS: &[&str] = &["auto", "manual", "bypass"];
 
 #[derive(Debug, Clone, Deserialize)]
 struct ModeInfo {
@@ -337,16 +353,12 @@ fn default_permission() -> String {
 fn permission_index(permission: &str) -> usize {
     PERMISSIONS
         .iter()
-        .position(|(id, _)| *id == permission)
+        .position(|id| *id == permission)
         .unwrap_or(0)
 }
 
-fn permission_label(permission: &str) -> &'static str {
-    match permission {
-        "manual" => "手动",
-        "bypass" => "放行",
-        _ => "自动",
-    }
+fn permission_label(permission: &str) -> String {
+    i18n::permission_label(permission)
 }
 
 fn permission_color(permission: &str) -> Color {
@@ -386,6 +398,8 @@ struct TuiConfig {
     api_key: String,
     #[serde(default)]
     profiles: Vec<ProviderProfile>,
+    #[serde(default = "default_language")]
+    language: String,
 }
 
 impl Default for TuiConfig {
@@ -399,8 +413,13 @@ impl Default for TuiConfig {
             permission: default_permission(),
             api_key: String::new(),
             profiles: Vec::new(),
+            language: default_language(),
         }
     }
+}
+
+fn default_language() -> String {
+    i18n::Language::detect().id().to_string()
 }
 
 impl TuiConfig {
@@ -698,13 +717,13 @@ fn markdown_lite(text: &str) -> Vec<Line<'static>> {
         let trimmed = raw.trim_start();
         if let Some(language) = trimmed.strip_prefix("```") {
             if in_code {
-                lines.push(Line::from(Span::styled("  ╰─", Style::default().fg(FAINT))));
+                lines.push(Line::from(Span::styled("╰─", Style::default().fg(FAINT))));
                 in_code = false;
             } else {
                 let label = language.trim();
                 let label = if label.is_empty() { "code" } else { label };
                 lines.push(Line::from(Span::styled(
-                    format!("  ╭─ {label}"),
+                    format!("╭─ {label}"),
                     Style::default().fg(DIM),
                 )));
                 in_code = true;
@@ -713,7 +732,7 @@ fn markdown_lite(text: &str) -> Vec<Line<'static>> {
         }
         if in_code {
             lines.push(Line::from(vec![
-                Span::styled("  │ ", Style::default().fg(FAINT)),
+                Span::styled("│ ", Style::default().fg(FAINT)),
                 Span::styled(
                     raw.to_string(),
                     Style::default().fg(Color::Rgb(205, 210, 220)).bg(PANEL),
@@ -728,7 +747,7 @@ fn markdown_lite(text: &str) -> Vec<Line<'static>> {
         let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
         if hashes > 0 && trimmed[hashes..].starts_with(' ') {
             lines.push(Line::from(vec![
-                Span::styled("  ", body),
+                Span::styled("▌ ", Style::default().fg(ACCENT)),
                 Span::styled(
                     trimmed[hashes + 1..].to_string(),
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -740,7 +759,7 @@ fn markdown_lite(text: &str) -> Vec<Line<'static>> {
             .strip_prefix("- ")
             .or_else(|| trimmed.strip_prefix("* "))
         {
-            let mut spans = vec![Span::styled("  • ", Style::default().fg(ACCENT))];
+            let mut spans = vec![Span::styled("• ", Style::default().fg(ACCENT))];
             spans.extend(inline_spans(item, body));
             lines.push(Line::from(spans));
             continue;
@@ -748,7 +767,7 @@ fn markdown_lite(text: &str) -> Vec<Line<'static>> {
         let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
         if digits > 0 && trimmed[digits..].starts_with(". ") {
             let mut spans = vec![Span::styled(
-                format!("  {} ", &trimmed[..digits]),
+                format!("{}. ", &trimmed[..digits]),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )];
             spans.extend(inline_spans(&trimmed[digits + 2..], body));
@@ -756,17 +775,18 @@ fn markdown_lite(text: &str) -> Vec<Line<'static>> {
             continue;
         }
         if let Some(quote) = trimmed.strip_prefix("> ") {
-            let mut spans = vec![Span::styled("  │ ", Style::default().fg(FAINT))];
-            spans.extend(inline_spans(quote, Style::default().fg(DIM)));
+            let mut spans = vec![Span::styled("▏ ", Style::default().fg(FAINT))];
+            spans.extend(inline_spans(
+                quote,
+                Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+            ));
             lines.push(Line::from(spans));
             continue;
         }
-        let mut spans = vec![Span::styled("  ", body)];
-        spans.extend(inline_spans(raw, body));
-        lines.push(Line::from(spans));
+        lines.push(Line::from(inline_spans(raw, body)));
     }
     if in_code {
-        lines.push(Line::from(Span::styled("  ╰─", Style::default().fg(FAINT))));
+        lines.push(Line::from(Span::styled("╰─", Style::default().fg(FAINT))));
     }
     lines
 }
@@ -788,7 +808,7 @@ fn chat_lines(line: &ChatLine, width: u16, show_label: bool) -> Vec<Line<'static
     match line.role {
         ChatRole::User => {
             rendered.push(Line::from(Span::styled(
-                "  you",
+                format!("  {}", i18n::t("role.you")),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )));
             for (index, part) in parts.iter().enumerate() {
@@ -798,9 +818,13 @@ fn chat_lines(line: &ChatLine, width: u16, show_label: bool) -> Vec<Line<'static
                     Span::styled((*part).to_string(), Style::default().fg(TEXT).bg(USER_BG)),
                 ];
                 let used = 2 + UnicodeWidthStr::width(*part);
-                if (used as u16) < width {
+                // A compact bubble reads better than a full-width band; keep
+                // two cells of right padding and let the rest of the row show
+                // the normal transcript background.
+                let target = used.saturating_add(2).min(width as usize);
+                if target > used {
                     spans.push(Span::styled(
-                        " ".repeat(width as usize - used),
+                        " ".repeat(target - used),
                         Style::default().bg(USER_BG),
                     ));
                 }
@@ -811,7 +835,7 @@ fn chat_lines(line: &ChatLine, width: u16, show_label: bool) -> Vec<Line<'static
             if show_label {
                 rendered.push(Line::from(Span::styled(
                     "  Mitnick",
-                    Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+                    Style::default().fg(AGENT).add_modifier(Modifier::BOLD),
                 )));
             }
             let markdown = markdown_lite(&line.text);
@@ -829,7 +853,7 @@ fn chat_lines(line: &ChatLine, width: u16, show_label: bool) -> Vec<Line<'static
             if show_label {
                 rendered.push(Line::from(Span::styled(
                     "  Mitnick",
-                    Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+                    Style::default().fg(AGENT).add_modifier(Modifier::BOLD),
                 )));
             }
             let first = line.text.chars().next().unwrap_or('·');
@@ -841,14 +865,21 @@ fn chat_lines(line: &ChatLine, width: u16, show_label: bool) -> Vec<Line<'static
             };
             let body = line.text[first.len_utf8()..].trim_start();
             let (name, detail) = body.split_once(' ').unwrap_or((body, ""));
-            rendered.push(Line::from(vec![
+            let name_color = if first == '✗' { RED } else { TEXT };
+            let mut spans = vec![
                 Span::styled(format!("  {first} "), Style::default().fg(color)),
                 Span::styled(
                     name.to_string(),
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(name_color).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!(" {detail}"), Style::default().fg(DIM)),
-            ]));
+            ];
+            if !detail.trim().is_empty() {
+                spans.push(Span::styled(
+                    format!("  {}", detail.trim()),
+                    Style::default().fg(DIM),
+                ));
+            }
+            rendered.push(Line::from(spans));
         }
         ChatRole::Meta => {
             let label = format!(" ✓ {} ", truncate(&line.text, width as usize));
@@ -866,37 +897,53 @@ fn chat_lines(line: &ChatLine, width: u16, show_label: bool) -> Vec<Line<'static
             }
         }
         ChatRole::System => {
-            let is_error = line.text.starts_with('✗');
-            for (index, part) in parts.iter().enumerate() {
-                if is_error && index == 0 {
-                    rendered.push(Line::from(vec![
-                        Span::styled("  ▌ ", Style::default().fg(RED)),
-                        Span::styled(
-                            (*part).to_string(),
-                            Style::default()
-                                .fg(RED)
-                                .bg(ERR_BG)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
+            if let Some(rest) = line.text.strip_prefix("⧗ ") {
+                let color = if rest.contains("denied") {
+                    RED
+                } else if rest.contains("approved") {
+                    GREEN
                 } else {
-                    rendered.push(Line::from(Span::styled(
-                        format!("    {part}"),
-                        Style::default().fg(FAINT).add_modifier(Modifier::ITALIC),
-                    )));
+                    YELLOW
+                };
+                rendered.push(Line::from(vec![
+                    Span::styled("  ⧗ ", Style::default().fg(color)),
+                    Span::styled(rest.to_string(), Style::default().fg(color)),
+                ]));
+            } else {
+                let is_error = line.text.starts_with('✗');
+                for (index, part) in parts.iter().enumerate() {
+                    if is_error && index == 0 {
+                        rendered.push(Line::from(vec![
+                            Span::styled("  ▌ ", Style::default().fg(RED)),
+                            Span::styled(
+                                (*part).to_string(),
+                                Style::default()
+                                    .fg(RED)
+                                    .bg(ERR_BG)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                    } else {
+                        rendered.push(Line::from(Span::styled(
+                            format!("    {part}"),
+                            Style::default().fg(FAINT).add_modifier(Modifier::ITALIC),
+                        )));
+                    }
                 }
             }
         }
     }
-    if !(line.role == ChatRole::Tool && line.text.starts_with('▸')) {
+    let inline = (line.role == ChatRole::Tool && line.text.starts_with('▸'))
+        || (line.role == ChatRole::System && line.text.starts_with('⧗'));
+    if !inline {
         rendered.push(Line::from(""));
     }
     rendered
 }
 
-fn group_label_needed(previous: Option<&ChatGroup>, role: ChatRole) -> bool {
+fn group_label_needed(previous: Option<ChatRole>, role: ChatRole) -> bool {
     matches!(role, ChatRole::Assistant | ChatRole::Tool)
-        && !previous.is_some_and(|group| matches!(group.role, ChatRole::Assistant | ChatRole::Tool))
+        && !previous.is_some_and(|role| matches!(role, ChatRole::Assistant | ChatRole::Tool))
 }
 
 fn build_chat_group(line: &ChatLine, width: u16, show_label: bool) -> ChatGroup {
@@ -920,8 +967,15 @@ fn build_chat_group(line: &ChatLine, width: u16, show_label: bool) -> ChatGroup 
 
 fn build_chat_groups(selected: &[&ChatLine], width: u16) -> Vec<ChatGroup> {
     let mut groups: Vec<ChatGroup> = Vec::with_capacity(selected.len());
+    let mut last_content: Option<ChatRole> = None;
     for line in selected {
-        let show_label = group_label_needed(groups.last(), line.role);
+        let show_label = group_label_needed(last_content, line.role);
+        if matches!(
+            line.role,
+            ChatRole::User | ChatRole::Assistant | ChatRole::Tool
+        ) {
+            last_content = Some(line.role);
+        }
         groups.push(build_chat_group(line, width, show_label));
     }
     groups
@@ -951,15 +1005,18 @@ fn turn_error_text(status: &str, message: &str) -> String {
     }
     let mut text = format!("✗ {}", truncate(&detail, 400));
     if message.contains("function arguments") || message.contains("tool arguments") {
-        text.push_str("\nprovider returned incomplete tool arguments · retry the turn");
+        text.push('\n');
+        text.push_str(i18n::t("chat.hint.tool_args"));
     } else if message.contains("reasoning_text") || message.contains("thinking mode") {
-        text.push_str("\nreasoning context was rejected · retry, or start a fresh session");
+        text.push('\n');
+        text.push_str(i18n::t("chat.hint.reasoning"));
     } else if message.contains("LLM call failed")
         || message.contains("model_not_found")
         || message.contains("HTTP 4")
         || message.contains("HTTP 5")
     {
-        text.push_str("\ncheck the model id and endpoint · ctrl+p providers");
+        text.push('\n');
+        text.push_str(i18n::t("chat.hint.check_model"));
     }
     text
 }
@@ -993,6 +1050,7 @@ struct ChatGroup {
 struct TranscriptCache {
     task: String,
     width: u16,
+    revision: u64,
     groups: Vec<ChatGroup>,
     prefix: Vec<usize>,
 }
@@ -1002,10 +1060,15 @@ fn append_agent_text(chat: &mut Vec<ChatLine>, task_id: &str, text: &str, delta:
         return;
     }
     if delta {
-        if let Some(line) = chat.iter_mut().rev().find(|line| {
-            line.task_id == task_id && line.role == ChatRole::Assistant && line.streaming
-        }) {
-            line.text.push_str(text);
+        // Only extend the assistant line if it is still the newest line for
+        // this task. Text that arrives after a tool call belongs to a new
+        // model step, not to the paragraph before the tool ran.
+        let last = chat.iter().rposition(|line| line.task_id == task_id);
+        if let Some(index) = last
+            && chat[index].role == ChatRole::Assistant
+            && chat[index].streaming
+        {
+            chat[index].text.push_str(text);
         } else {
             chat.push(ChatLine {
                 task_id: task_id.to_string(),
@@ -1025,10 +1088,9 @@ fn append_agent_text(chat: &mut Vec<ChatLine>, task_id: &str, text: &str, delta:
 }
 
 fn finish_streaming(chat: &mut [ChatLine], task_id: &str) {
-    if let Some(line) = chat
+    for line in chat
         .iter_mut()
-        .rev()
-        .find(|line| line.task_id == task_id && line.role == ChatRole::Assistant && line.streaming)
+        .filter(|line| line.task_id == task_id && line.role == ChatRole::Assistant)
     {
         line.streaming = false;
     }
@@ -1038,7 +1100,7 @@ fn finish_streaming(chat: &mut [ChatLine], task_id: &str) {
 #[command(
     name = "msk-tui",
     version,
-    about = "MitnickSolve interactive CTF agent"
+    about = "interactive security and network operations workbench"
 )]
 struct Cli {
     /// Read a JSONL event log instead of opening the conversational daemon.
@@ -1086,6 +1148,12 @@ struct Cli {
     /// Diagnostic: render the permission picker in a snapshot.
     #[arg(long, hide = true)]
     snapshot_permissions: bool,
+    /// Diagnostic: render the settings overlay in a snapshot.
+    #[arg(long, hide = true)]
+    snapshot_settings: bool,
+    /// Diagnostic: render the language picker in a snapshot.
+    #[arg(long, hide = true)]
+    snapshot_language: bool,
     /// Print environment/daemon diagnostics and exit.
     #[arg(long)]
     doctor: bool,
@@ -1436,33 +1504,20 @@ impl App {
             let area = centered_rect(64, 56, frame.area());
             frame.render_widget(Clear, area);
             let help = Paragraph::new(
-                "MitnickSolve conversational workbench
+                "MitnickSolve event viewer
 
-                 Enter / i  write a message, or describe a new challenge
-                 Enter      send / start the task
-                 Esc        leave the editor without sending
-                 ← / →      move the input cursor
-                 Ctrl+U     clear the input
-                 PgUp/PgDn  scroll the conversation
-                 v          toggle the raw event inspector
-                 End        jump to the newest message
-                 j / k      previous / next session
-                 g / G      first / last session
-                 n          start a new session
-                 s          interrupt the running turn
-                 x          cancel the selected task
-                 t          open/focus the PTY terminal
-                 Ctrl+Q     detach from terminal focus
-                 y / n      approve / deny a pending request
-                 ?          toggle this help
                  q          quit
+                 j / k      move the selection
+                 g / G      first / last event
+                 tab        cycle the log filter
+                 1 - 5      All / LLM / Tools / Artifacts / Context
+                 /          search (Enter applies, Esc clears)
+                 f          follow the newest event
+                 r          reload the log from disk
+                 ?          toggle this help
 
-                 Slash commands in the editor:
-                 /new [goal]  /provider NAME  /terminal  /approvals
-                 /interrupt  /cancel  /clear  /status  /help  /quit
-
-                 Providers: scripted, scripted-demo, openai, responses, component.
-                 ◆ marks an interactive task; tool calls appear inline in the conversation.",
+                 The log is read-only. Run msk-tui without --events for the
+                 conversational workbench.",
             )
             .block(Block::default().borders(Borders::ALL).title("help"))
             .wrap(Wrap { trim: false });
@@ -1547,6 +1602,14 @@ struct DaemonApp {
     auto_scroll: bool,
     transcript_loaded: Option<String>,
     transcript_cache: RefCell<TranscriptCache>,
+    language: i18n::Language,
+    show_settings: bool,
+    settings_selection: usize,
+    show_language: bool,
+    language_selection: usize,
+    chat_revision: u64,
+    events_epoch: Cell<u64>,
+    usage_cache: RefCell<Option<(String, u64, (u64, usize))>>,
     input_history: Vec<String>,
     history_index: Option<usize>,
     show_events: bool,
@@ -1557,6 +1620,7 @@ struct DaemonApp {
     findings: Vec<Value>,
     show_findings: bool,
     findings_scroll: usize,
+    findings_max_scroll: Cell<usize>,
     show_modes: bool,
     mode_selection: usize,
     show_permissions: bool,
@@ -1601,10 +1665,16 @@ impl DaemonApp {
         client.subscribe(None)?;
         let configured = root.join("tui-config.json").exists();
         let mut config = TuiConfig::load(&root);
+        let language = std::env::var("MSK_LANG")
+            .ok()
+            .and_then(|value| i18n::Language::parse(&value))
+            .or_else(|| i18n::Language::parse(&config.language))
+            .unwrap_or_else(i18n::Language::detect);
+        i18n::set_language(language);
         if !modes.iter().any(|mode| mode.id == config.mode) {
             config.mode = default_mode();
         }
-        if !PERMISSIONS.iter().any(|(id, _)| *id == config.permission) {
+        if !PERMISSIONS.contains(&config.permission.as_str()) {
             config.permission = default_permission();
         }
         if let Some(provider) = provider {
@@ -1684,6 +1754,14 @@ impl DaemonApp {
             auto_scroll: true,
             transcript_loaded: None,
             transcript_cache: RefCell::new(TranscriptCache::default()),
+            language,
+            show_settings: false,
+            settings_selection: 0,
+            show_language: false,
+            language_selection: 0,
+            chat_revision: 0,
+            events_epoch: Cell::new(0),
+            usage_cache: RefCell::new(None),
             input_history: Vec::new(),
             history_index: None,
             show_events: false,
@@ -1694,6 +1772,7 @@ impl DaemonApp {
             findings: Vec::new(),
             show_findings: false,
             findings_scroll: 0,
+            findings_max_scroll: Cell::new(0),
             show_modes: false,
             mode_selection: 0,
             show_permissions: false,
@@ -1764,6 +1843,7 @@ impl DaemonApp {
             permission: self.permission.clone(),
             api_key: self.api_key.clone(),
             profiles: self.profiles.clone(),
+            language: self.language.id().to_string(),
         };
         if let Err(err) = config.save(&self.root) {
             self.status = format!("save config failed: {err}");
@@ -1828,7 +1908,9 @@ impl DaemonApp {
                                 self.selected_task_id().as_deref() == Some(task_id.as_str());
                             if selected {
                                 match event.kind.as_str() {
-                                    "tool.call" => {
+                                    "tool.call" if event.actor == "agent" => {
+                                        finish_streaming(&mut self.chat, &task_id);
+                                        self.touch_chat();
                                         let tool = event
                                             .data
                                             .get("tool")
@@ -1836,33 +1918,91 @@ impl DaemonApp {
                                             .unwrap_or("tool");
                                         let args =
                                             event.data.get("args").cloned().unwrap_or(Value::Null);
-                                        self.chat.push(ChatLine {
+                                        self.push_chat(ChatLine {
                                             task_id: task_id.clone(),
                                             role: ChatRole::Tool,
                                             text: format!("▸ {tool} {}", tool_summary(tool, &args)),
                                             streaming: false,
                                         });
                                     }
-                                    "tool.result" => {
+                                    "tool.result" if event.actor == "agent" => {
+                                        finish_streaming(&mut self.chat, &task_id);
+                                        self.touch_chat();
                                         let tool = event
                                             .data
                                             .get("tool")
                                             .and_then(Value::as_str)
                                             .unwrap_or("tool");
-                                        let ok = !event
+                                        let ok = event
                                             .data
-                                            .get("is_error")
+                                            .get("ok")
                                             .and_then(Value::as_bool)
-                                            .unwrap_or(false);
+                                            .unwrap_or(true)
+                                            && !event
+                                                .data
+                                                .get("is_error")
+                                                .and_then(Value::as_bool)
+                                                .unwrap_or(false);
                                         let mut text =
                                             format!("{} {tool}", if ok { "✓" } else { "✗" });
-                                        if let Some(summary) = observation_summary(&event.data) {
+                                        if let Some(artifact) =
+                                            event.data.get("artifact").and_then(Value::as_str)
+                                        {
+                                            text.push_str(&format!(
+                                                "  artifact {}",
+                                                short_id(artifact)
+                                            ));
+                                            if let Some(bytes) = artifact_bytes(&event.data) {
+                                                text.push_str(&format!(" · {bytes} B"));
+                                            }
+                                        } else if let Some(summary) =
+                                            observation_summary(tool, &event.data)
+                                        {
                                             text.push_str(&format!("  {summary}"));
                                         }
-                                        self.chat.push(ChatLine {
+                                        self.push_chat(ChatLine {
                                             task_id: task_id.clone(),
                                             role: ChatRole::Tool,
                                             text,
+                                            streaming: false,
+                                        });
+                                    }
+                                    "mode.switch" if event.actor == "agent" => {
+                                        let mode = event
+                                            .data
+                                            .get("mode")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or_default();
+                                        self.push_chat(ChatLine {
+                                            task_id: task_id.clone(),
+                                            role: ChatRole::System,
+                                            text: format!(
+                                                "⧗ {}",
+                                                i18n::tf(
+                                                    "modes.switched",
+                                                    &[&self.mode_label(mode)]
+                                                )
+                                            ),
+                                            streaming: false,
+                                        });
+                                    }
+                                    "tool.error" if event.actor == "agent" => {
+                                        finish_streaming(&mut self.chat, &task_id);
+                                        self.touch_chat();
+                                        let tool = event
+                                            .data
+                                            .get("tool")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("tool");
+                                        let error = event
+                                            .data
+                                            .get("error")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("tool failed");
+                                        self.push_chat(ChatLine {
+                                            task_id: task_id.clone(),
+                                            role: ChatRole::Tool,
+                                            text: format!("✗ {tool}  {error}"),
                                             streaming: false,
                                         });
                                     }
@@ -1892,6 +2032,7 @@ impl DaemonApp {
                         }
                         if finished {
                             finish_streaming(&mut self.chat, task_id);
+                            self.touch_chat();
                             self.approvals.retain(|approval| {
                                 approval.get("task_id").and_then(Value::as_str) != Some(task_id)
                             });
@@ -1929,15 +2070,68 @@ impl DaemonApp {
                         if !duplicate {
                             self.approvals.push(pending.clone());
                             self.status = "approval requested".into();
+                            let task_id = pending.get("task_id").and_then(Value::as_str);
+                            if task_id.is_some() && self.selected_task_id().as_deref() == task_id {
+                                let tool = pending
+                                    .get("tool")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("tool");
+                                self.push_chat(ChatLine {
+                                    task_id: task_id.unwrap_or_default().to_string(),
+                                    role: ChatRole::System,
+                                    text: format!("⧗ {}", i18n::tf("approval.requested", &[tool])),
+                                    streaming: false,
+                                });
+                                self.trim_chat();
+                            }
                         }
                     }
                 }
                 Some("approval.resolved") => {
                     if let Some(resolved) = value.get("params") {
+                        let tool = self
+                            .approvals
+                            .iter()
+                            .find(|approval| {
+                                approval.get("task_id") == resolved.get("task_id")
+                                    && approval.get("id") == resolved.get("id")
+                            })
+                            .and_then(|approval| approval.get("tool"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
                         self.approvals.retain(|approval| {
                             approval.get("task_id") != resolved.get("task_id")
                                 || approval.get("id") != resolved.get("id")
                         });
+                        if let Some(approved) = resolved.get("approved").and_then(Value::as_bool)
+                            && resolved
+                                .get("task_id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|task| {
+                                    self.selected_task_id().as_deref() == Some(task)
+                                })
+                        {
+                            let outcome = if approved {
+                                i18n::t("approval.approved")
+                            } else {
+                                i18n::t("approval.denied")
+                            };
+                            let note = match &tool {
+                                Some(tool) => format!("⧗ {outcome} · {tool}"),
+                                None => format!("⧗ {outcome}"),
+                            };
+                            self.push_chat(ChatLine {
+                                task_id: resolved
+                                    .get("task_id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                role: ChatRole::System,
+                                text: note,
+                                streaming: false,
+                            });
+                            self.trim_chat();
+                        }
                     }
                 }
                 Some("task.message") => {
@@ -1949,7 +2143,7 @@ impl DaemonApp {
                         .to_string();
                     let text = params.get("text").and_then(Value::as_str).unwrap_or("");
                     if !task_id.is_empty() && !text.is_empty() {
-                        self.chat.push(ChatLine {
+                        self.push_chat(ChatLine {
                             task_id,
                             role: ChatRole::User,
                             text: text.to_string(),
@@ -1971,6 +2165,7 @@ impl DaemonApp {
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
                     append_agent_text(&mut self.chat, &task_id, text, delta);
+                    self.touch_chat();
                     self.trim_chat();
                 }
                 Some("turn.end") => {
@@ -1985,6 +2180,7 @@ impl DaemonApp {
                         .and_then(Value::as_str)
                         .unwrap_or("awaiting_input");
                     finish_streaming(&mut self.chat, &task_id);
+                    self.touch_chat();
                     self.approvals.retain(|approval| {
                         approval.get("task_id").and_then(Value::as_str) != Some(task_id.as_str())
                     });
@@ -2077,6 +2273,9 @@ impl DaemonApp {
             self.last_refresh = Instant::now();
         }
         self.flush_pending_initial();
+        if changed {
+            self.touch_events();
+        }
         Ok(changed)
     }
 
@@ -2085,7 +2284,7 @@ impl DaemonApp {
         match event.kind.as_str() {
             "turn.start" => {
                 if let Some(user) = data.get("user").and_then(Value::as_str) {
-                    self.chat.push(ChatLine {
+                    self.push_chat(ChatLine {
                         task_id: task_id.to_string(),
                         role: ChatRole::User,
                         text: user.to_string(),
@@ -2097,7 +2296,7 @@ impl DaemonApp {
                 if let Some(text) = data.get("text").and_then(Value::as_str)
                     && !text.is_empty()
                 {
-                    self.chat.push(ChatLine {
+                    self.push_chat(ChatLine {
                         task_id: task_id.to_string(),
                         role: ChatRole::Assistant,
                         text: text.to_string(),
@@ -2106,9 +2305,12 @@ impl DaemonApp {
                 }
             }
             "tool.call" => {
+                if event.actor != "agent" {
+                    return;
+                }
                 let tool = data.get("tool").and_then(Value::as_str).unwrap_or("tool");
                 let args = data.get("args").cloned().unwrap_or(Value::Null);
-                self.chat.push(ChatLine {
+                self.push_chat(ChatLine {
                     task_id: task_id.to_string(),
                     role: ChatRole::Tool,
                     text: format!("▸ {tool} {}", tool_summary(tool, &args)),
@@ -2116,21 +2318,44 @@ impl DaemonApp {
                 });
             }
             "tool.result" => {
+                if event.actor != "agent" {
+                    return;
+                }
                 let tool = data.get("tool").and_then(Value::as_str).unwrap_or("tool");
                 let failed = data
                     .get("is_error")
                     .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    || data.get("ok").and_then(Value::as_bool) == Some(false);
                 let mut text = format!("{} {tool}", if failed { "✗" } else { "✓" });
                 if let Some(artifact) = data.get("artifact").and_then(Value::as_str) {
-                    text.push_str(&format!("  artifact {artifact}"));
-                } else if let Some(summary) = observation_summary(data) {
+                    text.push_str(&format!("  artifact {}", short_id(artifact)));
+                    if let Some(bytes) = artifact_bytes(data) {
+                        text.push_str(&format!(" · {bytes} B"));
+                    }
+                } else if let Some(summary) = observation_summary(tool, data) {
                     text.push_str(&format!("  {summary}"));
                 }
-                self.chat.push(ChatLine {
+                self.push_chat(ChatLine {
                     task_id: task_id.to_string(),
                     role: ChatRole::Tool,
                     text,
+                    streaming: false,
+                });
+            }
+            "tool.error" => {
+                if event.actor != "agent" {
+                    return;
+                }
+                let tool = data.get("tool").and_then(Value::as_str).unwrap_or("tool");
+                let error = data
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool failed");
+                self.push_chat(ChatLine {
+                    task_id: task_id.to_string(),
+                    role: ChatRole::Tool,
+                    text: format!("✗ {tool}  {error}"),
                     streaming: false,
                 });
             }
@@ -2141,7 +2366,7 @@ impl DaemonApp {
                         .get("message")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    self.chat.push(ChatLine {
+                    self.push_chat(ChatLine {
                         task_id: task_id.to_string(),
                         role: ChatRole::System,
                         text: turn_error_text(status, message),
@@ -2170,13 +2395,15 @@ impl DaemonApp {
                         .unwrap_or("default")
                         .to_string();
                     let mut text = format!(
-                        "turn complete · {} · {provider} · {model} · effort {effort}",
-                        short_time(&event.ts)
+                        "{} · {} · {provider} · {model} · {}",
+                        i18n::t("chat.turn_complete"),
+                        short_time(&event.ts),
+                        i18n::tf("chat.effort", &[&i18n::effort_label(&effort)])
                     );
                     if let Some(ms) = data.get("duration_ms").and_then(Value::as_u64) {
                         text.push_str(&format!(" · {:.1}s", ms as f64 / 1000.0));
                     }
-                    self.chat.push(ChatLine {
+                    self.push_chat(ChatLine {
                         task_id: task_id.to_string(),
                         role: ChatRole::Meta,
                         text,
@@ -2184,12 +2411,43 @@ impl DaemonApp {
                     });
                 }
             }
-            "approval.request" => {
-                let tool = data.get("tool").and_then(Value::as_str).unwrap_or("tool");
-                self.chat.push(ChatLine {
+            "mode.switch" => {
+                let mode = data.get("mode").and_then(Value::as_str).unwrap_or_default();
+                self.push_chat(ChatLine {
                     task_id: task_id.to_string(),
                     role: ChatRole::System,
-                    text: format!("approval requested: {tool}"),
+                    text: format!(
+                        "⧗ {}",
+                        i18n::tf("modes.switched", &[&self.mode_label(mode)])
+                    ),
+                    streaming: false,
+                });
+            }
+            "approval.request" => {
+                let tool = data.get("tool").and_then(Value::as_str).unwrap_or("tool");
+                self.push_chat(ChatLine {
+                    task_id: task_id.to_string(),
+                    role: ChatRole::System,
+                    text: format!("⧗ {}", i18n::tf("approval.requested", &[tool])),
+                    streaming: false,
+                });
+            }
+            "approval.result" => {
+                let approved = data
+                    .get("approved")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.push_chat(ChatLine {
+                    task_id: task_id.to_string(),
+                    role: ChatRole::System,
+                    text: format!(
+                        "⧗ {}",
+                        if approved {
+                            i18n::t("approval.approved")
+                        } else {
+                            i18n::t("approval.denied")
+                        }
+                    ),
                     streaming: false,
                 });
             }
@@ -2222,12 +2480,33 @@ impl DaemonApp {
             None
         };
         self.chat.retain(|line| line.task_id != task_id);
+        self.touch_chat();
         if let Some(history) = result.get("history").and_then(Value::as_array) {
+            let mut known: HashSet<String> = self
+                .events
+                .iter()
+                .filter(|(id, _)| id == task_id)
+                .map(|(_, event)| event.id.clone())
+                .collect();
             for event in history {
                 if let Ok(event) = serde_json::from_value::<Event>(event.clone()) {
+                    // The event inspector and footer usage should include the
+                    // recorded history of an opened session, not just events
+                    // that arrive after this client connected.
+                    if known.insert(event.id.clone()) {
+                        self.events.push((task_id.to_string(), event.clone()));
+                    }
                     self.append_history_event(task_id, &event);
                 }
             }
+            // Merge live and recorded history in sequence order so the event
+            // inspector and the footer usage read the newest context state.
+            self.events.sort_by_key(|(_, event)| event.seq);
+            if self.events.len() > MAX_EVENTS {
+                let excess = self.events.len() - MAX_EVENTS;
+                self.events.drain(0..excess);
+            }
+            self.touch_events();
             self.trim_chat();
             self.transcript_loaded = Some(task_id.to_string());
             match previous_scroll {
@@ -2261,7 +2540,7 @@ impl DaemonApp {
             } else {
                 (ChatRole::System, raw.to_string())
             };
-            self.chat.push(ChatLine {
+            self.push_chat(ChatLine {
                 task_id: task_id.to_string(),
                 role,
                 text,
@@ -2287,7 +2566,11 @@ impl DaemonApp {
         } else {
             (self.selected_task + 1).min(self.tasks.len())
         };
-        self.status = "sessions · ↑/↓ select · Enter open · n new · Esc close".into();
+        self.status = format!(
+            "{} · {}",
+            i18n::t("sessions.title"),
+            i18n::t("sessions.keys")
+        );
     }
 
     fn toggle_sessions(&mut self) {
@@ -2426,6 +2709,13 @@ impl DaemonApp {
         let Some(task_id) = self.selected_task_id() else {
             return (0, 0);
         };
+        let epoch = self.events_epoch.get();
+        if let Some((cached_task, cached_epoch, usage)) = self.usage_cache.borrow().as_ref()
+            && cached_task == &task_id
+            && *cached_epoch == epoch
+        {
+            return *usage;
+        }
         let mut tokens = 0;
         let mut tools = 0;
         for (id, event) in &self.events {
@@ -2442,7 +2732,13 @@ impl DaemonApp {
                 _ => {}
             }
         }
+        *self.usage_cache.borrow_mut() = Some((task_id, epoch, (tokens, tools)));
         (tokens, tools)
+    }
+
+    fn touch_events(&self) {
+        self.events_epoch
+            .set(self.events_epoch.get().wrapping_add(1));
     }
 
     fn selected_task_title(&self) -> String {
@@ -2477,6 +2773,17 @@ impl DaemonApp {
             .to_string()
     }
 
+    /// The mode the session was requested with. This may differ from the
+    /// resolved `mode` when auto routing picked a concrete mode.
+    fn selected_requested_mode(&self) -> String {
+        self.tasks
+            .get(self.selected_task)
+            .and_then(|task| task.get("requested_mode"))
+            .and_then(Value::as_str)
+            .unwrap_or(&self.mode)
+            .to_string()
+    }
+
     fn display_mode(&self) -> String {
         if self.new_task || self.selected_task_id().is_none() {
             self.mode.clone()
@@ -2489,37 +2796,63 @@ impl DaemonApp {
     /// replace the session the user is reading.
     fn announce_provider_saved(&mut self) {
         if self.selected_task_id().is_some() && !self.new_task {
-            self.status = format!(
-                "provider for next session: {} · current stays {} · ctrl+n starts it",
-                self.provider,
-                self.display_provider()
+            self.status = i18n::tf(
+                "providers.next_current",
+                &[&self.provider, &self.display_provider()],
             );
         } else {
-            self.status = format!("next session provider: {}", self.provider);
+            self.status = i18n::tf("providers.next", &[&self.provider]);
+        }
+    }
+
+    fn apply_mode_to_session(&mut self, requested: &str) -> bool {
+        let Some(task_id) = self.selected_task_id() else {
+            return false;
+        };
+        if self.new_task || !matches!(self.selected_state(), "running" | "waiting_input") {
+            return false;
+        }
+        match self.client.request_with_timeout(
+            methods::TASK_MODE,
+            json!({"task_id": task_id, "mode": requested}),
+            Duration::from_secs(5),
+        ) {
+            Ok(snapshot) => {
+                if let Some(existing) = self.tasks.iter_mut().find(|task| {
+                    task.get("task_id").and_then(Value::as_str) == Some(task_id.as_str())
+                }) {
+                    *existing = snapshot;
+                }
+                self.mode = requested.to_string();
+                self.save_config();
+                let resolved = self.selected_mode();
+                self.status = i18n::tf("modes.applied", &[&self.mode_label(&resolved)]);
+                true
+            }
+            Err(err) => {
+                self.status = format!("mode switch failed: {err}");
+                false
+            }
         }
     }
 
     fn announce_mode_saved(&mut self) {
+        let pending = self.mode_label(&self.mode);
         if self.new_task || self.selected_task_id().is_none() {
-            self.status = format!("next session mode: {}", self.mode);
+            self.status = i18n::tf("modes.next", &[&pending]);
         } else {
-            self.status = format!(
-                "mode for next session: {} · current stays {} · ctrl+n starts it",
-                self.mode,
-                self.selected_mode()
-            );
+            let current = self.mode_label(&self.selected_mode());
+            self.status = i18n::tf("modes.next_current", &[&pending, &current]);
         }
     }
 
     fn announce_permission_saved(&mut self) {
+        let pending = permission_label(&self.permission);
         if self.new_task || self.selected_task_id().is_none() {
-            self.status = format!("next session permission: {}", self.permission);
+            self.status = i18n::tf("permissions.next", &[&pending]);
         } else {
-            self.status = format!(
-                "permission for next session: {} · current stays {} · ctrl+n starts it",
-                self.permission,
-                self.display_permission()
-            );
+            let current = permission_label(&self.display_permission());
+            self.status = i18n::tf("permissions.next_current", &[&pending, &current]);
         }
     }
 
@@ -2529,14 +2862,12 @@ impl DaemonApp {
         let next = (index + delta).rem_euclid(length) as usize;
         self.effort = EFFORTS[next].0.to_string();
         self.save_config();
+        let pending = i18n::effort_label(&self.effort);
         if self.new_task || self.selected_task_id().is_none() {
-            self.status = format!("next session effort: {}", self.effort);
+            self.status = i18n::tf("effort.next", &[&pending]);
         } else {
-            self.status = format!(
-                "effort for next session: {} · current stays {} · ctrl+n starts it",
-                self.effort,
-                self.display_effort()
-            );
+            let current = i18n::effort_label(&self.display_effort());
+            self.status = i18n::tf("effort.next_current", &[&pending, &current]);
         }
     }
 
@@ -2591,6 +2922,9 @@ impl DaemonApp {
     }
 
     fn mode_label(&self, mode: &str) -> String {
+        if let Some(label) = i18n::mode_label(mode) {
+            return label.to_string();
+        }
         self.modes
             .iter()
             .find(|entry| entry.id == mode)
@@ -2612,10 +2946,20 @@ impl DaemonApp {
             .map(|entry| entry.id.clone())
     }
 
+    fn touch_chat(&mut self) {
+        self.chat_revision = self.chat_revision.wrapping_add(1);
+    }
+
+    fn push_chat(&mut self, line: ChatLine) {
+        self.chat.push(line);
+        self.chat_revision = self.chat_revision.wrapping_add(1);
+    }
+
     fn trim_chat(&mut self) {
         if self.chat.len() > MAX_CHAT_LINES {
             let excess = self.chat.len() - MAX_CHAT_LINES;
             self.chat.drain(0..excess);
+            self.touch_chat();
         }
     }
 
@@ -2676,6 +3020,7 @@ impl DaemonApp {
             "/models" | "/model" if argument.is_empty() => self.open_setup_at(SetupStep::Model),
             "/model" => {
                 self.model = argument.to_string();
+                self.save_config();
                 self.status = format!("next session model: {}", self.model);
             }
             "/effort" if argument.is_empty() => self.open_setup_at(SetupStep::Effort),
@@ -2700,9 +3045,11 @@ impl DaemonApp {
             }
             "/mode" => {
                 if let Some(mode) = self.find_mode(argument) {
-                    self.mode = mode;
-                    self.save_config();
-                    self.announce_mode_saved();
+                    if !self.apply_mode_to_session(&mode) {
+                        self.mode = mode;
+                        self.save_config();
+                        self.announce_mode_saved();
+                    }
                 } else {
                     self.status = "unknown mode; open /mode to list configured modes".into();
                 }
@@ -2714,15 +3061,28 @@ impl DaemonApp {
             }
             "/permissions" => {
                 let value = argument.trim();
-                let found = PERMISSIONS.iter().find(|(id, _)| {
-                    id.eq_ignore_ascii_case(value) || permission_label(id) == value
+                let found = PERMISSIONS.iter().find(|id| {
+                    id.eq_ignore_ascii_case(value)
+                        || i18n::permission_label(id).eq_ignore_ascii_case(value)
                 });
-                if let Some((id, _)) = found {
+                if let Some(id) = found {
                     self.permission = (*id).to_string();
                     self.save_config();
                     self.announce_permission_saved();
                 } else {
                     self.status = "usage: /permissions auto|manual|bypass".into();
+                }
+            }
+            "/settings" => self.open_settings(),
+            "/language" if argument.is_empty() => self.open_language(),
+            "/language" => {
+                if let Some(language) = i18n::Language::parse(argument) {
+                    self.apply_language(language);
+                } else {
+                    self.status = format!(
+                        "{}: en, zh-CN, ja, es, fr, de",
+                        i18n::t("settings.language")
+                    );
                 }
             }
             "/demo" => {
@@ -2762,8 +3122,9 @@ impl DaemonApp {
                     self.show_findings = true;
                     self.findings_scroll = 0;
                     self.status = format!(
-                        "{} finding(s) · j/k scroll · r reload · Esc close",
-                        self.findings.len()
+                        "{} · {}",
+                        i18n::tf("findings.count", &[&self.findings.len().to_string()]),
+                        i18n::t("findings.keys")
                     );
                 }
                 Err(err) => self.status = format!("findings failed: {err}"),
@@ -2789,6 +3150,7 @@ impl DaemonApp {
             "/clear" => {
                 if let Some(task_id) = self.selected_task_id() {
                     self.chat.retain(|line| line.task_id != task_id);
+                    self.touch_chat();
                 }
                 self.status = "conversation cleared".into();
             }
@@ -3052,7 +3414,7 @@ impl DaemonApp {
                 self.new_task = true;
             }
         }
-        self.input_cursor = self.input_cursor.min(self.input.len());
+        self.input_cursor = char_boundary_at_or_before(&self.input, self.input_cursor);
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         self.input.insert_str(self.input_cursor, &normalized);
         self.input_cursor += normalized.len();
@@ -3061,7 +3423,7 @@ impl DaemonApp {
     }
 
     fn compose_key(&mut self, key: KeyEvent) -> bool {
-        self.input_cursor = self.input_cursor.min(self.input.len());
+        self.input_cursor = char_boundary_at_or_before(&self.input, self.input_cursor);
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => {
@@ -3166,7 +3528,7 @@ impl DaemonApp {
     fn open_palette(&mut self) {
         self.composing = false;
         self.palette = Some(PaletteState::default());
-        self.status = "commands · type to filter · Enter run · Esc close".into();
+        self.status = i18n::t("palette.status").to_string();
     }
 
     fn palette_key(&mut self, key: KeyEvent) -> bool {
@@ -3255,18 +3617,119 @@ impl DaemonApp {
                 self.findings_scroll = self
                     .findings_scroll
                     .saturating_add(1)
-                    .min(self.findings.len().saturating_sub(1));
+                    .min(self.findings_max_scroll.get());
             }
             KeyCode::Home | KeyCode::Char('g') => self.findings_scroll = 0,
             KeyCode::End | KeyCode::Char('G') => {
-                self.findings_scroll = self.findings.len().saturating_sub(1);
+                self.findings_scroll = self.findings_max_scroll.get();
             }
             KeyCode::Char('r') => match self.load_findings() {
                 Ok(()) => {
-                    self.status = format!("{} finding(s)", self.findings.len());
+                    self.status = i18n::tf("findings.count", &[&self.findings.len().to_string()]);
                 }
                 Err(err) => self.status = format!("findings failed: {err}"),
             },
+            _ => {}
+        }
+        false
+    }
+
+    fn open_settings(&mut self) {
+        self.composing = false;
+        self.show_language = false;
+        self.show_settings = true;
+        self.settings_selection = 0;
+        self.status = i18n::t("settings.keys").to_string();
+    }
+
+    fn open_language(&mut self) {
+        self.composing = false;
+        self.show_language = true;
+        self.language_selection = self.language.index();
+    }
+
+    fn apply_language(&mut self, language: i18n::Language) {
+        self.language = language;
+        i18n::set_language(language);
+        self.language_selection = language.index();
+        self.show_language = false;
+        self.save_config();
+        self.touch_chat();
+        if let Some(task_id) = self.selected_task_id() {
+            self.load_transcript(&task_id);
+        }
+        self.status = if self.show_settings {
+            i18n::t("settings.keys").to_string()
+        } else {
+            String::new()
+        };
+    }
+
+    fn settings_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                self.show_settings = false;
+                self.status.clear();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.settings_selection = self.settings_selection.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.settings_selection = (self.settings_selection + 1).min(4);
+            }
+            KeyCode::Enter => match self.settings_selection {
+                0 => {
+                    self.show_language = true;
+                    self.language_selection = self.language.index();
+                }
+                1 => {
+                    self.show_settings = false;
+                    self.permission_selection = permission_index(&self.permission);
+                    self.show_permissions = true;
+                }
+                2 => {
+                    self.show_settings = false;
+                    self.mode_selection = self.mode_index(&self.mode);
+                    self.show_modes = true;
+                }
+                3 => {
+                    self.show_settings = false;
+                    self.open_providers();
+                }
+                4 => {
+                    self.show_settings = false;
+                    self.open_setup();
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        false
+    }
+
+    fn language_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                self.show_language = false;
+                if self.show_settings {
+                    self.status = i18n::t("settings.keys").to_string();
+                } else {
+                    self.status.clear();
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.language_selection = self.language_selection.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.language_selection =
+                    (self.language_selection + 1).min(i18n::ALL.len().saturating_sub(1));
+            }
+            KeyCode::Enter => {
+                let index = self
+                    .language_selection
+                    .min(i18n::ALL.len().saturating_sub(1));
+                self.apply_language(i18n::ALL[index]);
+            }
             _ => {}
         }
         false
@@ -3295,11 +3758,11 @@ impl DaemonApp {
             .unwrap_or(0)
             .min(self.profiles.len().saturating_sub(1));
         self.status = if self.profiles.is_empty() {
-            "no saved providers · n add one".into()
+            i18n::t("providers.none").into()
         } else {
             format!(
-                "{} provider profile(s) · Enter use · n new · e edit · d delete",
-                self.profiles.len()
+                "{}",
+                i18n::tf("providers.count", &[&self.profiles.len().to_string()])
             )
         };
     }
@@ -3330,14 +3793,11 @@ impl DaemonApp {
             profile.name.clone()
         };
         if requires_key(&self.provider) && !self.has_llm_key() {
-            self.status = format!("{name} selected · API key missing · e to edit");
+            self.status = i18n::tf("providers.selected_missing", &[&name]);
         } else if self.selected_task_id().is_some() && !self.new_task {
-            self.status = format!(
-                "provider for next session: {name} · current stays {} · ctrl+n starts it",
-                self.display_provider()
-            );
+            self.status = i18n::tf("providers.next_current", &[&name, &self.display_provider()]);
         } else {
-            self.status = format!("next session provider: {name}");
+            self.status = i18n::tf("providers.next", &[&name]);
         }
     }
 
@@ -3408,7 +3868,7 @@ impl DaemonApp {
                 } else {
                     self.provider_delete_armed = Some(index);
                     let name = self.profiles[index].name.clone();
-                    self.status = format!("press d again to delete {name}");
+                    self.status = i18n::tf("providers.delete_armed", &[&name]);
                 }
             }
             _ => {
@@ -3435,9 +3895,13 @@ impl DaemonApp {
                 self.mode_selection = (self.mode_selection + 1).min(self.modes.len() - 1);
             }
             KeyCode::Enter => {
-                self.mode = self.modes[self.mode_selection].id.clone();
-                self.save_config();
+                let requested = self.modes[self.mode_selection].id.clone();
                 self.show_modes = false;
+                if self.apply_mode_to_session(&requested) {
+                    return false;
+                }
+                self.mode = requested;
+                self.save_config();
                 self.announce_mode_saved();
             }
             _ => {}
@@ -3459,7 +3923,7 @@ impl DaemonApp {
                     (self.permission_selection + 1).min(PERMISSIONS.len() - 1);
             }
             KeyCode::Enter => {
-                self.permission = PERMISSIONS[self.permission_selection].0.to_string();
+                self.permission = PERMISSIONS[self.permission_selection].to_string();
                 self.save_config();
                 self.show_permissions = false;
                 self.announce_permission_saved();
@@ -3510,6 +3974,14 @@ impl DaemonApp {
                 _ => {}
             }
             return false;
+        }
+
+        if self.show_language {
+            return self.language_key(key);
+        }
+
+        if self.show_settings {
+            return self.settings_key(key);
         }
 
         if self.show_findings {
@@ -3624,7 +4096,7 @@ impl DaemonApp {
             Duration::from_secs(5),
         ) {
             Ok(_) => {
-                self.chat.push(ChatLine {
+                self.push_chat(ChatLine {
                     task_id: task_id.clone(),
                     role: ChatRole::System,
                     text: "[cancelled]".into(),
@@ -3677,7 +4149,7 @@ impl DaemonApp {
         if !self.composing {
             return 5;
         }
-        let lines = self.input.matches('\n').count() as u16 + 1;
+        let lines = self.input.matches('\n').count().saturating_add(1).min(8) as u16;
         (lines + 4).clamp(5, 12)
     }
 
@@ -3808,6 +4280,8 @@ impl DaemonApp {
             && !self.show_modes
             && !self.show_providers
             && !self.show_permissions
+            && !self.show_settings
+            && !self.show_language
             && !self.show_help;
         let modal = !focused;
         if !modal {
@@ -3852,6 +4326,12 @@ impl DaemonApp {
         if self.show_permissions {
             self.draw_permissions(frame, area);
         }
+        if self.show_settings {
+            self.draw_settings(frame, area);
+        }
+        if self.show_language {
+            self.draw_language(frame, area);
+        }
         if self.setup.is_some() {
             self.draw_setup(frame);
         }
@@ -3861,26 +4341,87 @@ impl DaemonApp {
     }
 
     fn draw_home(&self, frame: &mut ratatui::Frame, area: Rect, input_area: Rect) {
-        let mark = wordmark(area.width);
-        let mark_height = mark.len() as u16;
-        let group = mark_height + 3;
-        if input_area.y <= area.y + group {
+        let available = input_area.y.saturating_sub(area.y);
+        let full_mark = wordmark(area.width);
+        let full_height = full_mark.len() as u16;
+        let full = available >= full_height + 6;
+        let compact = !full && available >= 5;
+        if !full && !compact {
             return;
         }
-        let mark_y = input_area.y.saturating_sub(group).max(area.y);
-        if mark_y + mark_height >= input_area.y {
-            return;
-        }
-        let mark_area = Rect {
-            x: area.x,
-            y: mark_y,
-            width: area.width,
-            height: mark_height,
+
+        let chip_y = if full {
+            let mark_y = input_area.y.saturating_sub(full_height + 6);
+            frame.render_widget(
+                Paragraph::new(Text::from(full_mark)).alignment(Alignment::Center),
+                Rect {
+                    x: area.x,
+                    y: mark_y,
+                    width: area.width,
+                    height: full_height,
+                },
+            );
+            let tagline_y = mark_y + full_height + 1;
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    truncate(i18n::t("app.tagline"), area.width as usize),
+                    Style::default().fg(DIM),
+                ))
+                .alignment(Alignment::Center),
+                Rect {
+                    x: area.x,
+                    y: tagline_y,
+                    width: area.width,
+                    height: 1,
+                },
+            );
+            if area.width >= 58 {
+                frame.render_widget(
+                    Paragraph::new(Self::home_capabilities()).alignment(Alignment::Center),
+                    Rect {
+                        x: area.x,
+                        y: tagline_y + 1,
+                        width: area.width,
+                        height: 1,
+                    },
+                );
+            }
+            mark_y + full_height + 4
+        } else {
+            let brand_y = input_area.y.saturating_sub(4);
+            let brand = if area.width >= 24 {
+                "M I T N I C K S O L V E"
+            } else {
+                "MSK"
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    brand,
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Center),
+                Rect {
+                    x: area.x,
+                    y: brand_y,
+                    width: area.width,
+                    height: 1,
+                },
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    truncate(i18n::t("app.tagline"), area.width as usize),
+                    Style::default().fg(DIM),
+                ))
+                .alignment(Alignment::Center),
+                Rect {
+                    x: area.x,
+                    y: brand_y + 1,
+                    width: area.width,
+                    height: 1,
+                },
+            );
+            brand_y + 2
         };
-        frame.render_widget(
-            Paragraph::new(Text::from(mark)).alignment(Alignment::Center),
-            mark_area,
-        );
 
         let mut chips: Vec<Span> = Vec::new();
         chips.push(chip(
@@ -3913,15 +4454,14 @@ impl DaemonApp {
                 Color::Rgb(43, 37, 20),
             ));
         }
-        let chip_area = Rect {
-            x: area.x,
-            y: mark_area.y + mark_height + 1,
-            width: area.width,
-            height: 1,
-        };
         frame.render_widget(
             Paragraph::new(Line::from(chips)).alignment(Alignment::Center),
-            chip_area,
+            Rect {
+                x: area.x,
+                y: chip_y,
+                width: area.width,
+                height: 1,
+            },
         );
 
         let card_y = input_area
@@ -3929,7 +4469,7 @@ impl DaemonApp {
             .saturating_add(input_area.height)
             .saturating_add(2);
         let card_height = 6u16;
-        if area.bottom().saturating_sub(1) > card_y + card_height {
+        if area.bottom().saturating_sub(1) >= card_y + card_height {
             let width = 64.min(area.width.saturating_sub(8)).max(30);
             let card = Rect {
                 x: area.x + area.width.saturating_sub(width) / 2,
@@ -3937,13 +4477,13 @@ impl DaemonApp {
                 width,
                 height: card_height,
             };
-            let block = panel_block("try", ACCENT);
+            let block = panel_block(i18n::t("home.try"), ACCENT);
             let inner = block.inner(card);
             frame.render_widget(block, card);
             let examples = [
-                "inspect ./challenge and find the flag",
-                "map the services on 10.10.10.5",
-                "triage ./evidence and summarize the findings",
+                i18n::t("home.example.inspect"),
+                i18n::t("home.example.map"),
+                i18n::t("home.example.triage"),
             ];
             let mut lines = Vec::new();
             for example in examples {
@@ -3953,11 +4493,11 @@ impl DaemonApp {
                 ]));
             }
             lines.push(Line::from(Span::styled(
-                "  /demo runs the offline tool demo",
+                format!("  {}", i18n::t("home.demo")),
                 Style::default().fg(FAINT),
             )));
             frame.render_widget(
-                Paragraph::new(lines),
+                Paragraph::new(lines).wrap(Wrap { trim: false }),
                 Rect {
                     x: inner.x + 1,
                     y: inner.y,
@@ -3966,6 +4506,22 @@ impl DaemonApp {
                 },
             );
         }
+    }
+
+    fn home_capabilities() -> Line<'static> {
+        Line::from(vec![
+            Span::styled(i18n::t("home.cap.recon"), Style::default().fg(ACCENT)),
+            Span::styled("  ·  ", Style::default().fg(FAINT)),
+            Span::styled(i18n::t("home.cap.web"), Style::default().fg(GREEN)),
+            Span::styled("  ·  ", Style::default().fg(FAINT)),
+            Span::styled(i18n::t("home.cap.forensics"), Style::default().fg(TOOL)),
+            Span::styled("  ·  ", Style::default().fg(FAINT)),
+            Span::styled(i18n::t("home.cap.findings"), Style::default().fg(YELLOW)),
+            Span::styled("  ·  ", Style::default().fg(FAINT)),
+            Span::styled(i18n::t("home.cap.reports"), Style::default().fg(DIM)),
+            Span::styled("  ·  ", Style::default().fg(FAINT)),
+            Span::styled(i18n::t("home.cap.pty"), Style::default().fg(GREEN)),
+        ])
     }
 
     fn draw_chat(&self, frame: &mut ratatui::Frame, area: Rect, input_area: Rect) {
@@ -3980,19 +4536,39 @@ impl DaemonApp {
         let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         let (state_text, state_color, state_bg) = match state {
             "running" => (
-                format!("{} running", spinner[(self.spin.get() / 2) % spinner.len()]),
+                format!(
+                    "{} {}",
+                    spinner[(self.spin.get() / 2) % spinner.len()],
+                    i18n::t("state.running")
+                ),
                 ACCENT,
                 Color::Rgb(22, 36, 54),
             ),
             "waiting_input" if last_error.is_some() => (
-                "✗ last turn failed".to_string(),
+                format!("✗ {}", i18n::t("state.last_failed")),
                 RED,
                 Color::Rgb(46, 24, 28),
             ),
-            "waiting_input" => ("● ready".to_string(), GREEN, Color::Rgb(20, 38, 28)),
-            "failed" => ("✗ failed".to_string(), RED, Color::Rgb(46, 24, 28)),
-            "cancelled" => ("✗ cancelled".to_string(), RED, Color::Rgb(46, 24, 28)),
-            "done" => ("✓ done".to_string(), DIM, Color::Rgb(32, 32, 36)),
+            "waiting_input" => (
+                format!("● {}", i18n::t("state.ready")),
+                GREEN,
+                Color::Rgb(20, 38, 28),
+            ),
+            "failed" => (
+                format!("✗ {}", i18n::t("state.failed")),
+                RED,
+                Color::Rgb(46, 24, 28),
+            ),
+            "cancelled" => (
+                format!("✗ {}", i18n::t("state.cancelled")),
+                RED,
+                Color::Rgb(46, 24, 28),
+            ),
+            "done" => (
+                format!("✓ {}", i18n::t("state.done")),
+                DIM,
+                Color::Rgb(32, 32, 36),
+            ),
             other => (format!("● {other}"), DIM, Color::Rgb(32, 32, 36)),
         };
         self.spin.set(self.spin.get().wrapping_add(1));
@@ -4046,7 +4622,10 @@ impl DaemonApp {
                 Style::default().fg(GREEN),
             ),
             Span::styled(" · ", Style::default().fg(FAINT)),
-            Span::styled(format!("effort {display_effort}"), Style::default().fg(DIM)),
+            Span::styled(
+                i18n::tf("chat.effort", &[&i18n::effort_label(&display_effort)]),
+                Style::default().fg(DIM),
+            ),
         ]);
         frame.render_widget(
             Paragraph::new(right).alignment(Alignment::Right),
@@ -4078,54 +4657,65 @@ impl DaemonApp {
         let bar_width = if show_bar { 1 } else { 0 };
         let text_width = transcript_area.width.saturating_sub(bar_width);
         let task_id = self.selected_task_id();
-        let selected: Vec<&ChatLine> = self
-            .chat
-            .iter()
-            .filter(|line| Some(line.task_id.as_str()) == task_id.as_deref())
-            .collect();
-        let hashes: Vec<u64> = selected.iter().map(|line| chat_hash(line)).collect();
+        let revision = self.chat_revision;
         let (scroll, line_count, visible, offset) = {
             let mut cache = self.transcript_cache.borrow_mut();
             let cache_task = task_id.as_deref().unwrap_or("");
-            if cache.task != cache_task || cache.width != text_width {
-                cache.task = cache_task.to_string();
-                cache.width = text_width;
-                cache.groups = build_chat_groups(&selected, text_width);
-            } else {
-                let old = cache.groups.len();
-                let common = old.min(hashes.len());
-                let prefix_matches = cache.groups[..common]
+            if cache.task != cache_task || cache.width != text_width || cache.revision != revision {
+                let selected: Vec<&ChatLine> = self
+                    .chat
                     .iter()
-                    .zip(hashes.iter().take(common))
-                    .all(|(group, hash)| group.hash == *hash);
-                if prefix_matches {
-                    cache.groups.truncate(hashes.len());
-                    for line in selected.iter().skip(common) {
-                        let show_label = group_label_needed(cache.groups.last(), line.role);
-                        cache
-                            .groups
-                            .push(build_chat_group(line, text_width, show_label));
-                    }
-                } else if old == hashes.len()
-                    && old > 0
-                    && cache.groups[..old - 1]
-                        .iter()
-                        .zip(hashes.iter().take(old - 1))
-                        .all(|(group, hash)| group.hash == *hash)
-                {
-                    let show_label = cache.groups[old - 1].show_label;
-                    cache.groups[old - 1] =
-                        build_chat_group(selected[old - 1], text_width, show_label);
-                } else {
+                    .filter(|line| Some(line.task_id.as_str()) == task_id.as_deref())
+                    .collect();
+                let hashes: Vec<u64> = selected.iter().map(|line| chat_hash(line)).collect();
+                if cache.task != cache_task || cache.width != text_width {
+                    cache.task = cache_task.to_string();
+                    cache.width = text_width;
                     cache.groups = build_chat_groups(&selected, text_width);
+                } else {
+                    let old = cache.groups.len();
+                    let common = old.min(hashes.len());
+                    let prefix_matches = cache.groups[..common]
+                        .iter()
+                        .zip(hashes.iter().take(common))
+                        .all(|(group, hash)| group.hash == *hash);
+                    if prefix_matches {
+                        cache.groups.truncate(hashes.len());
+                        for line in selected.iter().skip(common) {
+                            let last_content = cache.groups.iter().rev().find_map(|group| {
+                                matches!(
+                                    group.role,
+                                    ChatRole::User | ChatRole::Assistant | ChatRole::Tool
+                                )
+                                .then_some(group.role)
+                            });
+                            let show_label = group_label_needed(last_content, line.role);
+                            cache
+                                .groups
+                                .push(build_chat_group(line, text_width, show_label));
+                        }
+                    } else if old == hashes.len()
+                        && old > 0
+                        && cache.groups[..old - 1]
+                            .iter()
+                            .zip(hashes.iter().take(old - 1))
+                            .all(|(group, hash)| group.hash == *hash)
+                    {
+                        let show_label = cache.groups[old - 1].show_label;
+                        cache.groups[old - 1] =
+                            build_chat_group(selected[old - 1], text_width, show_label);
+                    } else {
+                        cache.groups = build_chat_groups(&selected, text_width);
+                    }
                 }
-            }
-            cache.prefix.clear();
-            cache.prefix.push(0);
-            for index in 0..cache.groups.len() {
-                let height = cache.groups[index].height;
-                let last = *cache.prefix.last().unwrap_or(&0);
-                cache.prefix.push(last + height);
+                cache.revision = revision;
+                cache.prefix.clear();
+                cache.prefix.push(0);
+                for index in 0..cache.groups.len() {
+                    let height = cache.groups[index].height;
+                    let last = *cache.prefix.last().unwrap_or(&0);
+                    cache.prefix.push(last + height);
+                }
             }
             let total = *cache.prefix.last().unwrap_or(&0);
             let max_scroll = total.saturating_sub(transcript_area.height as usize);
@@ -4141,7 +4731,7 @@ impl DaemonApp {
                     scroll,
                     total,
                     vec![Line::from(Span::styled(
-                        "No messages yet. Type below to start.",
+                        i18n::t("chat.empty"),
                         Style::default().fg(DIM),
                     ))],
                     0,
@@ -4225,18 +4815,39 @@ impl DaemonApp {
 
         let meta_y = inner.y + inner.height - 1;
         let input_rows = inner.height.saturating_sub(2).max(1);
+        if inner.width > 4 {
+            frame.render_widget(
+                Paragraph::new(Span::styled("❯", Style::default().fg(ACCENT).bg(PANEL))),
+                Rect {
+                    x: inner.x + 1,
+                    y: inner.y,
+                    width: 1,
+                    height: 1,
+                },
+            );
+        }
+        let prompt_width = if inner.width > 4 { 2 } else { 0 };
         let input_area = Rect {
-            x: inner.x + 1,
+            x: inner.x + 1 + prompt_width,
             y: inner.y,
-            width: inner.width.saturating_sub(1),
+            width: inner.width.saturating_sub(1 + prompt_width),
             height: input_rows,
         };
 
         if self.input.is_empty() {
-            let placeholder = if self.new_task || self.selected_task_id().is_none() {
-                "Ask anything…  \"inspect ./challenge and find the flag\""
+            let home = self.new_task || self.selected_task_id().is_none();
+            let placeholder = if home {
+                if input_area.width < 60 {
+                    i18n::t("home.ask")
+                } else if input_area.width < 78 {
+                    i18n::t("home.ask.short")
+                } else {
+                    i18n::t("home.ask.example")
+                }
+            } else if input_area.width < 60 {
+                i18n::t("composer.reply")
             } else {
-                "Reply…   Shift+Enter for a new line"
+                i18n::t("composer.reply.hint")
             };
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
@@ -4249,7 +4860,7 @@ impl DaemonApp {
                 frame.set_cursor_position((input_area.x, input_area.y));
             }
         } else {
-            let cursor = self.input_cursor.min(self.input.len());
+            let cursor = char_boundary_at_or_before(&self.input, self.input_cursor);
             let before = &self.input[..cursor];
             let row = before.matches('\n').count();
             let line_start = before.rfind('\n').map(|index| index + 1).unwrap_or(0);
@@ -4285,6 +4896,19 @@ impl DaemonApp {
                 .bg(PANEL)
                 .add_modifier(Modifier::BOLD),
         )];
+        if self.selected_task_id().is_some()
+            && !self.new_task
+            && self.mode != self.selected_requested_mode()
+        {
+            meta.push(Span::styled(" → ", Style::default().fg(FAINT).bg(PANEL)));
+            meta.push(Span::styled(
+                self.mode_label(&self.mode),
+                Style::default()
+                    .fg(YELLOW)
+                    .bg(PANEL)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         let display_provider = self.display_provider();
         let display_model = self.display_model();
         let display_effort = self.display_effort();
@@ -4303,7 +4927,7 @@ impl DaemonApp {
         if display_effort != "default" {
             meta.push(Span::styled(" · ", Style::default().fg(FAINT).bg(PANEL)));
             meta.push(Span::styled(
-                format!("effort {display_effort}"),
+                i18n::tf("chat.effort", &[&i18n::effort_label(&display_effort)]),
                 Style::default().fg(DIM).bg(PANEL),
             ));
         }
@@ -4349,7 +4973,7 @@ impl DaemonApp {
             height,
         };
         frame.render_widget(Clear, area);
-        let block = panel_block("commands", ACCENT);
+        let block = panel_block(i18n::t("palette.title"), ACCENT);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let items: Vec<ListItem> = matches
@@ -4360,7 +4984,7 @@ impl DaemonApp {
                 let command = &COMMANDS[*command];
                 ListItem::new(Line::from(vec![
                     Span::styled(
-                        format!("{:<24}", command.label),
+                        pad_display(command.label(), 24),
                         Style::default()
                             .fg(if index == 0 { TEXT } else { DIM })
                             .add_modifier(if index == 0 {
@@ -4369,7 +4993,7 @@ impl DaemonApp {
                                 Modifier::empty()
                             }),
                     ),
-                    Span::styled(command.hint, Style::default().fg(FAINT)),
+                    Span::styled(command.hint(), Style::default().fg(FAINT)),
                 ]))
             })
             .collect();
@@ -4377,26 +5001,35 @@ impl DaemonApp {
     }
 
     fn draw_hints(&self, frame: &mut ratatui::Frame, input_area: Rect, hints_area: Rect) {
-        let hints_width = 54.min(hints_area.width).max(1);
-        let hints = Line::from(vec![
-            Span::styled(
-                "tab",
+        let keys = [
+            "hints.sessions",
+            "hints.new",
+            "hints.commands",
+            "hints.help",
+        ];
+        let mut spans = Vec::new();
+        let mut plain = String::new();
+        for (index, key) in keys.iter().enumerate() {
+            let text = i18n::t(key);
+            let (shortcut, rest) = text.split_once(' ').unwrap_or((text, ""));
+            spans.push(Span::styled(
+                shortcut.to_string(),
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" sessions   ", Style::default().fg(DIM)),
-            Span::styled(
-                "ctrl+n",
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" new   ", Style::default().fg(DIM)),
-            Span::styled(
-                "ctrl+p",
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" commands   ", Style::default().fg(DIM)),
-            Span::styled("F1", Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
-            Span::styled(" help", Style::default().fg(DIM)),
-        ]);
+            ));
+            let tail = if index + 1 == keys.len() { " " } else { "   " };
+            spans.push(Span::styled(
+                format!(" {rest}{tail}"),
+                Style::default().fg(DIM),
+            ));
+            plain.push_str(shortcut);
+            plain.push(' ');
+            plain.push_str(rest);
+            plain.push_str(tail);
+        }
+        let hints = Line::from(spans);
+        let hints_width = (UnicodeWidthStr::width(plain.as_str()) as u16 + 1)
+            .min(hints_area.width)
+            .max(1);
         let hint_area = Rect {
             x: input_area.right().saturating_sub(hints_width + 1),
             y: hints_area.y,
@@ -4430,49 +5063,103 @@ impl DaemonApp {
     fn draw_footer(&self, frame: &mut ratatui::Frame, area: Rect) {
         let right = format!("MitnickSolve {VERSION}");
         let right_width = UnicodeWidthStr::width(right.as_str()) as u16;
-        let left_width = area.width.saturating_sub(right_width + 5).max(10);
+        let left_width = area.width.saturating_sub(right_width + 5).max(10) as usize;
+        let current_permission = self.display_permission();
+        let permission_text = if self.selected_task_id().is_some()
+            && !self.new_task
+            && self.permission != current_permission
+        {
+            format!(
+                "{} → {}",
+                permission_label(&current_permission),
+                permission_label(&self.permission)
+            )
+        } else {
+            permission_label(&current_permission)
+        };
+        let permission = i18n::tf("footer.permission", &[&permission_text]);
+        let permission_width = UnicodeWidthStr::width(permission.as_str());
+        let workspace = truncate(
+            &self.workspace_label(),
+            left_width.saturating_sub(permission_width + 10).max(4),
+        );
+        let mut used = UnicodeWidthStr::width(workspace.as_str()) + permission_width + 5;
         let mut spans = vec![
-            Span::styled(self.workspace_label(), Style::default().fg(FAINT)),
+            Span::styled(workspace, Style::default().fg(FAINT)),
             Span::styled("  ·  ", Style::default().fg(FAINT)),
             Span::styled(
-                format!("权限 {}", permission_label(&self.display_permission())),
+                permission,
                 Style::default().fg(permission_color(&self.display_permission())),
             ),
         ];
-        if left_width >= 80 && self.selected_task_id().is_some() {
+        if self.selected_task_id().is_some() {
             let (tokens, tools) = self.selected_usage();
             if tokens > 0 {
-                spans.push(Span::styled("  ·  ", Style::default().fg(FAINT)));
-                spans.push(Span::styled(
-                    format!("ctx {}", format_tokens(tokens)),
-                    Style::default().fg(DIM),
-                ));
+                let limit = self
+                    .tasks
+                    .get(self.selected_task)
+                    .and_then(|task| task.get("max_context_tokens"))
+                    .and_then(Value::as_u64)
+                    .filter(|limit| *limit > 0);
+                let ctx = i18n::tf("footer.ctx", &[&format_tokens(tokens)]);
+                let extra =
+                    5 + UnicodeWidthStr::width(ctx.as_str()) + if limit.is_some() { 9 } else { 0 };
+                if used + extra <= left_width {
+                    spans.push(Span::styled("  ·  ", Style::default().fg(FAINT)));
+                    spans.push(Span::styled(ctx, Style::default().fg(DIM)));
+                    if let Some(limit) = limit {
+                        let ratio = (tokens as f64 / limit as f64).min(1.0);
+                        let filled = ((ratio * 8.0).ceil() as usize).min(8);
+                        let color = if ratio >= 0.9 {
+                            RED
+                        } else if ratio >= 0.7 {
+                            YELLOW
+                        } else {
+                            DIM
+                        };
+                        spans.push(Span::styled(
+                            format!(" {}{}", "▰".repeat(filled), "▱".repeat(8 - filled)),
+                            Style::default().fg(color),
+                        ));
+                    }
+                    used += extra;
+                }
             }
             if tools > 0 {
-                spans.push(Span::styled("  ·  ", Style::default().fg(FAINT)));
-                spans.push(Span::styled(
-                    format!("tools {tools}"),
-                    Style::default().fg(DIM),
-                ));
+                let text = i18n::tf("footer.tools", &[&tools.to_string()]);
+                let extra = 5 + UnicodeWidthStr::width(text.as_str());
+                if used + extra <= left_width {
+                    spans.push(Span::styled("  ·  ", Style::default().fg(FAINT)));
+                    spans.push(Span::styled(text, Style::default().fg(DIM)));
+                    used += extra;
+                }
             }
         }
-        if !self.auto_scroll && self.selected_task_id().is_some() && left_width >= 70 {
-            spans.push(Span::styled("  ·  ", Style::default().fg(FAINT)));
-            spans.push(Span::styled(
-                if left_width >= 90 {
-                    "↑ scrollback · End follows"
-                } else {
-                    "↑ scrollback"
-                },
-                Style::default().fg(YELLOW),
-            ));
+        if !self.auto_scroll && self.selected_task_id().is_some() {
+            let full = i18n::t("footer.scrollback.follow");
+            let short = i18n::t("footer.scrollback");
+            let (label, width) = if used + 5 + UnicodeWidthStr::width(full) <= left_width {
+                (full, UnicodeWidthStr::width(full))
+            } else if used + 5 + UnicodeWidthStr::width(short) <= left_width {
+                (short, UnicodeWidthStr::width(short))
+            } else if used + 7 <= left_width {
+                ("↑", 1)
+            } else {
+                ("", 0)
+            };
+            if !label.is_empty() {
+                spans.push(Span::styled("  ·  ", Style::default().fg(FAINT)));
+                spans.push(Span::styled(label, Style::default().fg(YELLOW)));
+                used += 5 + width;
+            }
         }
+        let _ = used;
         frame.render_widget(
             Paragraph::new(Line::from(spans)),
             Rect {
                 x: area.x + 2,
                 y: area.y,
-                width: left_width,
+                width: left_width as u16,
                 height: 1,
             },
         );
@@ -4522,36 +5209,9 @@ impl DaemonApp {
     fn draw_help(&self, frame: &mut ratatui::Frame, area: Rect) {
         let area = centered_rect(70, 78, area);
         frame.render_widget(Clear, area);
-        let lines = vec![
-            help_line("Enter", "write a message / send"),
-            help_line("Shift+Enter", "insert a newline"),
-            help_line("Esc", "interrupt a running turn or close the editor"),
-            help_line("Tab", "open the session switcher"),
-            help_line("Ctrl+N", "start a new session"),
-            help_line("Ctrl+P", "command palette"),
-            help_line("F1", "toggle this help"),
-            help_line("F2 / Shift+F2", "cycle reasoning effort forward / back"),
-            help_line("↑ / ↓", "scroll the transcript one line"),
-            help_line("PgUp / PgDn", "scroll ten lines"),
-            help_line("Ctrl/Alt+↑/↓", "older / newer input history"),
-            help_line("Ctrl+Home/End", "transcript top / follow output"),
-            help_line("mouse wheel", "scroll the transcript"),
-            help_line("y / n", "approve or deny a pending tool call"),
-            help_line("Ctrl+Q", "detach from the terminal"),
-            help_line("Ctrl+C", "interrupt the turn, or quit when idle"),
-            Line::from(""),
-            Line::from(Span::styled(
-                "The agent runs in the daemon. Every tool call goes through envd;",
-                Style::default().fg(DIM),
-            )),
-            Line::from(Span::styled(
-                "the working directory is your project unless --workspace says otherwise.",
-                Style::default().fg(DIM),
-            )),
-        ];
         frame.render_widget(
-            Paragraph::new(lines)
-                .block(panel_block("keyboard shortcuts", ACCENT))
+            Paragraph::new(i18n::t("help.body"))
+                .block(panel_block(i18n::t("help.title"), ACCENT))
                 .wrap(Wrap { trim: false }),
             area,
         );
@@ -4572,7 +5232,7 @@ impl DaemonApp {
             height,
         };
         frame.render_widget(Clear, area);
-        let block = panel_block("commands", ACCENT);
+        let block = panel_block(i18n::t("palette.title"), ACCENT);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.width < 6 || inner.height < 4 {
@@ -4585,9 +5245,9 @@ impl DaemonApp {
                 Span::styled("▌", Style::default().fg(ACCENT)),
                 Span::styled(
                     if palette.query.is_empty() {
-                        "  type a command"
+                        format!("  {}", i18n::t("palette.placeholder"))
                     } else {
-                        ""
+                        String::new()
                     },
                     Style::default().fg(FAINT),
                 ),
@@ -4609,7 +5269,7 @@ impl DaemonApp {
         if filtered.is_empty() {
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    "  no matching command",
+                    format!("  {}", i18n::t("palette.empty")),
                     Style::default().fg(DIM),
                 )),
                 list_area,
@@ -4621,8 +5281,8 @@ impl DaemonApp {
             .map(|index| {
                 let command = &COMMANDS[*index];
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{:<26}", command.label), Style::default().fg(TEXT)),
-                    Span::styled(command.hint, Style::default().fg(DIM)),
+                    Span::styled(pad_display(command.label(), 26), Style::default().fg(TEXT)),
+                    Span::styled(command.hint(), Style::default().fg(DIM)),
                 ]))
             })
             .collect();
@@ -4640,7 +5300,12 @@ impl DaemonApp {
     }
 
     fn draw_session_rail(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let block = panel_block("sessions", ACCENT);
+        let title = if self.tasks.is_empty() {
+            i18n::t("sessions.title").to_string()
+        } else {
+            i18n::tf("sessions.count", &[&self.tasks.len().to_string()])
+        };
+        let block = panel_block(&title, ACCENT);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.height < 3 || inner.width < 8 {
@@ -4664,7 +5329,7 @@ impl DaemonApp {
         for index in start..total.min(start + rows) {
             let task = &self.tasks[index];
             let state = task.get("state").and_then(Value::as_str).unwrap_or("?");
-            let glyph = state_label(state).chars().next().unwrap_or('·');
+            let glyph = state_glyph(state);
             let current = !self.new_task && index == self.selected_task;
             let title = task.get("goal").and_then(Value::as_str).unwrap_or("");
             lines.push(Line::from(vec![
@@ -4681,7 +5346,7 @@ impl DaemonApp {
         }
         if total == 0 {
             lines.push(Line::from(Span::styled(
-                "  no sessions",
+                format!("  {}", i18n::t("sessions.empty")),
                 Style::default().fg(FAINT),
             )));
         }
@@ -4692,7 +5357,7 @@ impl DaemonApp {
                     if self.new_task { "● " } else { "＋ " },
                     Style::default().fg(if self.new_task { GREEN } else { ACCENT }),
                 ),
-                Span::styled("New session", Style::default().fg(ACCENT)),
+                Span::styled(i18n::t("sessions.new"), Style::default().fg(ACCENT)),
             ]));
         }
         frame.render_widget(
@@ -4706,7 +5371,7 @@ impl DaemonApp {
         );
         frame.render_widget(
             Paragraph::new(Span::styled(
-                "tab switch · ctrl+n new",
+                i18n::t("sessions.rail.hint"),
                 Style::default().fg(FAINT),
             ))
             .alignment(Alignment::Center),
@@ -4731,7 +5396,7 @@ impl DaemonApp {
             height,
         };
         frame.render_widget(Clear, area);
-        let block = panel_block("sessions", ACCENT);
+        let block = panel_block(i18n::t("sessions.title"), ACCENT);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.height < 3 {
@@ -4739,7 +5404,7 @@ impl DaemonApp {
         }
         frame.render_widget(
             Paragraph::new(Span::styled(
-                "Open a saved conversation or start a fresh one.",
+                i18n::t("sessions.intro"),
                 Style::default().fg(DIM),
             )),
             Rect {
@@ -4762,10 +5427,10 @@ impl DaemonApp {
                 Style::default().fg(if self.new_task { GREEN } else { ACCENT }),
             ),
             Span::styled(
-                format!("{:<14}", "New session"),
+                pad_display(i18n::t("sessions.new"), 14),
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("start a fresh conversation", Style::default().fg(DIM)),
+            Span::styled(i18n::t("sessions.new.hint"), Style::default().fg(DIM)),
         ])));
         for (index, task) in self.tasks.iter().enumerate() {
             let state = task.get("state").and_then(Value::as_str).unwrap_or("?");
@@ -4778,7 +5443,7 @@ impl DaemonApp {
                     Style::default().fg(if current { GREEN } else { FAINT }),
                 ),
                 Span::styled(
-                    format!("{:<14}", state_label(state)),
+                    pad_display(&state_label(state), 14),
                     Style::default().fg(state_color),
                 ),
                 Span::styled(
@@ -4802,7 +5467,7 @@ impl DaemonApp {
         frame.render_stateful_widget(list, list_area, &mut state);
         frame.render_widget(
             Paragraph::new(Span::styled(
-                "↑/↓ select · Enter open · n new · Esc close",
+                i18n::t("sessions.keys"),
                 Style::default().fg(FAINT),
             ))
             .alignment(Alignment::Right),
@@ -4828,22 +5493,23 @@ impl DaemonApp {
             height,
         };
         frame.render_widget(Clear, area);
-        let block = panel_block("assessment findings", ACCENT);
+        let block = panel_block(i18n::t("findings.title"), ACCENT);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.width < 10 || inner.height < 4 {
             return;
         }
         if self.findings.is_empty() {
+            self.findings_max_scroll.set(0);
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::from(Span::styled(
-                        "No findings recorded.",
+                        i18n::t("findings.empty"),
                         Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                     )),
                     Line::from(""),
                     Line::from(Span::styled(
-                        "The agent records findings with the finding_add tool.",
+                        i18n::t("findings.empty.hint"),
                         Style::default().fg(DIM),
                     )),
                 ]),
@@ -4867,19 +5533,55 @@ impl DaemonApp {
         let mut lines = vec![
             Line::from(vec![
                 Span::styled(
-                    format!("{} finding(s)", self.findings.len()),
+                    i18n::tf("findings.count", &[&self.findings.len().to_string()]),
                     Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!(
-                        "   critical {} · high {} · medium {} · low {} · info {}",
-                        counts[4], counts[3], counts[2], counts[1], counts[0]
+                        "   {}",
+                        i18n::tf(
+                            "findings.severity",
+                            &[
+                                &counts[4].to_string(),
+                                &counts[3].to_string(),
+                                &counts[2].to_string(),
+                                &counts[1].to_string(),
+                                &counts[0].to_string(),
+                            ]
+                        )
                     ),
                     Style::default().fg(DIM),
                 ),
             ]),
             Line::from(""),
         ];
+        let total: usize = self.findings.len();
+        if total > 0 {
+            let width = inner.width.saturating_sub(4).min(48) as usize;
+            let mut used = 0usize;
+            let mut bar: Vec<Span> = Vec::new();
+            for (count, color) in [
+                (counts[4], Color::Rgb(239, 68, 68)),
+                (counts[3], Color::Rgb(249, 115, 22)),
+                (counts[2], YELLOW),
+                (counts[1], ACCENT),
+                (counts[0], DIM),
+            ] {
+                let cells = count * width / total;
+                if cells > 0 {
+                    bar.push(Span::styled("█".repeat(cells), Style::default().fg(color)));
+                    used += cells;
+                }
+            }
+            if used < width {
+                bar.push(Span::styled(
+                    "░".repeat(width - used),
+                    Style::default().fg(FAINT),
+                ));
+            }
+            lines.push(Line::from(bar));
+            lines.push(Line::from(""));
+        }
         for finding in &self.findings {
             let severity = finding
                 .get("severity")
@@ -4893,7 +5595,11 @@ impl DaemonApp {
             };
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("{:<9}", severity.to_ascii_uppercase()),
+                    {
+                        let label = i18n::severity_label(severity);
+                        let padding = 9usize.saturating_sub(UnicodeWidthStr::width(label.as_str()));
+                        format!("{label}{}", " ".repeat(padding))
+                    },
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
@@ -4925,7 +5631,7 @@ impl DaemonApp {
             }
             if !status.is_empty() {
                 meta.push(Span::styled(
-                    format!("  {status}"),
+                    format!("  {}", i18n::finding_status_label(status)),
                     Style::default().fg(DIM),
                 ));
             }
@@ -4956,7 +5662,13 @@ impl DaemonApp {
             width: inner.width,
             height: inner.height.saturating_sub(1),
         };
-        let scroll = self.findings_scroll.min(lines.len().saturating_sub(1));
+        let wrapped = Paragraph::new(lines.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(list_area.width)
+            .max(1);
+        self.findings_max_scroll
+            .set(wrapped.saturating_sub(list_area.height as usize));
+        let scroll = self.findings_scroll.min(self.findings_max_scroll.get());
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
@@ -4965,7 +5677,7 @@ impl DaemonApp {
         );
         frame.render_widget(
             Paragraph::new(Span::styled(
-                "j/k scroll · r reload · Esc close",
+                i18n::t("findings.keys"),
                 Style::default().fg(FAINT),
             ))
             .alignment(Alignment::Right),
@@ -4974,6 +5686,170 @@ impl DaemonApp {
                 y: inner.bottom().saturating_sub(1),
                 width: inner.width.saturating_sub(1),
                 height: 1,
+            },
+        );
+    }
+
+    fn draw_settings(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let width = 72.min(area.width.saturating_sub(6)).max(34);
+        let height = 13.min(area.height.saturating_sub(2)).max(9);
+        let area = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, area);
+        let block = panel_block(i18n::t("settings.title"), ACCENT);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width < 24 {
+            return;
+        }
+        let current_permission = self.display_permission();
+        let permission_value = if self.selected_task_id().is_some()
+            && !self.new_task
+            && self.permission != current_permission
+        {
+            format!(
+                "{}  ({})",
+                i18n::permission_label(&self.permission),
+                i18n::tf(
+                    "settings.current",
+                    &[&i18n::permission_label(&current_permission)]
+                )
+            )
+        } else {
+            i18n::permission_label(&self.permission)
+        };
+        let current_mode = self.selected_mode();
+        let requested_mode = self.selected_requested_mode();
+        let mode_value = if self.selected_task_id().is_some()
+            && !self.new_task
+            && (self.mode != requested_mode || current_mode != requested_mode)
+        {
+            format!(
+                "{}  ({})",
+                self.mode_label(&self.mode),
+                i18n::tf("settings.current", &[&self.mode_label(&current_mode)])
+            )
+        } else {
+            self.mode_label(&self.mode)
+        };
+        let rows = [
+            (
+                i18n::t("settings.language"),
+                self.language.label().to_string(),
+            ),
+            (i18n::t("settings.permission"), permission_value),
+            (i18n::t("settings.mode"), mode_value),
+            (i18n::t("settings.providers"), String::new()),
+            (i18n::t("settings.setup"), String::new()),
+        ];
+        let mut lines = vec![
+            Line::from(Span::styled(
+                i18n::t("settings.intro"),
+                Style::default().fg(DIM),
+            )),
+            Line::from(""),
+        ];
+        for (index, (label, value)) in rows.iter().enumerate() {
+            let selected = index == self.settings_selection;
+            let padding = 22usize.saturating_sub(UnicodeWidthStr::width(*label));
+            let mut spans = vec![
+                Span::styled(
+                    if selected { "❯ " } else { "  " },
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled(
+                    format!("{label}{}", " ".repeat(padding)),
+                    if selected {
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(TEXT)
+                    },
+                ),
+            ];
+            if !value.is_empty() {
+                spans.push(Span::styled(value.clone(), Style::default().fg(DIM)));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            i18n::t("settings.keys"),
+            Style::default().fg(ACCENT),
+        )));
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            Rect {
+                x: inner.x + 1,
+                y: inner.y,
+                width: inner.width.saturating_sub(2),
+                height: inner.height,
+            },
+        );
+    }
+
+    fn draw_language(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let width = 56.min(area.width.saturating_sub(6)).max(30);
+        let height = (i18n::ALL.len() as u16 + 6)
+            .min(area.height.saturating_sub(2))
+            .max(10);
+        let area = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, area);
+        let block = panel_block(i18n::t("language.title"), ACCENT);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width < 20 {
+            return;
+        }
+        let mut lines = vec![
+            Line::from(Span::styled(
+                i18n::t("language.intro"),
+                Style::default().fg(DIM),
+            )),
+            Line::from(""),
+        ];
+        for (index, language) in i18n::ALL.iter().enumerate() {
+            let selected = index == self.language_selection;
+            let current = *language == self.language;
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { "❯ " } else { "  " },
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled(
+                    if current { "● " } else { "○ " },
+                    Style::default().fg(if current { GREEN } else { FAINT }),
+                ),
+                Span::styled(
+                    language.label().to_string(),
+                    if selected {
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(TEXT)
+                    },
+                ),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            i18n::t("language.keys"),
+            Style::default().fg(ACCENT),
+        )));
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            Rect {
+                x: inner.x + 1,
+                y: inner.y,
+                width: inner.width.saturating_sub(2),
+                height: inner.height,
             },
         );
     }
@@ -4990,14 +5866,14 @@ impl DaemonApp {
             height,
         };
         frame.render_widget(Clear, area);
-        let block = panel_block("agent mode", ACCENT);
+        let block = panel_block(i18n::t("modes.title"), ACCENT);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let mut lines = vec![
-            Line::from(vec![Span::styled(
-                "Next session operates in the selected mode.",
+            Line::from(Span::styled(
+                i18n::t("modes.intro"),
                 Style::default().fg(DIM),
-            )]),
+            )),
             Line::from(""),
         ];
         for (index, mode) in self.modes.iter().enumerate() {
@@ -5017,15 +5893,25 @@ impl DaemonApp {
                     },
                 ),
                 Span::styled(
-                    format!("{:<6}", self.mode_label(&mode.id)),
+                    {
+                        let label = self.mode_label(&mode.id);
+                        let padding =
+                            10usize.saturating_sub(UnicodeWidthStr::width(label.as_str()));
+                        format!("{label}{}", " ".repeat(padding))
+                    },
                     Style::default().fg(if current { GREEN } else { FAINT }),
                 ),
-                Span::styled(mode.description.clone(), Style::default().fg(DIM)),
+                Span::styled(
+                    i18n::mode_desc(&mode.id)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| mode.description.clone()),
+                    Style::default().fg(DIM),
+                ),
             ]));
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "↑/↓ choose · Enter apply · Esc cancel",
+            i18n::t("modes.keys"),
             Style::default().fg(ACCENT),
         )));
         frame.render_widget(
@@ -5061,23 +5947,23 @@ impl DaemonApp {
             height,
         };
         frame.render_widget(Clear, area);
-        let block = panel_block("providers", ACCENT);
+        let block = panel_block(i18n::t("providers.title"), ACCENT);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let mut lines = vec![
             Line::from(Span::styled(
-                "Saved provider profiles. Switch with Enter; keys stay on this machine.",
+                i18n::t("providers.intro"),
                 Style::default().fg(DIM),
             )),
             Line::from(""),
         ];
         if self.profiles.is_empty() {
             lines.push(Line::from(Span::styled(
-                "No saved providers yet.",
+                i18n::t("providers.empty"),
                 Style::default().fg(TEXT),
             )));
             lines.push(Line::from(Span::styled(
-                "Press n to add one, or s for the full setup.",
+                i18n::t("providers.empty.hint"),
                 Style::default().fg(DIM),
             )));
         }
@@ -5114,12 +6000,18 @@ impl DaemonApp {
                 profile.model.clone()
             };
             let effort = if profile.effort.is_empty() {
-                "default".to_string()
+                i18n::t("effort.default").to_string()
             } else {
-                profile.effort.clone()
+                i18n::effort_label(&profile.effort)
             };
             let mut detail = vec![Span::styled(
-                format!("    {} · {} · effort {}", profile.provider, model, effort),
+                format!(
+                    "    {} · {} · {} {}",
+                    profile.provider,
+                    model,
+                    i18n::t("providers.effort"),
+                    effort
+                ),
                 Style::default().fg(DIM),
             )];
             if !profile.base_url.is_empty() {
@@ -5131,18 +6023,24 @@ impl DaemonApp {
             }
             detail.push(Span::styled(" · ", Style::default().fg(FAINT)));
             if !requires_key(&profile.provider) {
-                detail.push(Span::styled("no key needed", Style::default().fg(FAINT)));
+                detail.push(Span::styled(
+                    i18n::t("providers.no_key"),
+                    Style::default().fg(FAINT),
+                ));
             } else if profile.api_key.is_empty() {
                 detail.push(Span::styled(
                     if self.daemon_llm_key {
-                        "key from mskd env"
+                        i18n::t("providers.key_env")
                     } else {
-                        "key missing"
+                        i18n::t("providers.key_missing")
                     },
                     Style::default().fg(if self.daemon_llm_key { DIM } else { YELLOW }),
                 ));
             } else {
-                detail.push(Span::styled("key set", Style::default().fg(GREEN)));
+                detail.push(Span::styled(
+                    i18n::t("providers.key_set"),
+                    Style::default().fg(GREEN),
+                ));
             }
             lines.push(Line::from(detail));
         }
@@ -5150,13 +6048,13 @@ impl DaemonApp {
         if let Some(index) = self.provider_delete_armed {
             if let Some(profile) = self.profiles.get(index) {
                 lines.push(Line::from(Span::styled(
-                    format!("press d again to delete {}", profile.name),
+                    i18n::tf("providers.delete_armed", &[&profile.name]),
                     Style::default().fg(RED).add_modifier(Modifier::BOLD),
                 )));
             }
         }
         lines.push(Line::from(Span::styled(
-            "↑/↓ choose · Enter use · n new · e edit · d delete · s setup · Esc close",
+            i18n::t("providers.keys"),
             Style::default().fg(ACCENT),
         )));
         frame.render_widget(
@@ -5182,26 +6080,29 @@ impl DaemonApp {
             height,
         };
         frame.render_widget(Clear, area);
-        let block = panel_block("permissions", GREEN);
+        let block = panel_block(i18n::t("permissions.title"), GREEN);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let mut lines = vec![
             Line::from(Span::styled(
-                "Controls approval prompts for tool calls in the next session.",
+                i18n::t("permissions.intro"),
                 Style::default().fg(DIM),
             )),
             Line::from(""),
         ];
-        for (index, (id, description)) in PERMISSIONS.iter().enumerate() {
+        for (index, id) in PERMISSIONS.iter().enumerate() {
             let selected = index == self.permission_selection;
             let current = *id == self.permission;
+            let label = i18n::permission_label(id);
+            let padding = 10usize.saturating_sub(UnicodeWidthStr::width(label.as_str()));
+            let description = i18n::permission_desc(id);
             lines.push(Line::from(vec![
                 Span::styled(
                     if selected { "❯ " } else { "  " },
                     Style::default().fg(GREEN),
                 ),
                 Span::styled(
-                    format!("{:<10}", id),
+                    format!("{label}{}", " ".repeat(padding)),
                     if selected {
                         Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
                     } else {
@@ -5209,15 +6110,15 @@ impl DaemonApp {
                     },
                 ),
                 Span::styled(
-                    format!("{:<6}", permission_label(id)),
+                    format!("{:<8}", i18n::permission_label(id)),
                     Style::default().fg(if current { permission_color(id) } else { FAINT }),
                 ),
-                Span::styled((*description).to_string(), Style::default().fg(DIM)),
+                Span::styled(description, Style::default().fg(DIM)),
             ]));
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "↑/↓ choose · Enter apply · Esc cancel",
+            i18n::t("permissions.keys"),
             Style::default().fg(ACCENT),
         )));
         frame.render_widget(
@@ -5240,7 +6141,32 @@ impl DaemonApp {
             .unwrap_or_default();
         let args = serde_json::to_string_pretty(pending.get("args").unwrap_or(&Value::Null))
             .unwrap_or_default();
-        let area = centered_rect(80, 48, area);
+        let goal = pending
+            .get("task_id")
+            .and_then(Value::as_str)
+            .and_then(|task_id| {
+                self.tasks
+                    .iter()
+                    .find(|task| task.get("task_id").and_then(Value::as_str) == Some(task_id))
+            })
+            .and_then(|task| task.get("goal"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let arg_lines: Vec<&str> = args.lines().collect();
+        let shown_args = arg_lines.len().min(8);
+        let header_height = if goal.is_empty() { 4 } else { 5 };
+        let extra = usize::from(arg_lines.len() > shown_args);
+        let width = 84.min(area.width.saturating_sub(4)).max(36).min(area.width);
+        let height = (header_height + shown_args + extra + 4)
+            .min(area.height.saturating_sub(2) as usize)
+            .max(10) as u16;
+        let area = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+        let total_approvals = self.approvals.len().to_string();
         frame.render_widget(Clear, area);
         let block = Block::default()
             .borders(Borders::ALL)
@@ -5249,42 +6175,66 @@ impl DaemonApp {
             .style(Style::default().bg(PANEL))
             .title(Span::styled(
                 format!(
-                    " approval required · {} of {} · #{id} ",
-                    1,
-                    self.approvals.len()
+                    " {} · {} · #{id} ",
+                    i18n::t("approval.required"),
+                    i18n::tf("approval.count", &["1", &total_approvals])
                 ),
                 Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled("tool  ", Style::default().fg(FAINT)),
+        let label = |key: &'static str| {
+            let text = i18n::t(key);
+            let padding = 6usize.saturating_sub(UnicodeWidthStr::width(text));
+            format!("{text}{}", " ".repeat(padding))
+        };
+        let mut lines = vec![Line::from(vec![
+            Span::styled(label("approval.tool"), Style::default().fg(FAINT)),
+            Span::styled(
+                tool.to_string(),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+        ])];
+        if !goal.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(label("approval.task"), Style::default().fg(FAINT)),
                 Span::styled(
-                    tool.to_string(),
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    truncate(goal, inner.width.saturating_sub(8) as usize),
+                    Style::default().fg(DIM),
                 ),
-            ]),
-            Line::from(vec![
-                Span::styled("why   ", Style::default().fg(FAINT)),
-                Span::styled(reason.to_string(), Style::default().fg(DIM)),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled("arguments", Style::default().fg(FAINT))),
-        ];
-        let budget = inner.height.saturating_sub(7) as usize;
-        for part in args.lines().take(budget.max(1)) {
+            ]));
+        }
+        lines.push(Line::from(vec![
+            Span::styled(label("approval.why"), Style::default().fg(FAINT)),
+            Span::styled(i18n::approval_reason(reason), Style::default().fg(DIM)),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            i18n::t("approval.arguments"),
+            Style::default().fg(FAINT),
+        )));
+        let arg_width = inner.width.saturating_sub(2) as usize;
+        for part in arg_lines.iter().take(shown_args) {
             lines.push(Line::from(Span::styled(
-                format!("  {part}"),
+                format!("  {}", truncate(part, arg_width)),
                 Style::default().fg(DIM),
             )));
+        }
+        if arg_lines.len() > shown_args {
+            lines.push(Line::from(Span::styled("  …", Style::default().fg(FAINT))));
         }
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled("y", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
-            Span::styled(" allow     ", Style::default().fg(DIM)),
+            Span::styled(
+                format!(" {}     ", i18n::t("approval.allow")),
+                Style::default().fg(DIM),
+            ),
             Span::styled("n", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
-            Span::styled(" deny", Style::default().fg(DIM)),
+            Span::styled(
+                format!(" {}", i18n::t("approval.deny")),
+                Style::default().fg(DIM),
+            ),
         ]));
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
@@ -5363,34 +6313,56 @@ fn run_daemon(
             app.refresh_ms.clamp(100, 500)
         };
         if event::poll(Duration::from_millis(poll_ms))? {
-            match event::read()? {
-                CrosstermEvent::Key(key)
-                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+            // Drain a burst (paste as key events, mouse wheel, held keys) before
+            // painting. Each individual key event used to trigger a full frame,
+            // which made large pastes and wheel bursts feel laggy.
+            let mut batch = 0usize;
+            let batch_started = Instant::now();
+            loop {
+                let (quit, redraw) = handle_crossterm_event(&mut app, event::read()?);
+                dirty |= redraw;
+                if quit {
+                    return Ok(());
+                }
+                batch += 1;
+                if batch >= 2048
+                    || batch_started.elapsed() >= Duration::from_millis(12)
+                    || !event::poll(Duration::ZERO)?
                 {
-                    dirty = true;
-                    if app.handle_key(key) {
-                        return Ok(());
-                    }
+                    break;
                 }
-                CrosstermEvent::Paste(text) => {
-                    dirty = true;
-                    app.handle_paste(&text);
-                }
-                CrosstermEvent::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        app.scroll_up(3);
-                        dirty = true;
-                    }
-                    MouseEventKind::ScrollDown => {
-                        app.scroll_down(3);
-                        dirty = true;
-                    }
-                    _ => {}
-                },
-                CrosstermEvent::Resize(_, _) => dirty = true,
-                _ => {}
+            }
+            if app.quit_requested {
+                return Ok(());
             }
         }
+    }
+}
+
+fn handle_crossterm_event(app: &mut DaemonApp, event: CrosstermEvent) -> (bool, bool) {
+    match event {
+        CrosstermEvent::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+        {
+            (app.handle_key(key), true)
+        }
+        CrosstermEvent::Paste(text) => {
+            app.handle_paste(&text);
+            (false, true)
+        }
+        CrosstermEvent::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                app.scroll_up(3);
+                (false, true)
+            }
+            MouseEventKind::ScrollDown => {
+                app.scroll_down(3);
+                (false, true)
+            }
+            _ => (false, false),
+        },
+        CrosstermEvent::Resize(_, _) => (false, true),
+        _ => (false, false),
     }
 }
 
@@ -5426,6 +6398,8 @@ fn main() -> Result<()> {
             cli.snapshot_modes,
             cli.snapshot_providers,
             cli.snapshot_permissions,
+            cli.snapshot_settings,
+            cli.snapshot_language,
         );
     }
 
@@ -5491,10 +6465,13 @@ fn snapshot_daemon(
     modes: bool,
     providers: bool,
     permissions: bool,
+    settings: bool,
+    language: bool,
 ) -> Result<()> {
     let mut app = DaemonApp::connect(root.to_path_buf(), 100, provider)?;
     let _ = app.refresh();
-    if palette || sessions || findings || modes || providers || permissions {
+    if palette || sessions || findings || modes || providers || permissions || settings || language
+    {
         app.setup = None;
     }
     if setup {
@@ -5521,6 +6498,12 @@ fn snapshot_daemon(
     if permissions {
         app.permission_selection = permission_index(&app.permission);
         app.show_permissions = true;
+    }
+    if settings {
+        app.open_settings();
+    }
+    if language {
+        app.open_language();
     }
     app.auto_scroll = false;
     app.scroll_top = 10_000;
@@ -5874,8 +6857,8 @@ fn filtered_commands(query: &str) -> Vec<usize> {
         .enumerate()
         .filter(|(_, command)| {
             needle.is_empty()
-                || command.label.to_lowercase().contains(&needle)
-                || command.hint.to_lowercase().contains(&needle)
+                || command.label().to_lowercase().contains(&needle)
+                || command.hint().to_lowercase().contains(&needle)
                 || command.command.contains(&needle)
         })
         .map(|(index, _)| index)
@@ -5903,14 +6886,21 @@ fn finding_rank(severity: &str) -> u8 {
     }
 }
 
-fn state_label(state: &str) -> &'static str {
+fn state_glyph(state: &str) -> char {
     match state {
-        "running" => "● running",
-        "waiting_input" => "● ready",
-        "failed" => "✗ failed",
-        "cancelled" => "✗ cancelled",
-        "done" => "✓ done",
-        _ => "· unknown",
+        "running" | "waiting_input" => '●',
+        "failed" | "cancelled" => '✗',
+        "done" => '✓',
+        _ => '·',
+    }
+}
+
+fn state_label(state: &str) -> String {
+    let word = i18n::state_word(state);
+    if word.is_empty() {
+        format!("{} {state}", state_glyph(state))
+    } else {
+        format!("{} {word}", state_glyph(state))
     }
 }
 
@@ -5944,16 +6934,6 @@ fn panel_block(title: &str, accent: Color) -> Block<'static> {
             format!(" {title} "),
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ))
-}
-
-fn help_line(key: &'static str, description: &'static str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!("{key:<14}"),
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(description, Style::default().fg(DIM)),
-    ])
 }
 
 fn wordmark(width: u16) -> Vec<Line<'static>> {
@@ -6091,15 +7071,186 @@ fn detail_text(event: &Event) -> String {
     lines.join("\n")
 }
 
-fn observation_summary(data: &Value) -> Option<String> {
-    let observation = data.get("observation")?;
-    if let Some(text) = observation.as_str() {
-        if let Ok(value) = serde_json::from_str::<Value>(text) {
-            return Some(compact_json(&value, 120));
-        }
-        return Some(truncate(text, 120));
+/// Short, stable label for IDs shown in the transcript. Full artifact hashes
+/// remain available in the event inspector and on disk.
+fn short_id(value: &str) -> String {
+    const MAX: usize = 12;
+    if value.chars().count() <= MAX {
+        value.to_string()
+    } else {
+        format!("{}…", value.chars().take(MAX - 1).collect::<String>())
     }
-    Some(compact_json(observation, 120))
+}
+
+/// Reads the byte count from the `[artifact <id> (<bytes> bytes)]` prefix the
+/// kernel attaches to truncated observations.
+fn artifact_bytes(data: &Value) -> Option<u64> {
+    let observation = data.get("observation")?.as_str()?;
+    let rest = observation.strip_prefix("[artifact ")?;
+    let open = rest.find('(')?;
+    let close = rest[open..].find(')')?;
+    rest[open + 1..open + close]
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn clean_inline(value: &str, max: usize) -> String {
+    let text: String = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    truncate(text.trim(), max)
+}
+
+fn first_line(value: &str) -> String {
+    value
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| clean_inline(line, 72))
+        .unwrap_or_default()
+}
+
+/// Long hex runs are almost always hashes; keep them recognizable but short.
+fn shorten_hex_ids(text: &str) -> String {
+    let characters: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < characters.len() {
+        if characters[index].is_ascii_hexdigit() {
+            let start = index;
+            while index < characters.len() && characters[index].is_ascii_hexdigit() {
+                index += 1;
+            }
+            if index - start >= 32 {
+                out.extend(&characters[start..start + 8]);
+                out.push('…');
+            } else {
+                out.extend(&characters[start..index]);
+            }
+        } else {
+            out.push(characters[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
+fn structured_summary(tool: &str, value: &Value) -> Option<String> {
+    let number = |key: &str| value.get(key).and_then(Value::as_u64);
+    let text = |key: &str| value.get(key).and_then(Value::as_str);
+    let summary = match tool {
+        "exec" | "session_exec" => {
+            let mut parts = Vec::new();
+            if let Some(code) = number("exit_code") {
+                parts.push(format!("exit {code}"));
+            }
+            let line = text("stdout")
+                .or_else(|| text("stderr"))
+                .map(first_line)
+                .unwrap_or_default();
+            if !line.is_empty() {
+                parts.push(line);
+            }
+            if value.get("truncated") == Some(&Value::Bool(true)) {
+                parts.push("truncated".into());
+            }
+            if let Some(ms) = number("duration_ms") {
+                parts.push(format!("{ms}ms"));
+            }
+            parts.join(" · ")
+        }
+        "read_file" => {
+            let size = number("size").or_else(|| number("bytes")).unwrap_or(0);
+            let mut parts = vec![format!("{size} B")];
+            if let Some(hash) = text("sha256") {
+                parts.push(format!("sha256 {}", short_id(hash)));
+            }
+            if value.get("eof") == Some(&Value::Bool(false)) {
+                parts.push("more".into());
+            }
+            parts.join(" · ")
+        }
+        "artifact_read" => {
+            let bytes = number("bytes")
+                .or_else(|| text("data").map(|data| data.len() as u64))
+                .unwrap_or(0);
+            let mut parts = vec![format!("{bytes} B")];
+            if let Some(offset) = number("next_offset") {
+                parts.push(format!("offset {offset}"));
+            }
+            if let Some(encoding) = text("encoding") {
+                parts.push(encoding.to_string());
+            }
+            parts.join(" · ")
+        }
+        "stat_file" => {
+            let size = number("size").unwrap_or(0);
+            let mut parts = vec![format!("{size} B")];
+            if let Some(mode) = text("mode") {
+                parts.push(mode.to_string());
+            }
+            parts.join(" · ")
+        }
+        "session_create" => {
+            let mut parts = Vec::new();
+            if let Some(id) = text("session_id") {
+                parts.push(format!("session {}", short_id(id)));
+            }
+            if let Some(state) = text("state") {
+                parts.push(state.to_string());
+            }
+            if let Some(shell) = text("shell") {
+                parts.push(shell.to_string());
+            }
+            parts.join(" · ")
+        }
+        "session_close" => "closed".into(),
+        "session_write" => number("bytes")
+            .map(|bytes| format!("{bytes} B"))
+            .unwrap_or_default(),
+        "web_request" | "http_request" => {
+            let mut parts = Vec::new();
+            if let Some(status) = number("status") {
+                parts.push(format!("HTTP {status}"));
+            }
+            if let Some(bytes) = number("bytes") {
+                parts.push(format!("{bytes} B"));
+            }
+            if value.get("truncated") == Some(&Value::Bool(true)) {
+                parts.push("truncated".into());
+            }
+            parts.join(" · ")
+        }
+        _ => return None,
+    };
+    (!summary.is_empty()).then_some(summary)
+}
+
+fn observation_summary(tool: &str, data: &Value) -> Option<String> {
+    let observation = data.get("observation")?;
+    let value = match observation {
+        Value::String(text) => {
+            serde_json::from_str::<Value>(text).unwrap_or_else(|_| Value::String(text.clone()))
+        }
+        other => other.clone(),
+    };
+    if let Some(summary) = structured_summary(tool, &value) {
+        return Some(summary);
+    }
+    let text = match &value {
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    };
+    Some(shorten_hex_ids(&clean_inline(&text, 140)))
 }
 
 fn compact_json(value: &Value, max_chars: usize) -> String {
@@ -6128,13 +7279,14 @@ fn tool_summary(tool: &str, args: &Value) -> String {
         "session_exec" => string_field(args, "command")
             .unwrap_or_default()
             .to_string(),
-        "session_create" => string_field(args, "name")
-            .or_else(|| string_field(args, "kind"))
-            .unwrap_or_default()
-            .to_string(),
-        "session_close" => string_field(args, "session_id")
-            .unwrap_or_default()
-            .to_string(),
+        "session_create" => match string_field(args, "name").or_else(|| string_field(args, "kind"))
+        {
+            Some(name) => name.to_string(),
+            None => string_field(args, "env_id")
+                .map(short_id)
+                .unwrap_or_default(),
+        },
+        "session_close" => short_id(string_field(args, "session_id").unwrap_or_default()),
         "env_create" => {
             let kind = string_field(args, "kind").unwrap_or("managed");
             let name = string_field(args, "name").unwrap_or("");
@@ -6168,7 +7320,7 @@ fn tool_summary(tool: &str, args: &Value) -> String {
             format!("{method} {url}")
         }
         "artifact_read" => {
-            let id = string_field(args, "id").unwrap_or_default();
+            let id = short_id(string_field(args, "id").unwrap_or_default());
             let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
             format!("artifact {id} @{offset}")
         }
@@ -6185,6 +7337,22 @@ fn tool_summary(tool: &str, args: &Value) -> String {
     } else {
         truncate(value.trim(), 180)
     }
+}
+
+/// Clamps a byte cursor to the string and backs it up to a character
+/// boundary. A cursor shared between setup fields can otherwise land inside a
+/// multi-byte character and make a later slice panic.
+fn pad_display(text: &str, width: usize) -> String {
+    let used = UnicodeWidthStr::width(text);
+    format!("{text}{}", " ".repeat(width.saturating_sub(used)))
+}
+
+fn char_boundary_at_or_before(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {
@@ -6316,6 +7484,65 @@ mod tests {
     }
 
     #[test]
+    fn tool_results_use_compact_structured_summaries() {
+        let exec = json!({
+            "observation": {
+                "exit_code": 0,
+                "stdout": "session-one",
+                "duration_ms": 3
+            }
+        });
+        assert_eq!(
+            observation_summary("session_exec", &exec).as_deref(),
+            Some("exit 0 · session-one · 3ms")
+        );
+
+        let id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let artifact = json!({
+            "observation": format!("[artifact {id} (4954 bytes)] preview")
+        });
+        assert_eq!(artifact_bytes(&artifact), Some(4954));
+        assert_eq!(short_id(id), "0123456789a…");
+
+        let read = json!({
+            "observation": {
+                "bytes": 200,
+                "next_offset": 200,
+                "encoding": "utf8"
+            }
+        });
+        assert_eq!(
+            observation_summary("artifact_read", &read).as_deref(),
+            Some("200 B · offset 200 · utf8")
+        );
+    }
+
+    #[test]
+    fn neutral_system_events_do_not_split_a_tool_group() {
+        let assistant = ChatLine {
+            task_id: "task-1".into(),
+            role: ChatRole::Assistant,
+            text: "run it".into(),
+            streaming: false,
+        };
+        let approval = ChatLine {
+            task_id: "task-1".into(),
+            role: ChatRole::System,
+            text: "⧗ approval requested · session_exec".into(),
+            streaming: false,
+        };
+        let tool = ChatLine {
+            task_id: "task-1".into(),
+            role: ChatRole::Tool,
+            text: "✓ session_exec  exit 0".into(),
+            streaming: false,
+        };
+        let groups = build_chat_groups(&[&assistant, &approval, &tool], 80);
+        assert!(groups[0].show_label);
+        assert!(!groups[2].show_label);
+    }
+
+    #[test]
     fn tool_summaries_are_readable() {
         assert_eq!(
             tool_summary("session_exec", &json!({"command": "id"})),
@@ -6438,6 +7665,24 @@ mod tests {
         append_agent_text(&mut chat, "task-1", "done", false);
         assert_eq!(chat.len(), 2);
         assert_eq!(chat[1].text, "done");
+    }
+
+    #[test]
+    fn text_after_a_tool_call_starts_a_new_assistant_block() {
+        let mut chat = Vec::new();
+        append_agent_text(&mut chat, "task-1", "first step", true);
+        chat.push(ChatLine {
+            task_id: "task-1".into(),
+            role: ChatRole::Tool,
+            text: "▸ exec".into(),
+            streaming: false,
+        });
+        append_agent_text(&mut chat, "task-1", "second step", true);
+        assert_eq!(chat.len(), 3);
+        assert_eq!(chat[0].text, "first step");
+        assert_eq!(chat[2].text, "second step");
+        finish_streaming(&mut chat, "task-1");
+        assert!(chat.iter().all(|line| !line.streaming));
     }
 
     #[test]
@@ -7060,7 +8305,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
-    fn mode_change_does_not_replace_the_open_session() {
+    fn mode_change_for_an_unknown_task_uses_next_session() {
         let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
             return;
         };
@@ -7085,6 +8330,40 @@ mod tests {
         assert!(!app.new_task, "changing a mode must not open a session");
         assert_eq!(app.selected_task, 0);
         assert!(app.status.contains("next session"));
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd; set MSK_TUI_TEST_ROOT"]
+    fn mode_switch_applies_to_the_open_session() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app =
+            DaemonApp::connect(PathBuf::from(root), 100, Some("scripted".into())).unwrap();
+        app.setup = None;
+        app.create_task_with_goal("mode switch test", false);
+        for _ in 0..100 {
+            let _ = app.refresh();
+            let _ = app.reload_tasks();
+            if app.selected_state() == "waiting_input" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(app.selected_state(), "waiting_input");
+        let replacement = app
+            .modes
+            .iter()
+            .position(|mode| mode.id == "plan")
+            .expect("plan mode");
+        app.mode_selection = replacement;
+        app.show_modes = true;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.new_task);
+        assert_eq!(app.selected_mode(), "plan");
+        assert_eq!(app.mode, "plan");
+        assert!(!app.status.is_empty());
+        app.cancel_task();
     }
 
     #[test]
@@ -7139,17 +8418,22 @@ mod tests {
         app.input = "hello tui".into();
         app.input_cursor = app.input.len();
         app.send_message();
+        let selected = app.selected_task_id();
         for _ in 0..100 {
             let _ = app.refresh();
             if app.chat.iter().any(|line| {
-                line.role == ChatRole::Assistant && line.text.contains("echo: hello tui")
+                Some(line.task_id.as_str()) == selected.as_deref()
+                    && line.role == ChatRole::Assistant
+                    && line.text.contains("echo: hello tui")
             }) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
         assert!(app.chat.iter().any(|line| {
-            line.role == ChatRole::Assistant && line.text.contains("echo: hello tui")
+            Some(line.task_id.as_str()) == selected.as_deref()
+                && line.role == ChatRole::Assistant
+                && line.text.contains("echo: hello tui")
         }));
 
         let backend = TestBackend::new(120, 40);
@@ -7164,7 +8448,9 @@ mod tests {
             .collect();
         assert!(content.contains("hello tui"));
         assert!(content.contains("echo: hello tui"));
-        assert!(content.contains("攻击") || content.contains("exploit"));
+        assert!(
+            content.contains("攻击") || content.contains("攻 击") || content.contains("exploit")
+        );
         assert!(content.contains("scripted"));
         app.cancel_task();
     }

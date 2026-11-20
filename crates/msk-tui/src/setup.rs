@@ -54,11 +54,14 @@ impl DaemonApp {
                     .to_string(),
             };
             if !cleaned.is_empty() {
-                let cursor = setup.input_cursor;
+                let cursor = setup
+                    .text_ref()
+                    .map(|field| char_boundary_at_or_before(field, setup.input_cursor))
+                    .unwrap_or(0);
                 if let Some(field) = setup.text_field() {
                     field.insert_str(cursor, &cleaned);
                 }
-                setup.input_cursor += cleaned.len();
+                setup.input_cursor = cursor + cleaned.len();
                 self.status = if setup.step == SetupStep::ApiKey {
                     "key pasted (hidden)".into()
                 } else {
@@ -73,8 +76,11 @@ impl DaemonApp {
         let Some(mut setup) = self.setup.take() else {
             return false;
         };
-        if let Some(length) = setup.text_len() {
-            setup.input_cursor = clamp_cursor(setup.input_cursor, length);
+        if let Some(cursor) = setup
+            .text_ref()
+            .map(|field| char_boundary_at_or_before(field, setup.input_cursor))
+        {
+            setup.input_cursor = cursor;
         }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         if control && key.code == KeyCode::Char('u') {
@@ -268,6 +274,7 @@ impl DaemonApp {
             permission: self.permission.clone(),
             api_key: self.api_key.clone(),
             profiles: self.profiles.clone(),
+            language: self.language.id().to_string(),
         };
         self.show_providers = false;
         self.provider_delete_armed = None;
@@ -379,8 +386,16 @@ impl DaemonApp {
             return;
         };
         let outer = frame.area();
-        let width = 84.min(outer.width.saturating_sub(6)).max(32);
-        let height = 24.min(outer.height.saturating_sub(2)).max(14);
+        // Short or narrow terminals get the same wizard without the long
+        // explanatory copy, so the options and controls stay on screen.
+        let compact = outer.height < 32 || outer.width < 76;
+        let margin = if compact { 0 } else { 6 };
+        let width = 84.min(outer.width.saturating_sub(margin)).max(32);
+        let height = if compact {
+            22.min(outer.height.saturating_sub(2)).max(12)
+        } else {
+            24.min(outer.height.saturating_sub(2)).max(14)
+        };
         let area = Rect {
             x: outer.x + outer.width.saturating_sub(width) / 2,
             y: outer.y + outer.height.saturating_sub(height) / 2,
@@ -388,7 +403,7 @@ impl DaemonApp {
             height,
         };
         frame.render_widget(Clear, area);
-        let block = panel_block("setup", ACCENT);
+        let block = panel_block(i18n::t("setup.title"), ACCENT);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.width < 20 || inner.height < 8 {
@@ -397,68 +412,90 @@ impl DaemonApp {
 
         let provider = setup.selected_provider();
         let mut lines: Vec<Line> = Vec::new();
-        lines.push(Line::from(vec![
-            Span::styled(
-                "MitnickSolve",
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("   connect a model", Style::default().fg(DIM)),
-        ]));
-        lines.push(Line::from(Span::styled(
-            "You can change all of this later with ctrl+p.",
-            Style::default().fg(FAINT),
-        )));
-        lines.push(Line::from(""));
-        lines.push(step_line(setup.step, requires_key(provider)));
+        if !compact {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "MitnickSolve",
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("   {}", i18n::t("setup.connect")),
+                    Style::default().fg(DIM),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                i18n::t("setup.intro"),
+                Style::default().fg(FAINT),
+            )));
+            lines.push(Line::from(""));
+        }
+        lines.push(if compact {
+            compact_step_line(setup.step, requires_key(provider))
+        } else {
+            step_line(setup.step, requires_key(provider))
+        });
         lines.push(Line::from(""));
 
         let mut input_line: Option<usize> = None;
         match setup.step {
             SetupStep::Provider => {
                 lines.push(Line::from(Span::styled(
-                    "Choose how the agent reaches a model",
+                    i18n::t("setup.provider.title"),
                     Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                 )));
-                lines.push(Line::from(Span::styled(
-                    "scripted-demo needs no key and works offline.",
-                    Style::default().fg(DIM),
-                )));
-                lines.push(Line::from(""));
-                for (index, (name, description)) in PROVIDERS.iter().enumerate() {
-                    lines.push(option_line(index == setup.provider, *name, description));
+                if !compact {
+                    lines.push(Line::from(Span::styled(
+                        i18n::t("setup.provider.hint"),
+                        Style::default().fg(DIM),
+                    )));
                 }
-            }
-            SetupStep::Preset => {
-                lines.push(Line::from(Span::styled(
-                    "Service endpoint",
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-                )));
-                lines.push(Line::from(Span::styled(
-                    "Presets fill the base URL; choose or type a model next.",
-                    Style::default().fg(DIM),
-                )));
                 lines.push(Line::from(""));
-                for (index, (_, label, url, _)) in SERVICE_PRESETS.iter().enumerate() {
+                for (index, (name, _)) in PROVIDERS.iter().enumerate() {
                     lines.push(option_line(
-                        index == setup.preset,
-                        label,
-                        if url.is_empty() {
-                            "keep the endpoint you type in the next step"
+                        index == setup.provider,
+                        *name,
+                        if compact {
+                            ""
                         } else {
-                            url
+                            provider_description(name)
                         },
                     ));
                 }
             }
-            SetupStep::Model => {
+            SetupStep::Preset => {
                 lines.push(Line::from(Span::styled(
-                    format!("Model for {provider}"),
+                    i18n::t("setup.preset.title"),
                     Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                 )));
+                if !compact {
+                    lines.push(Line::from(Span::styled(
+                        i18n::t("setup.preset.hint"),
+                        Style::default().fg(DIM),
+                    )));
+                }
+                lines.push(Line::from(""));
+                for (index, (_, label, url, _)) in SERVICE_PRESETS.iter().enumerate() {
+                    let description = if compact {
+                        ""
+                    } else if url.is_empty() {
+                        i18n::t("setup.preset.custom")
+                    } else {
+                        url
+                    };
+                    lines.push(option_line(index == setup.preset, label, description));
+                }
+            }
+            SetupStep::Model => {
                 lines.push(Line::from(Span::styled(
-                    "Choose a preset, or type an exact model id.",
-                    Style::default().fg(DIM),
+                    i18n::tf("setup.model.title", &[provider]),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                 )));
+                if !compact {
+                    lines.push(Line::from(Span::styled(
+                        i18n::t("setup.model.hint"),
+                        Style::default().fg(DIM),
+                    )));
+                }
                 lines.push(Line::from(""));
                 for (index, name) in MODELS.iter().enumerate() {
                     let label = if *name == "custom…" && !setup.model_input.is_empty() {
@@ -466,28 +503,29 @@ impl DaemonApp {
                     } else {
                         (*name).to_string()
                     };
-                    lines.push(option_line(
-                        index == setup.model,
-                        &label,
-                        if *name == "custom…" {
-                            "type any model id"
-                        } else if *name == "gpt-5" {
-                            "flagship reasoning model"
-                        } else {
-                            "OpenAI-compatible model"
-                        },
-                    ));
+                    let description = if compact {
+                        ""
+                    } else if *name == "custom…" {
+                        i18n::t("setup.model.custom_desc")
+                    } else if *name == "gpt-5" {
+                        i18n::t("setup.model.flagship_desc")
+                    } else {
+                        i18n::t("setup.model.compatible_desc")
+                    };
+                    lines.push(option_line(index == setup.model, &label, description));
                 }
             }
             SetupStep::CustomModel => {
                 lines.push(Line::from(Span::styled(
-                    "Exact model name",
+                    i18n::t("setup.custom.title"),
                     Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                 )));
-                lines.push(Line::from(Span::styled(
-                    "This is sent unchanged to the provider.",
-                    Style::default().fg(DIM),
-                )));
+                if !compact {
+                    lines.push(Line::from(Span::styled(
+                        i18n::t("setup.custom.hint"),
+                        Style::default().fg(DIM),
+                    )));
+                }
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
                     Span::styled("❯ ", Style::default().fg(ACCENT)),
@@ -498,27 +536,39 @@ impl DaemonApp {
             }
             SetupStep::Effort => {
                 lines.push(Line::from(Span::styled(
-                    "Reasoning effort",
+                    i18n::t("setup.effort.title"),
                     Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                 )));
-                lines.push(Line::from(Span::styled(
-                    "Sent to OpenAI-compatible providers that support it.",
-                    Style::default().fg(DIM),
-                )));
+                if !compact {
+                    lines.push(Line::from(Span::styled(
+                        i18n::t("setup.effort.hint"),
+                        Style::default().fg(DIM),
+                    )));
+                }
                 lines.push(Line::from(""));
                 for (index, (name, description)) in EFFORTS.iter().enumerate() {
-                    lines.push(option_line(index == setup.effort, *name, description));
+                    lines.push(option_line(
+                        index == setup.effort,
+                        &i18n::effort_label(name),
+                        if compact {
+                            ""
+                        } else {
+                            i18n::effort_desc(name).unwrap_or(description)
+                        },
+                    ));
                 }
             }
             SetupStep::BaseUrl => {
                 lines.push(Line::from(Span::styled(
-                    "Endpoint",
+                    i18n::t("setup.base.title"),
                     Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                 )));
-                lines.push(Line::from(Span::styled(
-                    "OpenAI-compatible base URL. Empty uses MSK_LLM_BASE_URL or the provider default.",
-                    Style::default().fg(DIM),
-                )));
+                if !compact {
+                    lines.push(Line::from(Span::styled(
+                        i18n::t("setup.base.hint"),
+                        Style::default().fg(DIM),
+                    )));
+                }
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
                     Span::styled("❯ ", Style::default().fg(ACCENT)),
@@ -526,28 +576,32 @@ impl DaemonApp {
                     Span::styled("▌", Style::default().fg(ACCENT)),
                 ]));
                 input_line = Some(lines.len().saturating_sub(1));
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "Example: http://127.0.0.1:8080/v1",
-                    Style::default().fg(FAINT),
-                )));
+                if !compact {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        i18n::t("setup.base.example"),
+                        Style::default().fg(FAINT),
+                    )));
+                }
             }
             SetupStep::ApiKey => {
                 lines.push(Line::from(Span::styled(
-                    "API key",
+                    i18n::t("setup.key.title"),
                     Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                 )));
-                lines.push(Line::from(Span::styled(
-                    "Sent to mskd for tasks using this profile, never printed back.",
-                    Style::default().fg(DIM),
-                )));
+                if !compact {
+                    lines.push(Line::from(Span::styled(
+                        i18n::t("setup.key.hint"),
+                        Style::default().fg(DIM),
+                    )));
+                }
                 lines.push(Line::from(""));
                 let masked = masked_key(&setup.api_key);
                 lines.push(Line::from(vec![
                     Span::styled("❯ ", Style::default().fg(ACCENT)),
                     Span::styled(
                         if masked.is_empty() {
-                            "paste or type the key".to_string()
+                            i18n::t("setup.key.placeholder").to_string()
                         } else {
                             masked
                         },
@@ -560,47 +614,72 @@ impl DaemonApp {
                     Span::styled("▌", Style::default().fg(ACCENT)),
                 ]));
                 input_line = Some(lines.len().saturating_sub(1));
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    if is_local_endpoint(&setup.base_url) {
-                        "Local endpoint: the placeholder key is enough unless your server checks it."
-                    } else if setup.api_key.is_empty() {
-                        if self.daemon_llm_key {
-                            "Empty keeps using mskd's MSK_LLM_API_KEY."
+                if !compact {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        if is_local_endpoint(&setup.base_url) {
+                            i18n::t("setup.key.local")
+                        } else if setup.api_key.is_empty() {
+                            if self.daemon_llm_key {
+                                i18n::t("setup.key.empty_env")
+                            } else {
+                                i18n::t("setup.key.empty_requires_env")
+                            }
                         } else {
-                            "Empty is allowed only if mskd has MSK_LLM_API_KEY."
-                        }
-                    } else {
-                        "Stored in tui-config.json on this machine."
-                    },
-                    Style::default().fg(FAINT),
-                )));
+                            i18n::t("setup.key.stored")
+                        },
+                        Style::default().fg(FAINT),
+                    )));
+                }
             }
         }
 
         lines.push(Line::from(""));
-        lines.push(Line::from(""));
-        let key_state = if requires_key(provider) && !setup.api_key.trim().is_empty() {
-            "this profile has an API key"
+        if !compact {
+            lines.push(Line::from(""));
+        }
+        let key_state = if compact {
+            if requires_key(provider) && !setup.api_key.trim().is_empty() {
+                i18n::t("setup.key.set_short")
+            } else if self.daemon_llm_key {
+                i18n::t("setup.key.env_short")
+            } else {
+                i18n::t("setup.key.missing_short")
+            }
+        } else if requires_key(provider) && !setup.api_key.trim().is_empty() {
+            i18n::t("setup.key.profile")
         } else if self.daemon_llm_key {
-            "mskd has MSK_LLM_API_KEY"
+            i18n::t("setup.key.env")
         } else {
-            "no API key yet (type one here or export MSK_LLM_API_KEY in mskd)"
+            i18n::t("setup.key.missing")
         };
         lines.push(Line::from(Span::styled(
-            key_state,
+            if compact {
+                truncate(key_state, inner.width.saturating_sub(2) as usize)
+            } else {
+                key_state.to_string()
+            },
             Style::default().fg(if requires_key(provider) && !self.has_llm_key() {
                 YELLOW
             } else {
                 FAINT
             }),
         )));
+        if !compact {
+            lines.push(Line::from(Span::styled(
+                i18n::tf(
+                    "setup.config",
+                    &[&self.root.join("tui-config.json").display().to_string()],
+                ),
+                Style::default().fg(FAINT),
+            )));
+        }
         lines.push(Line::from(Span::styled(
-            format!("config  {}", self.root.join("tui-config.json").display()),
-            Style::default().fg(FAINT),
-        )));
-        lines.push(Line::from(Span::styled(
-            "↑/↓ choose   Enter next   Esc back/close   Ctrl+U clear input",
+            if compact {
+                i18n::t("setup.keys.compact")
+            } else {
+                i18n::t("setup.keys")
+            },
             Style::default().fg(ACCENT),
         )));
 
@@ -614,13 +693,18 @@ impl DaemonApp {
             },
         );
         if let Some(line_index) = input_line {
-            let cursor = setup.input_cursor;
             let masked_prefix;
             let cursor_text = match setup.step {
-                SetupStep::CustomModel => &setup.model_input[..cursor.min(setup.model_input.len())],
-                SetupStep::BaseUrl => &setup.base_url[..cursor.min(setup.base_url.len())],
+                SetupStep::CustomModel => {
+                    let cursor = char_boundary_at_or_before(&setup.model_input, setup.input_cursor);
+                    &setup.model_input[..cursor]
+                }
+                SetupStep::BaseUrl => {
+                    let cursor = char_boundary_at_or_before(&setup.base_url, setup.input_cursor);
+                    &setup.base_url[..cursor]
+                }
                 SetupStep::ApiKey => {
-                    let offset = cursor.min(setup.api_key.len());
+                    let offset = char_boundary_at_or_before(&setup.api_key, setup.input_cursor);
                     masked_prefix = masked_key(&setup.api_key[..offset]);
                     masked_prefix.as_str()
                 }
@@ -636,16 +720,50 @@ impl DaemonApp {
     }
 }
 
-fn step_line(step: SetupStep, needs_key: bool) -> Line<'static> {
+fn compact_step_line(step: SetupStep, needs_key: bool) -> Line<'static> {
     let mut steps = vec![
-        ("provider", SetupStep::Provider),
-        ("service", SetupStep::Preset),
-        ("model", SetupStep::Model),
-        ("effort", SetupStep::Effort),
-        ("endpoint", SetupStep::BaseUrl),
+        ("setup.step.provider", SetupStep::Provider),
+        ("setup.step.service", SetupStep::Preset),
+        ("setup.step.model", SetupStep::Model),
+        ("setup.step.effort", SetupStep::Effort),
+        ("setup.step.endpoint", SetupStep::BaseUrl),
     ];
     if needs_key {
-        steps.push(("key", SetupStep::ApiKey));
+        steps.push(("setup.step.key", SetupStep::ApiKey));
+    }
+    let active = match step {
+        SetupStep::CustomModel => SetupStep::Model,
+        SetupStep::ApiKey if !needs_key => SetupStep::BaseUrl,
+        other => other,
+    };
+    let index = steps
+        .iter()
+        .position(|(_, candidate)| *candidate == active)
+        .unwrap_or(0);
+    let step_number = (index + 1).to_string();
+    let step_total = steps.len().to_string();
+    Line::from(vec![
+        Span::styled(
+            i18n::tf("setup.step", &[&step_number, &step_total]),
+            Style::default().fg(FAINT),
+        ),
+        Span::styled(
+            format!("  · {}", i18n::t(steps[index].0)),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn step_line(step: SetupStep, needs_key: bool) -> Line<'static> {
+    let mut steps = vec![
+        ("setup.step.provider", SetupStep::Provider),
+        ("setup.step.service", SetupStep::Preset),
+        ("setup.step.model", SetupStep::Model),
+        ("setup.step.effort", SetupStep::Effort),
+        ("setup.step.endpoint", SetupStep::BaseUrl),
+    ];
+    if needs_key {
+        steps.push(("setup.step.key", SetupStep::ApiKey));
     }
     let active = match step {
         SetupStep::CustomModel => SetupStep::Model,
@@ -657,6 +775,7 @@ fn step_line(step: SetupStep, needs_key: bool) -> Line<'static> {
         if index > 0 {
             spans.push(Span::styled("  ›  ", Style::default().fg(FAINT)));
         }
+        let label = i18n::t(*label);
         if *candidate == active {
             spans.push(Span::styled(
                 format!("● {label}"),
@@ -670,6 +789,16 @@ fn step_line(step: SetupStep, needs_key: bool) -> Line<'static> {
         }
     }
     Line::from(spans)
+}
+
+fn provider_description(name: &str) -> &'static str {
+    match name {
+        "scripted-demo" => i18n::t("provider.scripted-demo.desc"),
+        "openai" => i18n::t("provider.openai.desc"),
+        "openai-responses" => i18n::t("provider.openai-responses.desc"),
+        "component" => i18n::t("provider.component.desc"),
+        _ => "",
+    }
 }
 
 fn is_text_step(step: SetupStep) -> bool {
@@ -715,10 +844,6 @@ impl SetupState {
     }
 }
 
-fn clamp_cursor(cursor: usize, length: usize) -> usize {
-    cursor.min(length)
-}
-
 fn option_line(selected: bool, name: &str, description: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
@@ -726,7 +851,7 @@ fn option_line(selected: bool, name: &str, description: &str) -> Line<'static> {
             Style::default().fg(ACCENT),
         ),
         Span::styled(
-            format!("{name:<20}"),
+            pad_display(name, 20),
             if selected {
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
             } else {
@@ -742,10 +867,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cursor_is_clamped_when_switching_to_an_empty_field() {
-        assert_eq!(clamp_cursor(24, 0), 0);
-        assert_eq!(clamp_cursor(4, 0), 0);
-        assert_eq!(clamp_cursor(2, 7), 2);
+    fn cursor_is_clamped_and_snapped_when_switching_fields() {
+        assert_eq!(char_boundary_at_or_before("", 24), 0);
+        assert_eq!(char_boundary_at_or_before("abc", 2), 2);
+        assert_eq!(char_boundary_at_or_before("a中b", 2), 1);
     }
 
     #[test]

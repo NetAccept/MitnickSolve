@@ -435,21 +435,7 @@ impl LlmProvider for OpenAiProvider {
             Ok(())
         })?;
 
-        let tool_calls = calls
-            .into_iter()
-            .map(|(index, (id, name, arguments))| {
-                let args = serde_json::from_str(&arguments).unwrap_or(Value::Null);
-                ToolCall {
-                    id: if id.is_empty() {
-                        format!("call-{index}")
-                    } else {
-                        id
-                    },
-                    tool: name,
-                    args,
-                }
-            })
-            .collect();
+        let tool_calls = streamed_tool_calls(calls)?;
 
         Ok(LlmResponse {
             text,
@@ -459,6 +445,40 @@ impl LlmProvider for OpenAiProvider {
             provider_items: Vec::new(),
         })
     }
+}
+
+/// Joins the per-index fragments of a streamed tool call. Empty arguments are
+/// treated as `{}` (some providers omit them for argument-less tools), but a
+/// truncated JSON fragment must fail the turn instead of running a tool with
+/// null arguments.
+fn streamed_tool_calls(
+    calls: BTreeMap<usize, (String, String, String)>,
+) -> Result<Vec<ToolCall>, LlmError> {
+    let mut tool_calls = Vec::with_capacity(calls.len());
+    for (index, (id, name, arguments)) in calls {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err(LlmError::Provider(format!(
+                "streamed tool call {index} has no name"
+            )));
+        }
+        let args = if arguments.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&arguments)
+                .map_err(|err| LlmError::Provider(format!("streamed tool arguments: {err}")))?
+        };
+        tool_calls.push(ToolCall {
+            id: if id.is_empty() {
+                format!("call-{index}")
+            } else {
+                id
+            },
+            tool: name,
+            args,
+        });
+    }
+    Ok(tool_calls)
 }
 
 fn chat_message(message: &Message) -> Value {
@@ -831,6 +851,22 @@ mod tests {
         assert_eq!(response.tool_calls[0].tool, "session_exec");
         assert_eq!(response.tool_calls[0].args["command"], "echo hi");
         assert_eq!(response.usage_tokens, 12);
+    }
+
+    #[test]
+    fn streamed_tool_calls_handle_empty_and_truncated_arguments() {
+        let mut calls = BTreeMap::new();
+        calls.insert(0, ("call_1".into(), "echo".into(), String::new()));
+        let parsed = streamed_tool_calls(calls).unwrap();
+        assert_eq!(parsed[0].args, json!({}));
+
+        let mut calls = BTreeMap::new();
+        calls.insert(0, ("call_2".into(), "exec".into(), "{\"argv\":".into()));
+        assert!(streamed_tool_calls(calls).is_err());
+
+        let mut calls = BTreeMap::new();
+        calls.insert(0, ("call_3".into(), String::new(), "{}".into()));
+        assert!(streamed_tool_calls(calls).is_err());
     }
 
     #[test]

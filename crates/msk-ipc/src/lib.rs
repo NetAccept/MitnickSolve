@@ -246,6 +246,10 @@ pub fn normalize_root(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         let text = canonical.to_string_lossy();
+        // UNC verbatim paths need their \\server\share form restored.
+        if let Some(stripped) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{stripped}"));
+        }
         if let Some(stripped) = text.strip_prefix(r"\\?\") {
             return PathBuf::from(stripped);
         }
@@ -382,11 +386,23 @@ impl Client {
                 .writer
                 .lock()
                 .map_err(|_| io::Error::other("writer poisoned"))?;
-            write_json_line(&mut *writer, &value)?;
+            if let Err(err) = write_json_line(&mut *writer, &value) {
+                self.drop_pending(id);
+                return Err(err);
+            }
         }
-        let response = receiver
-            .recv_timeout(timeout)
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "IPC response timeout"))?;
+        let response = match receiver.recv_timeout(timeout) {
+            Ok(response) => response,
+            Err(_) => {
+                // Stop a late response from being mistaken for a notification
+                // and keep repeated timeouts from growing the pending map.
+                self.drop_pending(id);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "IPC response timeout",
+                ));
+            }
+        };
         if let Some(error) = response.get("error") {
             return Err(io::Error::other(error.to_string()));
         }
@@ -394,6 +410,12 @@ impl Client {
             .get("result")
             .cloned()
             .unwrap_or(serde_json::Value::Null))
+    }
+
+    fn drop_pending(&self, id: u64) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&id);
+        }
     }
 
     pub fn subscribe(&mut self, task: Option<&str>) -> io::Result<u64> {
@@ -425,6 +447,7 @@ pub mod methods {
     pub const TASK_CREATE: &str = "task.create";
     pub const TASK_MESSAGE: &str = "task.message";
     pub const TASK_INTERRUPT: &str = "task.interrupt";
+    pub const TASK_MODE: &str = "task.mode";
     pub const TASK_CANCEL: &str = "task.cancel";
     pub const TASK_STATE: &str = "task.state";
     pub const TASK_LIST: &str = "task.list";

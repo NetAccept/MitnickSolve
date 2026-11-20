@@ -114,6 +114,14 @@ pub fn transcript(events: &[Event], task: Option<&str>) -> String {
                     .unwrap_or("");
                 out.push_str(&format!("tool {tool} error: {error}\n"));
             }
+            "mode.switch" => {
+                let mode = event
+                    .data
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                out.push_str(&format!("mode: switched to {mode}\n"));
+            }
             "approval.request" => {
                 let tool = event
                     .data

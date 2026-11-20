@@ -2,16 +2,17 @@
 //! context, artifact store, and event sink across many user turns. A failed
 //! turn ends that turn, not the session.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use msk_core::context::{ContextLimits, ContextManager, ContextMessage, Role};
 use msk_core::{PolicyDecision, ToolCall};
 use msk_data::ObjectStore;
 use msk_events::{Event, EventSink};
+use msk_kernel::mode::ModeRegistry;
 use msk_llm::{LlmDelta, LlmProvider};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -105,6 +106,14 @@ pub struct SessionOptions {
     pub provider: Box<dyn LlmProvider>,
     pub context: ContextManager,
     pub limits: ContextLimits,
+    /// Mode registry used to resolve per-turn tool sets. `None` keeps every
+    /// tool in `registry` available (used by unit tests and one-shot runs).
+    pub modes: Option<Arc<ModeRegistry>>,
+    /// Current agent mode id.
+    pub mode: String,
+    /// Shared with `EnvHost` so host-side checks (web_request, spawn_agent)
+    /// follow a mode switch.
+    pub mode_handle: Option<Arc<Mutex<String>>>,
     pub objects: Arc<dyn ObjectStore>,
     pub sink: Arc<dyn EventSink>,
     pub max_steps: usize,
@@ -122,6 +131,10 @@ pub struct Session {
     provider: Box<dyn LlmProvider>,
     context: ContextManager,
     limits: ContextLimits,
+    modes: Option<Arc<ModeRegistry>>,
+    mode: String,
+    mode_handle: Option<Arc<Mutex<String>>>,
+    allowed_tools: Option<HashSet<String>>,
     objects: Arc<dyn ObjectStore>,
     sink: Arc<dyn EventSink>,
     max_steps: usize,
@@ -139,12 +152,24 @@ pub struct Session {
 
 impl Session {
     pub fn new(options: SessionOptions) -> Self {
+        let mode = options.mode.clone();
+        let allowed_tools = options.modes.as_ref().map(|modes| {
+            modes
+                .tool_names(&mode)
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        });
         Self {
             env_id: options.env_id,
             registry: options.registry,
             provider: options.provider,
             context: options.context,
             limits: options.limits,
+            modes: options.modes,
+            mode,
+            mode_handle: options.mode_handle,
+            allowed_tools,
             objects: options.objects,
             sink: options.sink,
             max_steps: options.max_steps,
@@ -167,6 +192,44 @@ impl Session {
 
     pub fn cancel_token(&self) -> CancelToken {
         self.cancel.clone()
+    }
+
+    pub fn mode(&self) -> &str {
+        &self.mode
+    }
+
+    /// Switches the mode used for subsequent turns. The next provider request
+    /// only exposes the new mode's tools, and `run_tool` rejects anything
+    /// outside that set even if the model invents a call.
+    pub fn set_mode(&mut self, mode: &str) -> std::result::Result<(), String> {
+        let modes = self
+            .modes
+            .as_ref()
+            .ok_or_else(|| "mode switching is not configured".to_string())?;
+        if modes.spec(mode).is_none() {
+            return Err(format!("unknown mode: {mode}"));
+        }
+        let names = modes.tool_names(mode);
+        self.allowed_tools = Some(names.iter().map(|name| (*name).to_string()).collect());
+        self.mode = mode.to_string();
+        if let Some(handle) = &self.mode_handle
+            && let Ok(mut current) = handle.lock()
+        {
+            *current = mode.to_string();
+        }
+        let label = modes.label(mode);
+        let prompt = modes.prompt(mode);
+        self.context.push_pinned(
+            Role::System,
+            format!(
+                "Current agent mode is now {mode} ({label}). Previous mode instructions are superseded. {prompt}"
+            ),
+        );
+        self.emit(
+            "mode.switch",
+            json!({"mode": mode, "label": label, "tools": names}),
+        );
+        Ok(())
     }
 
     pub fn turns(&self) -> u64 {
@@ -197,7 +260,7 @@ impl Session {
             if self.cancel.is_cancelled() {
                 return self.finish_interrupted();
             }
-            let request = llm_request(&self.context, &self.registry);
+            let request = llm_request(&self.context, &self.registry, self.allowed_tools.as_ref());
             let response = match complete_or_stream(
                 self.provider.as_ref(),
                 &request,
@@ -304,6 +367,23 @@ impl Session {
             return;
         }
 
+        if let Some(allowed) = &self.allowed_tools
+            && !allowed.contains(&call.tool)
+        {
+            self.emit(
+                "policy.decision",
+                json!({
+                    "tool": call.tool,
+                    "decision": "deny",
+                    "reason": "not allowed in current mode"
+                }),
+            );
+            self.push_tool_error(
+                &call,
+                format!("tool {} is not available in {} mode", call.tool, self.mode),
+            );
+            return;
+        }
         let (decision, context) = match self.registry.get(&call.tool) {
             Some(tool) => (tool.decision, tool.context.clone()),
             None => {
@@ -639,6 +719,9 @@ mod tests {
             provider: Box::new(ScriptedProvider::new("scripted", responses)),
             context,
             limits,
+            modes: None,
+            mode: "exploit".into(),
+            mode_handle: None,
             objects: Arc::new(MemoryObjectStore::new()),
             sink: Arc::new(NullSink),
             max_steps: 4,
@@ -791,6 +874,9 @@ mod tests {
                 context
             },
             limits,
+            modes: None,
+            mode: "exploit".into(),
+            mode_handle: None,
             objects: Arc::new(MemoryObjectStore::new()),
             sink: Arc::new(NullSink),
             max_steps: 4,
@@ -844,6 +930,9 @@ mod tests {
             provider: Box::new(msk_llm::EchoProvider::new("echo")),
             context,
             limits: limits.clone(),
+            modes: None,
+            mode: "exploit".into(),
+            mode_handle: None,
             objects: Arc::new(MemoryObjectStore::new()),
             sink: Arc::new(NullSink),
             max_steps: 4,
@@ -958,6 +1047,9 @@ mod tests {
             )),
             context: ContextManager::new(limits.clone()),
             limits,
+            modes: None,
+            mode: "exploit".into(),
+            mode_handle: None,
             objects: Arc::new(MemoryObjectStore::new()),
             sink: Arc::new(NullSink),
             max_steps: 4,
