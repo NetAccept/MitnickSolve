@@ -15,7 +15,7 @@
   "home.example.triage": "triage ./evidence and summarize the findings",
   "home.demo": "/demo runs the offline tool demo",
   "composer.reply": "Reply…",
-  "composer.reply.hint": "Reply…   Shift+Enter for a new line",
+  "composer.reply.hint": "Reply…   Shift+Enter or Ctrl+J for a new line",
   "composer.missing_key": "missing API key · ctrl+p providers",
   "hints.sessions": "tab sessions",
   "hints.new": "ctrl+n new",
@@ -224,7 +224,7 @@
   "provider.openai-responses.desc": "OpenAI Responses API function calls",
   "provider.component.desc": "signed llm.provider component configured on mskd",
   "help.title": "keyboard shortcuts",
-  "help.body": "MitnickSolve conversational workbench\n\nEnter / i  write a message, or describe a new challenge\nEnter      send / start the task\nEsc        leave the editor without sending\n← / →      move the input cursor\nCtrl+U     clear the input\nPgUp/PgDn  scroll the conversation\nv          toggle the raw event inspector\nEnd        jump to the newest message\nj / k      previous / next session\ng / G      first / last session\nn          start a new session\ns          interrupt the running turn\nx          cancel the selected task\nt          open/focus the PTY terminal\nCtrl+Q     detach from terminal focus\ny / n      approve / deny a pending request\n?          toggle this help\nq          quit\n\nSlash commands in the editor:\n/new [goal]  /provider NAME  /terminal  /approvals\n/settings  /language  /interrupt  /cancel  /clear  /status  /help  /quit\n\nProviders: scripted, scripted-demo, openai, responses, component.\n◆ marks an interactive task; tool calls appear inline in the conversation.",
+  "help.body": "MitnickSolve conversational workbench\n\nEnter / i  write a message, or describe a new challenge\nEnter      send / start the task\nShift+Enter / Ctrl+J  insert a new line\nEsc        leave the editor without sending\n← / →      move the input cursor\nCtrl+U     clear the input\nPgUp/PgDn  scroll the conversation\nv          toggle the raw event inspector\nEnd        jump to the newest message\nj / k      previous / next session\ng / G      first / last session\nn          start a new session\ns          interrupt the running turn\nx          cancel the selected task\nt          open/focus the PTY terminal\nCtrl+Q     detach from terminal focus\ny / n      approve / deny a pending request\n?          toggle this help\nq          quit\n\nSlash commands in the editor:\n/new [goal]  /provider NAME  /terminal  /approvals\n/settings  /language  /interrupt  /cancel  /clear  /status  /help  /quit\n\nProviders: scripted, scripted-demo, openai, responses, component.\n◆ marks an interactive task; tool calls appear inline in the conversation.",
   "settings.current": "current {0}",
   "providers.next": "next session provider: {0}",
   "providers.next_current": "provider for next session: {0} · current stays {1} · ctrl+n starts it",
@@ -237,5 +237,6 @@
   "effort.next_current": "effort for next session: {0} · current stays {1} · ctrl+n starts it",
   "palette.status": "commands · type to filter · Enter run · Esc close",
   "modes.applied": "mode switched to {0} for the next turn",
-  "modes.switched": "mode switched to {0}"
+  "modes.switched": "mode switched to {0}",
+  "state.saved": "saved"
 }

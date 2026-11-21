@@ -15,7 +15,7 @@
   "home.example.triage": "分析 ./evidence 并总结发现",
   "home.demo": "/demo 运行离线工具演示",
   "composer.reply": "回复…",
-  "composer.reply.hint": "回复…   Shift+Enter 换行",
+  "composer.reply.hint": "回复…   Shift+Enter 或 Ctrl+J 换行",
   "composer.missing_key": "缺少 API key · ctrl+p 提供商",
   "hints.sessions": "tab 会话",
   "hints.new": "ctrl+n 新建",
@@ -224,7 +224,7 @@
   "provider.openai-responses.desc": "OpenAI Responses API 函数调用",
   "provider.component.desc": "mskd 上配置的签名 llm.provider 组件",
   "help.title": "键盘快捷键",
-  "help.body": "MitnickSolve 对话工作台\n\nEnter / i  输入消息，或描述新挑战\nEnter      发送 / 启动任务\nEsc        退出编辑器但不发送\n← / →      移动输入光标\nCtrl+U     清空输入\nPgUp/PgDn  滚动对话\nv          切换原始事件检查器\nEnd        跳到最新消息\nj / k      上一个 / 下一个会话\ng / G      第一个 / 最后一个会话\nn          新建会话\ns          中断当前回合\nx          取消选中任务\nt          打开/聚焦 PTY 终端\nCtrl+Q     从终端焦点分离\ny / n      批准 / 拒绝待审批请求\n?          切换帮助\nq          退出\n\n编辑器中的斜杠命令：\n/new [目标]  /provider NAME  /terminal  /approvals\n/settings  /language  /interrupt  /cancel  /clear  /status  /help  /quit\n\n提供商：scripted、scripted-demo、openai、responses、component。\n◆ 标记交互任务；工具调用会内联显示在对话中。",
+  "help.body": "MitnickSolve 对话工作台\n\nEnter / i  输入消息，或描述新挑战\nEnter      发送 / 启动任务\nShift+Enter / Ctrl+J  换行\nEsc        退出编辑器但不发送\n← / →      移动输入光标\nCtrl+U     清空输入\nPgUp/PgDn  滚动对话\nv          切换原始事件检查器\nEnd        跳到最新消息\nj / k      上一个 / 下一个会话\ng / G      第一个 / 最后一个会话\nn          新建会话\ns          中断当前回合\nx          取消选中任务\nt          打开/聚焦 PTY 终端\nCtrl+Q     从终端焦点分离\ny / n      批准 / 拒绝待审批请求\n?          切换帮助\nq          退出\n\n编辑器中的斜杠命令：\n/new [目标]  /provider NAME  /terminal  /approvals\n/settings  /language  /interrupt  /cancel  /clear  /status  /help  /quit\n\n提供商：scripted、scripted-demo、openai、responses、component。\n◆ 标记交互任务；工具调用会内联显示在对话中。",
   "settings.current": "当前 {0}",
   "providers.next": "下一个会话提供商：{0}",
   "providers.next_current": "下一个会话提供商：{0} · 当前仍为 {1} · ctrl+n 启动新会话",
@@ -237,5 +237,6 @@
   "effort.next_current": "下一个会话推理强度：{0} · 当前仍为 {1} · ctrl+n 启动新会话",
   "palette.status": "命令 · 输入以筛选 · Enter 运行 · Esc 关闭",
   "modes.applied": "模式已切换到 {0}，下一条消息生效",
-  "modes.switched": "模式已切换为 {0}"
+  "modes.switched": "模式已切换为 {0}",
+  "state.saved": "已保存"
 }

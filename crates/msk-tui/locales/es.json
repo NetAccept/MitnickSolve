@@ -15,7 +15,7 @@
   "home.example.triage": "analiza ./evidence y resume los hallazgos",
   "home.demo": "/demo ejecuta la demo de herramientas sin conexión",
   "composer.reply": "Responder…",
-  "composer.reply.hint": "Responder…   Shift+Enter para nueva línea",
+  "composer.reply.hint": "Responder…   Shift+Enter o Ctrl+J para nueva línea",
   "composer.missing_key": "falta la API key · ctrl+p proveedores",
   "hints.sessions": "tab sesiones",
   "hints.new": "ctrl+n nueva",
@@ -235,7 +235,8 @@
   "setup.config": "config  {0}",
   "setup.keys": "↑/↓ elegir   Enter siguiente   Esc atrás/cerrar   Ctrl+U borrar entrada",
   "setup.keys.compact": "↑/↓ elegir · Enter siguiente · Esc atrás",
-  "help.body": "Banco de trabajo conversacional MitnickSolve\n\nEnter / i  escribe un mensaje o describe un reto nuevo\nEnter      enviar / iniciar la tarea\nEsc        salir del editor sin enviar\n← / →      mover el cursor de entrada\nCtrl+U     borrar la entrada\nPgUp/PgDn  desplazar la conversación\nv          alternar el inspector de eventos\nEnd        ir al mensaje más reciente\nj / k      sesión anterior / siguiente\ng / G      primera / última sesión\nn          iniciar una sesión nueva\ns          interrumpir el turno en ejecución\nx          cancelar la tarea seleccionada\nt          abrir/enfocar la terminal PTY\nCtrl+Q     soltar el foco de la terminal\ny / n      aprobar / denegar una solicitud pendiente\n?          alternar esta ayuda\nq          salir\n\nComandos de barra en el editor:\n/new [objetivo]  /provider NAME  /settings  /language  /terminal  /approvals\n/interrupt  /cancel  /clear  /status  /help  /quit\n\nProveedores: scripted, scripted-demo, openai, responses, component.\n◆ marca una tarea interactiva; las llamadas a herramientas aparecen en la conversación.",
+  "help.body": "Banco de trabajo conversacional MitnickSolve\n\nEnter / i  escribe un mensaje o describe un reto nuevo\nEnter      enviar / iniciar la tarea\nShift+Enter / Ctrl+J  insertar una línea nueva\nEsc        salir del editor sin enviar\n← / →      mover el cursor de entrada\nCtrl+U     borrar la entrada\nPgUp/PgDn  desplazar la conversación\nv          alternar el inspector de eventos\nEnd        ir al mensaje más reciente\nj / k      sesión anterior / siguiente\ng / G      primera / última sesión\nn          iniciar una sesión nueva\ns          interrumpir el turno en ejecución\nx          cancelar la tarea seleccionada\nt          abrir/enfocar la terminal PTY\nCtrl+Q     soltar el foco de la terminal\ny / n      aprobar / denegar una solicitud pendiente\n?          alternar esta ayuda\nq          salir\n\nComandos de barra en el editor:\n/new [objetivo]  /provider NAME  /settings  /language  /terminal  /approvals\n/interrupt  /cancel  /clear  /status  /help  /quit\n\nProveedores: scripted, scripted-demo, openai, responses, component.\n◆ marca una tarea interactiva; las llamadas a herramientas aparecen en la conversación.",
   "modes.applied": "modo cambiado a {0} para el próximo turno",
-  "modes.switched": "modo cambiado a {0}"
+  "modes.switched": "modo cambiado a {0}",
+  "state.saved": "guardada"
 }

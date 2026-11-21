@@ -102,6 +102,10 @@ M0 scaffold plus the P1 session/turn slice:
   sidebar. `↑`/`↓`, PgUp/PgDn and the mouse wheel scroll the transcript;
   `Ctrl+N` starts a session, `Ctrl+P` opens the command palette, `Tab` switches
   sessions, `y`/`n` answer approvals, and `Ctrl+Q` detaches from the PTY.
+- Persistent session list: mskd writes a small `task.json` beside each event
+  log and rebuilds saved sessions after a restart; the TUI marks them `▣ saved`
+  and replying resumes from the checkpoint. The composer soft-wraps, grows with
+  the draft, and accepts a newline with `Shift+Enter`, `Alt+Enter` or `Ctrl+J`.
 - SQLite event index: `msk-store` indexes events by id/task/kind/seq. Start
   mskd with `--store <path>` and query via `mskctl events` or
   `msk-replay --db <path>`; duplicate ids from log replay are ignored.

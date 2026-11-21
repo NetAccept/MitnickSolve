@@ -127,6 +127,8 @@ struct Task {
     max_steps: usize,
     max_context_tokens: usize,
     state: TaskState,
+    /// True when this entry was reconstructed from disk after a restart.
+    restored: bool,
     dir: PathBuf,
     child: Arc<Mutex<Option<Child>>>,
     input: Arc<Mutex<Option<ChildStdin>>>,
@@ -159,7 +161,9 @@ impl Task {
             "forked_from": self.forked_from,
             "max_steps": self.max_steps,
             "max_context_tokens": self.max_context_tokens,
-            "state": self.state.as_str(),
+            "state": if self.restored { "saved" } else { self.state.as_str() },
+            "restored": self.restored,
+            "checkpoint": self.dir.join("checkpoint.json").display().to_string(),
             "dir": self.dir.display().to_string(),
             "events": self.events,
             "turns": self.turns,
@@ -167,6 +171,90 @@ impl Task {
             "created_ms": self.created_ms
         })
     }
+
+    /// Static configuration kept next to the event log so a daemon restart can
+    /// list the session again. The API key is deliberately not persisted.
+    fn write_metadata(&self) -> Result<()> {
+        let metadata = TaskMetadata {
+            schema_version: 1,
+            task_id: self.id.clone(),
+            goal: self.goal.clone(),
+            demo: self.demo.clone(),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            base_url: self.base_url.clone(),
+            interactive: self.interactive,
+            stream: self.stream,
+            approvals: self.approvals.clone(),
+            permission: self.permission.clone(),
+            requested_mode: self.requested_mode.clone(),
+            mode: self.mode.clone(),
+            mode_reason: self.mode_reason.clone(),
+            headless: self.headless,
+            agent_depth: self.agent_depth,
+            parent_task: self.parent_task.clone(),
+            forked_from: self.forked_from.clone(),
+            max_steps: self.max_steps,
+            max_context_tokens: self.max_context_tokens,
+            created_ms: self.created_ms,
+        };
+        let text = serde_json::to_vec_pretty(&metadata)?;
+        fs::write(self.dir.join("task.json"), text)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TaskMetadata {
+    #[serde(default = "metadata_schema")]
+    schema_version: u32,
+    #[serde(default)]
+    task_id: String,
+    #[serde(default)]
+    goal: String,
+    #[serde(default)]
+    demo: String,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    interactive: bool,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    approvals: String,
+    #[serde(default)]
+    permission: String,
+    #[serde(default)]
+    requested_mode: String,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    mode_reason: String,
+    #[serde(default)]
+    headless: bool,
+    #[serde(default)]
+    agent_depth: u32,
+    #[serde(default)]
+    parent_task: Option<String>,
+    #[serde(default)]
+    forked_from: Option<String>,
+    #[serde(default)]
+    max_steps: usize,
+    #[serde(default)]
+    max_context_tokens: usize,
+    #[serde(default)]
+    created_ms: u128,
+}
+
+fn metadata_schema() -> u32 {
+    1
 }
 
 struct Subscriber {
@@ -536,6 +624,10 @@ fn main() -> Result<()> {
         next_task: AtomicU64::new(1),
         next_sub: AtomicU64::new(1),
     });
+
+    if let Err(err) = daemon.restore_tasks() {
+        eprintln!("mskd restore tasks: {err:#}");
+    }
 
     let data_daemon = daemon.clone();
     thread::spawn(move || {
@@ -1099,7 +1191,33 @@ impl Daemon {
             if let Some(source_events) = source.parent().map(|parent| parent.join("events.jsonl"))
                 && source_events.exists()
             {
-                let _ = fs::copy(source_events, dir.join("events.jsonl"));
+                // The copied log becomes part of the new task. Retag its events
+                // and renumber them so replay, ordering and the audit checker
+                // see one coherent session rather than two concatenated ones.
+                let target_events = dir.join("events.jsonl");
+                let rewritten = fs::read_to_string(&source_events).ok().map(|text| {
+                    let mut out = String::new();
+                    let mut seq = 0u64;
+                    for line in text.lines() {
+                        let Ok(mut event) = serde_json::from_str::<Event>(line) else {
+                            continue;
+                        };
+                        seq += 1;
+                        event.seq = seq;
+                        event.task = Some(id.clone());
+                        if let Ok(line) = serde_json::to_string(&event) {
+                            out.push_str(&line);
+                            out.push('\n');
+                        }
+                    }
+                    out
+                });
+                match rewritten {
+                    Some(text) => fs::write(target_events, text)?,
+                    None => {
+                        fs::copy(source_events, target_events)?;
+                    }
+                }
             }
             Some(target)
         } else {
@@ -1131,6 +1249,7 @@ impl Daemon {
             max_steps,
             max_context_tokens,
             state: TaskState::Running,
+            restored: false,
             dir,
             child: child.clone(),
             input: input.clone(),
@@ -1139,6 +1258,7 @@ impl Daemon {
             last_error: None,
             created_ms: now_ms(),
         };
+        task.write_metadata()?;
         let snapshot = task.snapshot();
         {
             let mut inner = self
@@ -1774,6 +1894,242 @@ impl Daemon {
         .unwrap_or(Value::Null);
         self.broadcast(notification, task_id);
         Ok(snapshot)
+    }
+
+    /// Rebuild the session list from the task directory after a restart. The
+    /// agent processes are gone, so each entry is exposed as `saved`: its
+    /// transcript stays readable and a new message resumes it from the
+    /// checkpoint.
+    fn restore_tasks(&self) -> Result<()> {
+        let tasks_dir = self.root.join("tasks");
+        let entries = match fs::read_dir(&tasks_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        let mut restored = Vec::new();
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let dir = entry.path();
+            let id = entry.file_name().to_string_lossy().to_string();
+            if !id.starts_with("task-") {
+                continue;
+            }
+            let checkpoint = dir.join("checkpoint.json");
+            let (events, _) =
+                msk_events::read_events_lenient(dir.join("events.jsonl")).unwrap_or_default();
+            if events.is_empty() && !checkpoint.exists() {
+                continue;
+            }
+            let metadata = fs::read(dir.join("task.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<TaskMetadata>(&bytes).ok());
+            let mut mode = metadata
+                .as_ref()
+                .map(|value| value.mode.clone())
+                .unwrap_or_default();
+            let mut requested_mode = metadata
+                .as_ref()
+                .map(|value| value.requested_mode.clone())
+                .unwrap_or_default();
+            let mut permission = metadata
+                .as_ref()
+                .map(|value| value.permission.clone())
+                .unwrap_or_default();
+            let mut demo = metadata
+                .as_ref()
+                .map(|value| value.demo.clone())
+                .unwrap_or_default();
+            for event in &events {
+                match event.kind.as_str() {
+                    "kernel.start" if demo.is_empty() => {
+                        demo = event
+                            .data
+                            .get("demo")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                    }
+                    "mode.select" => {
+                        if mode.is_empty() {
+                            mode = event
+                                .data
+                                .get("mode")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                        }
+                        if requested_mode.is_empty() {
+                            requested_mode = event
+                                .data
+                                .get("requested")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                        }
+                        if permission.is_empty() {
+                            permission = event
+                                .data
+                                .get("permission")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                        }
+                    }
+                    "mode.switch" => {
+                        if let Some(switched) = event.data.get("mode").and_then(Value::as_str) {
+                            mode = switched.to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let first_user = events
+                .iter()
+                .find(|event| event.kind == "turn.start")
+                .and_then(|event| event.data.get("user"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let goal = metadata
+                .as_ref()
+                .map(|value| value.goal.clone())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| {
+                    if first_user.is_empty() {
+                        format!("Saved session {id}")
+                    } else {
+                        first_user.to_string()
+                    }
+                });
+            let provider = metadata
+                .as_ref()
+                .map(|value| value.provider.clone())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "restored".into());
+            let mode = if mode.is_empty() {
+                if requested_mode.is_empty() {
+                    "investigate".to_string()
+                } else {
+                    requested_mode.clone()
+                }
+            } else {
+                mode
+            };
+            let requested_mode = if requested_mode.is_empty() {
+                mode.clone()
+            } else {
+                requested_mode
+            };
+            let mode_reason = metadata
+                .as_ref()
+                .map(|value| value.mode_reason.clone())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "restored".into());
+            let permission = if permission.is_empty() {
+                "manual".to_string()
+            } else {
+                permission
+            };
+            let max_steps = metadata
+                .as_ref()
+                .map(|value| value.max_steps)
+                .filter(|value| *value > 0)
+                .unwrap_or(12);
+            let max_context_tokens = metadata
+                .as_ref()
+                .map(|value| value.max_context_tokens)
+                .filter(|value| *value > 0)
+                .unwrap_or(100_000);
+            let created_ms = metadata
+                .as_ref()
+                .map(|value| value.created_ms)
+                .filter(|value| *value > 0)
+                .or_else(|| task_id_ms(&id))
+                .unwrap_or_else(now_ms);
+            let turns = events
+                .iter()
+                .filter(|event| event.kind == "turn.start")
+                .count() as u64;
+            let last_error = events.iter().rev().find_map(|event| {
+                if event.kind == "turn.end"
+                    && event.data.get("status").and_then(Value::as_str) == Some("failed")
+                {
+                    event
+                        .data
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                } else {
+                    None
+                }
+            });
+            let task = Task {
+                id,
+                goal,
+                demo: if demo.is_empty() {
+                    "session".into()
+                } else {
+                    demo
+                },
+                provider,
+                model: metadata.as_ref().and_then(|value| value.model.clone()),
+                effort: metadata.as_ref().and_then(|value| value.effort.clone()),
+                base_url: metadata.as_ref().and_then(|value| value.base_url.clone()),
+                api_key: None,
+                interactive: metadata
+                    .as_ref()
+                    .map(|value| value.interactive)
+                    .unwrap_or(true),
+                stream: metadata.as_ref().map(|value| value.stream).unwrap_or(false),
+                approvals: metadata
+                    .as_ref()
+                    .map(|value| value.approvals.clone())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "ask".into()),
+                permission,
+                requested_mode,
+                mode,
+                mode_reason,
+                headless: metadata
+                    .as_ref()
+                    .map(|value| value.headless)
+                    .unwrap_or(false),
+                agent_depth: metadata
+                    .as_ref()
+                    .map(|value| value.agent_depth)
+                    .unwrap_or(0),
+                parent_task: metadata
+                    .as_ref()
+                    .and_then(|value| value.parent_task.clone()),
+                forked_from: metadata
+                    .as_ref()
+                    .and_then(|value| value.forked_from.clone()),
+                resume_checkpoint: checkpoint.exists().then(|| checkpoint.clone()),
+                max_steps,
+                max_context_tokens,
+                state: TaskState::Done,
+                restored: true,
+                dir,
+                child: Arc::new(Mutex::new(None)),
+                input: Arc::new(Mutex::new(None)),
+                events: events.len() as u64,
+                turns,
+                last_error,
+                created_ms,
+            };
+            restored.push(task);
+        }
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("task map poisoned"))?;
+        for task in restored {
+            inner.tasks.entry(task.id.clone()).or_insert(task);
+        }
+        Ok(())
     }
 
     fn task_history(&self, params: &Value) -> Result<Value> {
@@ -2798,9 +3154,53 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
+fn task_id_ms(id: &str) -> Option<u128> {
+    id.strip_prefix("task-")?.split('-').next()?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_ids_expose_their_creation_time() {
+        assert_eq!(task_id_ms("task-1795240986558-1"), Some(1_795_240_986_558));
+        assert_eq!(task_id_ms("task-not-a-number-1"), None);
+        assert_eq!(task_id_ms("other-1"), None);
+    }
+
+    #[test]
+    fn task_metadata_roundtrips_without_a_key() {
+        let metadata = TaskMetadata {
+            schema_version: 1,
+            task_id: "task-1-1".into(),
+            goal: "check a host".into(),
+            demo: "session".into(),
+            provider: "openai".into(),
+            model: Some("model".into()),
+            effort: Some("high".into()),
+            base_url: Some("http://127.0.0.1/v1".into()),
+            interactive: true,
+            stream: true,
+            approvals: "ask".into(),
+            permission: "auto".into(),
+            requested_mode: "investigate".into(),
+            mode: "investigate".into(),
+            mode_reason: "explicit".into(),
+            headless: false,
+            agent_depth: 0,
+            parent_task: None,
+            forked_from: None,
+            max_steps: 12,
+            max_context_tokens: 100_000,
+            created_ms: 1,
+        };
+        let encoded = serde_json::to_value(&metadata).unwrap();
+        assert!(encoded.get("api_key").is_none());
+        let decoded: TaskMetadata = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.goal, metadata.goal);
+        assert_eq!(decoded.mode, "investigate");
+    }
 
     #[test]
     fn token_comparison_is_exact() {

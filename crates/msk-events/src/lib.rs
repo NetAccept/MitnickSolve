@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -94,11 +94,33 @@ impl JsonlSink {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // A resumed session appends to an existing log. Continue after its last
+        // sequence number instead of restarting at 1, which would break audit
+        // ordering and make the log fail its own consistency check.
+        if let Some(last) = last_event_seq(path) {
+            NEXT_SEQ.fetch_max(last.saturating_add(1), Ordering::SeqCst);
+        }
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             writer: Mutex::new(BufWriter::new(file)),
         })
     }
+}
+
+fn last_event_seq(path: &Path) -> Option<u64> {
+    let mut file = File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(64 * 1024);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    if start > 0 {
+        text = text.split_once('\n')?.1.to_string();
+    }
+    text.lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Event>(line).ok())
+        .map(|event| event.seq)
 }
 
 impl EventSink for JsonlSink {
@@ -293,6 +315,36 @@ mod tests {
         let event: Event = serde_json::from_str(line).unwrap();
         assert_eq!(event.schema_version, SCHEMA_VERSION);
         assert_eq!(event.seq, 0);
+    }
+
+    #[test]
+    fn sink_continues_after_existing_sequence_numbers() {
+        let path = std::env::temp_dir().join(format!("msk-events-seq-{}.jsonl", Uuid::new_v4()));
+        let first = Event {
+            seq: 7,
+            ..Event::new("a", "test", serde_json::json!({}))
+        };
+        let second = Event {
+            seq: 8,
+            ..Event::new("b", "test", serde_json::json!({}))
+        };
+        let text = format!(
+            "{}
+{}
+",
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+        std::fs::write(&path, text).unwrap();
+        let sink = JsonlSink::open(&path).unwrap();
+        sink.emit(&Event::new("c", "test", serde_json::json!({})))
+            .unwrap();
+        let events = read_events(&path).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[2].kind, "c");
+        assert!(events[2].seq > events[1].seq);
+        assert!(check_events(&events).is_empty());
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

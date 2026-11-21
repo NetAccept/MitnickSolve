@@ -12,11 +12,14 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use msk_events::{Event, read_events};
 use msk_ipc::data::{DataClient, DataEvent};
@@ -30,7 +33,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 mod i18n;
 mod setup;
@@ -1572,6 +1575,7 @@ struct DaemonApp {
     terminal: Option<TerminalView>,
     terminal_data: Option<DataClient>,
     terminal_size: Cell<(u16, u16)>,
+    composer_width: Cell<u16>,
     terminal_focus: bool,
     show_help: bool,
     status: String,
@@ -1724,6 +1728,7 @@ impl DaemonApp {
             terminal: None,
             terminal_data: None,
             terminal_size: Cell::new((0, 0)),
+            composer_width: Cell::new(0),
             terminal_focus: false,
             show_help: false,
             status: String::new(),
@@ -2758,6 +2763,16 @@ impl DaemonApp {
             .unwrap_or("?")
     }
 
+    fn selected_checkpoint(&self) -> Option<PathBuf> {
+        let path = self
+            .tasks
+            .get(self.selected_task)
+            .and_then(|task| task.get("checkpoint"))
+            .and_then(Value::as_str)?;
+        let path = PathBuf::from(path);
+        path.is_file().then_some(path)
+    }
+
     fn any_running(&self) -> bool {
         self.tasks
             .iter()
@@ -2981,6 +2996,18 @@ impl DaemonApp {
         }
         if self.new_task || self.selected_task_id().is_none() {
             self.start_new_task(&text);
+            return;
+        }
+        let state = self.selected_state();
+        if !matches!(state, "running" | "waiting_input")
+            && let Some(checkpoint) = self.selected_checkpoint()
+        {
+            // Continue with the mode shown for the saved session, not whatever
+            // was last chosen for new sessions.
+            let requested = self.selected_requested_mode();
+            let previous = std::mem::replace(&mut self.mode, requested);
+            self.create_task_with_options(&text, true, Some(&checkpoint));
+            self.mode = previous;
             return;
         }
         let Some(task_id) = self.selected_task_id() else {
@@ -3487,6 +3514,10 @@ impl DaemonApp {
             KeyCode::Enter => self.send_message(),
             KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => self.history_previous(),
             KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => self.history_next(),
+            KeyCode::Up if self.input_has_multiple_rows() => self.move_input_cursor_vertical(true),
+            KeyCode::Down if self.input_has_multiple_rows() => {
+                self.move_input_cursor_vertical(false)
+            }
             KeyCode::Up => self.scroll_up(1),
             KeyCode::Down => self.scroll_down(1),
             KeyCode::PageUp => self.scroll_up(10),
@@ -3512,8 +3543,8 @@ impl DaemonApp {
                     self.input_cursor += character.len_utf8();
                 }
             }
-            KeyCode::Home => self.input_cursor = 0,
-            KeyCode::End => self.input_cursor = self.input.len(),
+            KeyCode::Home => self.input_cursor = self.input_line_bounds().0,
+            KeyCode::End => self.input_cursor = self.input_line_bounds().1,
             KeyCode::Char(character)
                 if !key.modifiers.contains(KeyModifiers::ALT) && !character.is_control() =>
             {
@@ -4145,12 +4176,52 @@ impl DaemonApp {
         self.terminal = None;
     }
 
-    fn input_height(&self) -> u16 {
+    fn composer_text_width(&self) -> usize {
+        let width = self.composer_width.get();
+        if width == 0 { 80 } else { width as usize }
+    }
+
+    fn input_height(&self, input_width: u16) -> u16 {
         if !self.composing {
             return 5;
         }
-        let lines = self.input.matches('\n').count().saturating_add(1).min(8) as u16;
-        (lines + 4).clamp(5, 12)
+        let text_width = input_width.saturating_sub(5).max(1) as usize;
+        let rows = composer_layout(&self.input, self.input_cursor, text_width)
+            .lines
+            .len()
+            .clamp(1, 8);
+        (rows as u16 + 4).clamp(5, 12)
+    }
+
+    fn input_has_multiple_rows(&self) -> bool {
+        composer_layout(&self.input, self.input_cursor, self.composer_text_width())
+            .lines
+            .len()
+            > 1
+    }
+
+    fn move_input_cursor_vertical(&mut self, up: bool) {
+        let layout = composer_layout(&self.input, self.input_cursor, self.composer_text_width());
+        if layout.lines.len() <= 1 {
+            return;
+        }
+        let target = if up {
+            layout.cursor_row.saturating_sub(1)
+        } else {
+            (layout.cursor_row + 1).min(layout.lines.len() - 1)
+        };
+        if target == layout.cursor_row {
+            return;
+        }
+        self.input_cursor = composer_offset(&layout, target, layout.cursor_col);
+    }
+
+    fn input_line_bounds(&self) -> (usize, usize) {
+        let layout = composer_layout(&self.input, self.input_cursor, self.composer_text_width());
+        let row = layout.cursor_row.min(layout.lines.len().saturating_sub(1));
+        let start = layout.starts.get(row).copied().unwrap_or(0);
+        let end = start + layout.lines.get(row).map(String::len).unwrap_or(0);
+        (start, end.min(self.input.len()))
     }
 
     fn workspace_label(&self) -> String {
@@ -4197,7 +4268,6 @@ impl DaemonApp {
             .as_ref()
             .is_some_and(|task_id| self.chat.iter().any(|line| &line.task_id == task_id));
         let home = self.new_task || task_id.is_none() || !has_messages;
-        let input_height = self.input_height();
         let rail_width = if !home && area.width >= 100 { 24 } else { 0 };
         let content_area = Rect {
             x: area.x + rail_width,
@@ -4229,6 +4299,7 @@ impl DaemonApp {
             104.min(content_area.width.saturating_sub(4)).max(24)
         };
         let input_x = content_area.x + content_area.width.saturating_sub(input_width) / 2;
+        let input_height = self.input_height(input_width);
         let (input_area, hints_area) = if home {
             let target = content_area.y + ((content_area.height as u32 * 52 / 100) as u16);
             let input_y = target
@@ -4569,6 +4640,11 @@ impl DaemonApp {
                 DIM,
                 Color::Rgb(32, 32, 36),
             ),
+            "saved" => (
+                format!("▣ {}", i18n::t("state.saved")),
+                DIM,
+                Color::Rgb(32, 32, 36),
+            ),
             other => (format!("● {other}"), DIM, Color::Rgb(32, 32, 36)),
         };
         self.spin.set(self.spin.get().wrapping_add(1));
@@ -4833,6 +4909,7 @@ impl DaemonApp {
             width: inner.width.saturating_sub(1 + prompt_width),
             height: input_rows,
         };
+        self.composer_width.set(input_area.width);
 
         if self.input.is_empty() {
             let home = self.new_task || self.selected_task_id().is_none();
@@ -4860,18 +4937,19 @@ impl DaemonApp {
                 frame.set_cursor_position((input_area.x, input_area.y));
             }
         } else {
-            let cursor = char_boundary_at_or_before(&self.input, self.input_cursor);
-            let before = &self.input[..cursor];
-            let row = before.matches('\n').count();
-            let line_start = before.rfind('\n').map(|index| index + 1).unwrap_or(0);
-            let cursor_cols = UnicodeWidthStr::width(&self.input[line_start..cursor]);
-            let lines: Vec<&str> = self.input.split('\n').collect();
-            let start_line = row.saturating_sub(input_rows.saturating_sub(1) as usize);
-            let display = lines
+            let layout = composer_layout(
+                &self.input,
+                self.input_cursor,
+                input_area.width.max(1) as usize,
+            );
+            let rows = input_area.height.max(1) as usize;
+            let start_line = layout.cursor_row.saturating_sub(rows.saturating_sub(1));
+            let display = layout
+                .lines
                 .iter()
                 .skip(start_line)
-                .take(input_rows as usize)
-                .copied()
+                .take(rows)
+                .cloned()
                 .collect::<Vec<_>>()
                 .join("\n");
             frame.render_widget(
@@ -4879,8 +4957,8 @@ impl DaemonApp {
                 input_area,
             );
             if focused {
-                let x = input_area.x + cursor_cols as u16;
-                let y = input_area.y + (row - start_line) as u16;
+                let x = input_area.x + layout.cursor_col as u16;
+                let y = input_area.y + (layout.cursor_row - start_line) as u16;
                 frame.set_cursor_position((
                     x.min(input_area.right().saturating_sub(1)),
                     y.min(input_area.bottom().saturating_sub(1)),
@@ -6404,11 +6482,13 @@ fn main() -> Result<()> {
     }
 
     enable_raw_mode()?;
+    let keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let _ = execute!(
             std::io::stdout(),
+            PopKeyboardEnhancementFlags,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen,
@@ -6423,6 +6503,12 @@ fn main() -> Result<()> {
         EnableBracketedPaste,
         EnableMouseCapture
     )?;
+    if keyboard_enhanced {
+        execute!(
+            out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
     // crossterm enables any-motion tracking (?1003h). We only need wheel and
     // button events; motion events would wake the loop on every mouse move.
     write!(out, "\x1b[?1003l")?;
@@ -6444,6 +6530,9 @@ fn main() -> Result<()> {
     };
 
     disable_raw_mode()?;
+    if keyboard_enhanced {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
@@ -6870,7 +6959,7 @@ fn state_color(state: &str) -> Color {
         "running" => ACCENT,
         "waiting_input" => GREEN,
         "failed" | "cancelled" => RED,
-        "done" => DIM,
+        "done" | "saved" => DIM,
         _ => FAINT,
     }
 }
@@ -6891,6 +6980,7 @@ fn state_glyph(state: &str) -> char {
         "running" | "waiting_input" => '●',
         "failed" | "cancelled" => '✗',
         "done" => '✓',
+        "saved" => '▣',
         _ => '·',
     }
 }
@@ -7355,6 +7445,75 @@ fn char_boundary_at_or_before(text: &str, index: usize) -> usize {
     index
 }
 
+/// Visual layout of the composer: explicit newlines plus soft wrapping at the
+/// available width. Keeping this in one place means the height, rendered rows
+/// and cursor position always agree.
+struct ComposerLayout {
+    lines: Vec<String>,
+    starts: Vec<usize>,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
+fn composer_layout(input: &str, cursor: usize, width: usize) -> ComposerLayout {
+    let width = width.max(1);
+    let cursor = char_boundary_at_or_before(input, cursor);
+    let mut lines = vec![String::new()];
+    let mut starts = vec![0usize];
+    let mut row = 0usize;
+    let mut col = 0usize;
+    let mut cursor_row = 0usize;
+    let mut cursor_col = 0usize;
+    let mut marked = false;
+    for (index, character) in input.char_indices() {
+        if !marked && index == cursor {
+            cursor_row = row;
+            cursor_col = col;
+            marked = true;
+        }
+        if character == '\n' {
+            lines.push(String::new());
+            starts.push(index + 1);
+            row += 1;
+            col = 0;
+            continue;
+        }
+        let char_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if col > 0 && col + char_width > width {
+            lines.push(String::new());
+            starts.push(index);
+            row += 1;
+            col = 0;
+        }
+        lines[row].push(character);
+        col += char_width;
+    }
+    if !marked {
+        cursor_row = row;
+        cursor_col = col;
+    }
+    ComposerLayout {
+        lines,
+        starts,
+        cursor_row,
+        cursor_col,
+    }
+}
+
+fn composer_offset(layout: &ComposerLayout, row: usize, column: usize) -> usize {
+    let row = row.min(layout.lines.len().saturating_sub(1));
+    let start = layout.starts.get(row).copied().unwrap_or(0);
+    let mut width = 0usize;
+    for (offset, character) in layout.lines[row].char_indices() {
+        let char_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width + char_width > column {
+            return start + offset;
+        }
+        width += char_width;
+    }
+    start + layout.lines[row].len()
+}
+
 fn truncate(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         value.to_string()
@@ -7421,6 +7580,33 @@ mod tests {
     fn time_and_truncate_helpers() {
         assert_eq!(short_time("2026-11-14T08:01:09.123Z"), "08:01:09");
         assert_eq!(truncate("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn composer_wraps_long_and_wide_lines() {
+        let layout = composer_layout("abcdef", 6, 3);
+        assert_eq!(layout.lines, vec!["abc", "def"]);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 3));
+
+        let layout = composer_layout("中文字", 9, 4);
+        assert_eq!(layout.lines, vec!["中文", "字"]);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 2));
+
+        let layout = composer_layout("ab\ncd", 5, 20);
+        assert_eq!(layout.lines, vec!["ab", "cd"]);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 2));
+    }
+
+    #[test]
+    fn composer_maps_rows_back_to_byte_offsets() {
+        let layout = composer_layout("abcdef", 6, 3);
+        assert_eq!(composer_offset(&layout, 0, 3), 3);
+        assert_eq!(composer_offset(&layout, 1, 0), 3);
+        assert_eq!(composer_offset(&layout, 1, 3), 6);
+
+        let layout = composer_layout("ab\ncd", 5, 20);
+        assert_eq!(composer_offset(&layout, 0, 2), 2);
+        assert_eq!(composer_offset(&layout, 1, 0), 3);
     }
 
     #[test]

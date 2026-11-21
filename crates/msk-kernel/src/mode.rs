@@ -289,11 +289,10 @@ impl ModeRegistry {
                 label: "攻击".into(),
                 description: "authorized active testing, approvals on".into(),
                 prompt:
-                    "MODE: EXPLOIT. Perform only the authorized active testing in scope. Choose \
-                         the smallest action that answers the question, expect approval for \
-                         commands and network actions, stop on unexpected impact, and preserve \
-                         evidence. Record confirmed findings and never target anything outside the \
-                         engagement."
+                    "MODE: EXPLOIT. Perform the active testing the operator authorized. Choose the \
+                         smallest action that answers the question, expect approval for commands and \
+                         network actions, stop on unexpected impact, and preserve evidence. Record \
+                         confirmed findings; never target a third party the operator did not name."
                         .into(),
                 extends: None,
                 tools: vec!["*".into()],

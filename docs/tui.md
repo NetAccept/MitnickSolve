@@ -67,7 +67,7 @@ This is an actual `--snapshot` frame (120×40):
 
 
 
-  ~  ·  权 限  自 动                                                                                    MitnickSolve 0.1.7
+  ~  ·  权 限  自 动                                                                                    MitnickSolve 0.1.8
 ```
 
 - The large wordmark is drawn from Unicode blocks with a left-to-right gradient.
@@ -77,7 +77,12 @@ This is an actual `--snapshot` frame (120×40):
   compact wordmark and skips the capability strip rather than dropping the
   composer. At 80×24 the brand, tagline and status chips still fit.
 - The rounded composer is always the focused input. Just start typing; Enter
-  sends. `Shift+Enter` inserts a newline, bracketed paste inserts whole scripts.
+  sends. It soft-wraps long lines and grows up to eight rows. `Shift+Enter`,
+  `Alt+Enter` or `Ctrl+J` inserts a newline (`Ctrl+J` also works when the
+  terminal cannot report modifier keys); bracketed paste inserts whole scripts.
+  When the draft spans more than one visual row, `↑`/`↓` move the cursor
+  between rows instead of scrolling; `Home`/`End` go to the current row's
+  start/end.
 - The composer uses a `❯` prompt. Its status line shows the mode, provider,
   model and effort. The `try` card below suggests starter prompts; `/demo` runs
   the offline tool demo.
@@ -207,8 +212,10 @@ Enter to run, Esc to close.
                       ╰──────────────────────────────────────────────────────────────────────────╯
 ```
 
-`Tab` opens the session switcher. The first row starts a fresh session; saved
-sessions follow, titled by their goal (internal task ids stay out of the way).
+`Tab` opens the session switcher. The first row starts a fresh session;
+sessions restored from disk follow as `▣ saved`, alongside live ones, titled by
+their goal (internal task ids stay out of the way). Replying to a saved session
+resumes it from its checkpoint.
 Up/down only moves the highlight, Enter opens the selected row, `n` starts a new
 session, Esc closes. `Ctrl+N` starts a new session from anywhere without
 replacing the conversation you are reading.
@@ -255,7 +262,7 @@ markdown rendering and the composer at the bottom:
  │                    │   │  攻 击  · scripted                                                                         │
  │tab switch · ctrl+n │   ╰──────────────────────────────────────────────────────────────────────────────────────────╯
  ╰────────────────────╯                                        tab sessions   ctrl+n new   ctrl+p commands   F1 help
-  ~  ·  权 限  手 动   ·  ctx 12.3k ▰▱▱▱▱▱▱▱  ·  tools 7                                              MitnickSolve 0.1.7
+  ~  ·  权 限  手 动   ·  ctx 12.3k ▰▱▱▱▱▱▱▱  ·  tools 7                                              MitnickSolve 0.1.8
 ```
 
 - On wide terminals the left rail lists sessions and the session count; `▌`
@@ -336,7 +343,7 @@ Press `y` to approve or `n`/`Esc` to deny. Approvals are also hydrated from
 | `Ctrl+P` | command palette |
 | `F1` | keyboard shortcuts |
 | `F2` / `Shift+F2` | cycle reasoning effort forward / back |
-| `↑` / `↓` | scroll the conversation one line |
+| `↑` / `↓` | move between draft rows when the input is multi-line; otherwise scroll one line |
 | `PgUp` / `PgDn` | scroll ten lines |
 | `Ctrl/Alt+↑` / `Ctrl/Alt+↓` | older / newer input history |
 | `Ctrl+Home` / `Ctrl+End` | transcript top / follow output |
@@ -412,11 +419,18 @@ Selecting a session hydrates its conversation from `task.history` (structured
 events), not from a truncated transcript string. Switching sessions, attaching a
 second TUI, or finishing a turn all reload the same timeline.
 
-Tasks are in-memory in `mskd`, but event logs and checkpoints stay under
-`.msk/tasks/<task>/`. `Ctrl+P` → **Resume latest** (`/resume`) restores the
-newest checkpoint after a daemon restart. In service mode it reopens the
-original envd environment when possible; otherwise it creates a fresh one and
-marks old session ids stale. Forks always use a fresh environment.
+`mskd` writes a small `task.json` beside each event log. On restart it rebuilds
+the session list from `.msk/tasks/*`, shows those entries as `▣ saved`, and
+loads their conversations from `task.history`. Select a saved session in `Tab`
+and send a message to continue: the TUI creates a new task from that session's
+checkpoint, so the conversation carries over with a fresh agent process. Task
+directories written by older releases have no `task.json`; their goal and mode
+are reconstructed from the event log.
+
+`Ctrl+P` → **Resume latest** (`/resume`) remains a shortcut for the newest
+checkpoint. In service mode it reopens the original envd environment when
+possible; otherwise it creates a fresh one and marks old session ids stale.
+Forks always use a fresh environment.
 
 ## Real models
 

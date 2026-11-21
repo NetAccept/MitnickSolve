@@ -15,7 +15,7 @@
   "home.example.triage": "analysez ./evidence et résumez les constats",
   "home.demo": "/demo lance la démo d'outils hors ligne",
   "composer.reply": "Répondre…",
-  "composer.reply.hint": "Répondre…   Shift+Enter pour une nouvelle ligne",
+  "composer.reply.hint": "Répondre…   Shift+Enter ou Ctrl+J pour une nouvelle ligne",
   "composer.missing_key": "clé API manquante · ctrl+p fournisseurs",
   "hints.sessions": "tab sessions",
   "hints.new": "ctrl+n nouvelle",
@@ -235,7 +235,8 @@
   "setup.config": "config  {0}",
   "setup.keys": "↑/↓ choisir   Enter suivant   Esc retour/fermer   Ctrl+U effacer l'entrée",
   "setup.keys.compact": "↑/↓ choisir · Enter suivant · Esc retour",
-  "help.body": "Espace de travail conversationnel MitnickSolve\n\nEnter / i  écrire un message ou décrire un nouveau défi\nEnter      envoyer / démarrer la tâche\nEsc        quitter l'éditeur sans envoyer\n← / →      déplacer le curseur de saisie\nCtrl+U     effacer la saisie\nPgUp/PgDn  faire défiler la conversation\nv          basculer l'inspecteur d'événements\nEnd        aller au message le plus récent\nj / k      session précédente / suivante\ng / G      première / dernière session\nn          démarrer une nouvelle session\ns          interrompre le tour en cours\nx          annuler la tâche sélectionnée\nt          ouvrir/focaliser le terminal PTY\nCtrl+Q     quitter le focus terminal\ny / n      approuver / refuser une demande en attente\n?          basculer cette aide\nq          quitter\n\nCommandes slash dans l'éditeur :\n/new [objectif]  /provider NAME  /settings  /language  /terminal  /approvals\n/interrupt  /cancel  /clear  /status  /help  /quit\n\nFournisseurs : scripted, scripted-demo, openai, responses, component.\n◆ marque une tâche interactive ; les appels d'outils apparaissent dans la conversation.",
+  "help.body": "Espace de travail conversationnel MitnickSolve\n\nEnter / i  écrire un message ou décrire un nouveau défi\nEnter      envoyer / démarrer la tâche\nShift+Enter / Ctrl+J  insérer une nouvelle ligne\nEsc        quitter l'éditeur sans envoyer\n← / →      déplacer le curseur de saisie\nCtrl+U     effacer la saisie\nPgUp/PgDn  faire défiler la conversation\nv          basculer l'inspecteur d'événements\nEnd        aller au message le plus récent\nj / k      session précédente / suivante\ng / G      première / dernière session\nn          démarrer une nouvelle session\ns          interrompre le tour en cours\nx          annuler la tâche sélectionnée\nt          ouvrir/focaliser le terminal PTY\nCtrl+Q     quitter le focus terminal\ny / n      approuver / refuser une demande en attente\n?          basculer cette aide\nq          quitter\n\nCommandes slash dans l'éditeur :\n/new [objectif]  /provider NAME  /settings  /language  /terminal  /approvals\n/interrupt  /cancel  /clear  /status  /help  /quit\n\nFournisseurs : scripted, scripted-demo, openai, responses, component.\n◆ marque une tâche interactive ; les appels d'outils apparaissent dans la conversation.",
   "modes.applied": "mode changé pour {0} au prochain tour",
-  "modes.switched": "mode changé pour {0}"
+  "modes.switched": "mode changé pour {0}",
+  "state.saved": "enregistrée"
 }

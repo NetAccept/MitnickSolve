@@ -38,6 +38,23 @@ boundaries.
 The agent mode is shown in the composer's leading slot; permission is shown in
 the footer, so the two controls do not compete for the same space.
 
+## Scope and authorization
+
+The daemon does not infer an engagement scope. The operator decides what is in
+scope: the target named in the task, the workspace, or a written engagement
+definition. Mitnick performs routine read-only checks (DNS, TLS certificate and
+headers, a single GET/HEAD request) on a public host the operator names without
+demanding ownership proof, and does not treat a public host as automatically
+out of scope. Intrusive work (broad scans, exploitation, brute force, payloads,
+writes) still goes through the mode's tool set and approval policy; the agent is
+told to require the operator to state that the target is authorized and to stop
+on unexpected impact.
+
+For real engagements, put the authorization or scope file in the workspace so
+the decision and its evidence stay together. The envd `--net-allow` allowlist
+remains the deployment-level control when egress must be restricted regardless
+of agent intent.
+
 ## Relationship to agent modes
 
 | Agent mode | Typical permission |

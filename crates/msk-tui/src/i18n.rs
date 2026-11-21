@@ -246,6 +246,7 @@ pub fn state_word(state: &str) -> &'static str {
         "failed" => t("state.failed"),
         "cancelled" => t("state.cancelled"),
         "done" => t("state.done"),
+        "saved" => t("state.saved"),
         _ => "",
     }
 }

@@ -15,7 +15,7 @@
   "home.example.triage": "./evidence を分析して所見を要約する",
   "home.demo": "/demo でオフラインのツールデモを実行",
   "composer.reply": "返信…",
-  "composer.reply.hint": "返信…   Shift+Enter で改行",
+  "composer.reply.hint": "返信…   Shift+Enter または Ctrl+J で改行",
   "composer.missing_key": "API key がありません · ctrl+p プロバイダー",
   "hints.sessions": "tab セッション",
   "hints.new": "ctrl+n 新規",
@@ -235,7 +235,8 @@
   "effort.next": "次のセッションの推論強度：{0}",
   "effort.next_current": "次のセッションの推論強度：{0} · 現在は {1} のまま · ctrl+n で開始",
   "palette.status": "コマンド · 入力で絞り込み · Enter 実行 · Esc 閉じる",
-  "help.body": "MitnickSolve 会話ワークベンチ\n\nEnter / i  メッセージを入力、または新しい課題を説明\nEnter      送信 / タスク開始\nEsc        送信せずにエディターを閉じる\n← / →      入力カーソルを移動\nCtrl+U     入力をクリア\nPgUp/PgDn  会話をスクロール\nv          生のイベントインスペクターを切替\nEnd        最新メッセージへ移動\nj / k      前 / 次のセッション\ng / G      最初 / 最後のセッション\nn          新しいセッション\ns          実行中のターンを中断\nx          選択中のタスクをキャンセル\nt          PTY ターミナルを開く/フォーカス\nCtrl+Q     ターミナルフォーカスを解除\ny / n      承認待ちを承認 / 拒否\n?          このヘルプを切替\nq          終了\n\nエディターのスラッシュコマンド:\n/new [目標]  /provider NAME  /settings  /language  /terminal  /approvals\n/interrupt  /cancel  /clear  /status  /help  /quit\n\nプロバイダー: scripted、scripted-demo、openai、responses、component。\n◆ はインタラクティブタスク; ツール呼び出しは会話内に表示されます。",
+  "help.body": "MitnickSolve 会話ワークベンチ\n\nEnter / i  メッセージを入力、または新しい課題を説明\nEnter      送信 / タスク開始\nShift+Enter / Ctrl+J  改行\nEsc        送信せずにエディターを閉じる\n← / →      入力カーソルを移動\nCtrl+U     入力をクリア\nPgUp/PgDn  会話をスクロール\nv          生のイベントインスペクターを切替\nEnd        最新メッセージへ移動\nj / k      前 / 次のセッション\ng / G      最初 / 最後のセッション\nn          新しいセッション\ns          実行中のターンを中断\nx          選択中のタスクをキャンセル\nt          PTY ターミナルを開く/フォーカス\nCtrl+Q     ターミナルフォーカスを解除\ny / n      承認待ちを承認 / 拒否\n?          このヘルプを切替\nq          終了\n\nエディターのスラッシュコマンド:\n/new [目標]  /provider NAME  /settings  /language  /terminal  /approvals\n/interrupt  /cancel  /clear  /status  /help  /quit\n\nプロバイダー: scripted、scripted-demo、openai、responses、component。\n◆ はインタラクティブタスク; ツール呼び出しは会話内に表示されます。",
   "modes.applied": "モードを {0} に切り替えました。次のターンから有効です",
-  "modes.switched": "モードを {0} に切り替えました"
+  "modes.switched": "モードを {0} に切り替えました",
+  "state.saved": "保存済み"
 }
