@@ -67,7 +67,7 @@ This is an actual `--snapshot` frame (120×40):
 
 
 
-  ~  ·  权 限  自 动                                                                                    MitnickSolve 0.1.6
+  ~  ·  权 限  自 动                                                                                    MitnickSolve 0.1.7
 ```
 
 - The large wordmark is drawn from Unicode blocks with a left-to-right gradient.
@@ -255,7 +255,7 @@ markdown rendering and the composer at the bottom:
  │                    │   │  攻 击  · scripted                                                                         │
  │tab switch · ctrl+n │   ╰──────────────────────────────────────────────────────────────────────────────────────────╯
  ╰────────────────────╯                                        tab sessions   ctrl+n new   ctrl+p commands   F1 help
-  ~  ·  权 限  手 动   ·  ctx 12.3k ▰▱▱▱▱▱▱▱  ·  tools 7                                              MitnickSolve 0.1.6
+  ~  ·  权 限  手 动   ·  ctx 12.3k ▰▱▱▱▱▱▱▱  ·  tools 7                                              MitnickSolve 0.1.7
 ```
 
 - On wide terminals the left rail lists sessions and the session count; `▌`
