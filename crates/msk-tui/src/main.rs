@@ -115,6 +115,11 @@ const COMMANDS: &[CommandEntry] = &[
         command: "/mode",
     },
     CommandEntry {
+        label_key: "cmd.target.label",
+        hint_key: "cmd.target.hint",
+        command: "/target",
+    },
+    CommandEntry {
         label_key: "cmd.permissions.label",
         hint_key: "cmd.permissions.hint",
         command: "/permissions",
@@ -308,6 +313,43 @@ struct ModeInfo {
     description: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TargetInfo {
+    id: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    #[serde(rename = "default")]
+    is_default: bool,
+    #[serde(default)]
+    profile: String,
+    #[serde(default)]
+    attached: bool,
+}
+
+fn fallback_targets() -> Vec<TargetInfo> {
+    vec![
+        TargetInfo {
+            id: "local".into(),
+            label: "local".into(),
+            kind: "embedded".into(),
+            is_default: true,
+            profile: "dev".into(),
+            attached: false,
+        },
+        TargetInfo {
+            id: "none".into(),
+            label: "none".into(),
+            kind: "none".into(),
+            is_default: false,
+            profile: "none".into(),
+            attached: false,
+        },
+    ]
+}
+
 fn fallback_modes() -> Vec<ModeInfo> {
     [
         ("auto", "自动", "route to the least-invasive mode that fits"),
@@ -395,6 +437,8 @@ struct TuiConfig {
     base_url: String,
     #[serde(default = "default_mode")]
     mode: String,
+    #[serde(default = "default_target")]
+    target: String,
     #[serde(default = "default_permission")]
     permission: String,
     #[serde(default)]
@@ -413,6 +457,7 @@ impl Default for TuiConfig {
             effort: default_effort(),
             base_url: String::new(),
             mode: default_mode(),
+            target: default_target(),
             permission: default_permission(),
             api_key: String::new(),
             profiles: Vec::new(),
@@ -423,6 +468,10 @@ impl Default for TuiConfig {
 
 fn default_language() -> String {
     i18n::Language::detect().id().to_string()
+}
+
+fn default_target() -> String {
+    "local".into()
 }
 
 impl TuiConfig {
@@ -1145,6 +1194,9 @@ struct Cli {
     /// Diagnostic: render the agent mode picker in a snapshot.
     #[arg(long, hide = true)]
     snapshot_modes: bool,
+    /// Diagnostic: render the execution target picker in a snapshot.
+    #[arg(long, hide = true)]
+    snapshot_targets: bool,
     /// Diagnostic: render the provider profile picker in a snapshot.
     #[arg(long, hide = true)]
     snapshot_providers: bool,
@@ -1592,6 +1644,10 @@ struct DaemonApp {
     provider_delete_armed: Option<usize>,
     mode: String,
     modes: Vec<ModeInfo>,
+    target: String,
+    targets: Vec<TargetInfo>,
+    show_targets: bool,
+    target_selection: usize,
     permission: String,
     daemon_llm_key: bool,
     daemon_llm_model: Option<String>,
@@ -1666,6 +1722,21 @@ impl DaemonApp {
             })
             .filter(|modes| !modes.is_empty())
             .unwrap_or_else(fallback_modes);
+        let targets: Vec<TargetInfo> = hello
+            .get("targets")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| serde_json::from_value::<TargetInfo>(item.clone()).ok())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|targets| !targets.is_empty())
+            .unwrap_or_else(fallback_targets);
+        let daemon_default_target = hello
+            .get("default_target")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         client.subscribe(None)?;
         let configured = root.join("tui-config.json").exists();
         let mut config = TuiConfig::load(&root);
@@ -1680,6 +1751,18 @@ impl DaemonApp {
         }
         if !PERMISSIONS.contains(&config.permission.as_str()) {
             config.permission = default_permission();
+        }
+        if !configured || !targets.iter().any(|target| target.id == config.target) {
+            config.target = daemon_default_target
+                .clone()
+                .filter(|id| targets.iter().any(|target| &target.id == id))
+                .unwrap_or_else(|| {
+                    targets
+                        .iter()
+                        .find(|target| target.is_default)
+                        .map(|target| target.id.clone())
+                        .unwrap_or_else(|| "none".into())
+                });
         }
         if let Some(provider) = provider {
             config.provider = provider;
@@ -1745,6 +1828,10 @@ impl DaemonApp {
             provider_delete_armed: None,
             mode: config.mode,
             modes,
+            target: config.target,
+            targets,
+            show_targets: false,
+            target_selection: 0,
             permission: config.permission,
             daemon_llm_key,
             daemon_llm_model,
@@ -1845,6 +1932,7 @@ impl DaemonApp {
             effort: self.effort.clone(),
             base_url: self.base_url.clone(),
             mode: self.mode.clone(),
+            target: self.target.clone(),
             permission: self.permission.clone(),
             api_key: self.api_key.clone(),
             profiles: self.profiles.clone(),
@@ -2851,6 +2939,72 @@ impl DaemonApp {
         }
     }
 
+    fn apply_target_to_session(&mut self, requested: &str) -> bool {
+        let Some(task_id) = self.selected_task_id() else {
+            return false;
+        };
+        if self.new_task || !matches!(self.selected_state(), "running" | "waiting_input") {
+            return false;
+        }
+        if self.selected_state() == "running" {
+            self.status = i18n::t("targets.running").to_string();
+            return false;
+        }
+        if requested == self.selected_target_id() {
+            self.status = i18n::tf("targets.already", &[&self.target_label_for(requested)]);
+            return true;
+        }
+        match self.client.request_with_timeout(
+            methods::TASK_TARGET,
+            json!({"task_id": task_id, "target": requested}),
+            Duration::from_secs(35),
+        ) {
+            Ok(snapshot) => {
+                if let Some(existing) = self.tasks.iter_mut().find(|task| {
+                    task.get("task_id").and_then(Value::as_str) == Some(task_id.as_str())
+                }) {
+                    *existing = snapshot;
+                }
+                self.target = requested.to_string();
+                self.save_config();
+                self.status = i18n::tf("targets.applied", &[&self.target_label_for(requested)]);
+                true
+            }
+            Err(err) => {
+                self.status = i18n::tf("targets.failed", &[&err.to_string()]);
+                false
+            }
+        }
+    }
+
+    fn bind_target(&mut self, requested: &str) -> bool {
+        if !self.targets.iter().any(|target| target.id == requested) && requested != "none" {
+            self.status = i18n::tf("targets.unknown", &[requested]);
+            return false;
+        }
+        let live = !self.new_task
+            && self.selected_task_id().is_some()
+            && matches!(self.selected_state(), "running" | "waiting_input");
+        if live {
+            return self.apply_target_to_session(requested);
+        }
+        self.target = requested.to_string();
+        self.save_config();
+        self.status = i18n::tf("targets.next", &[&self.target_label_for(requested)]);
+        true
+    }
+
+    fn open_targets(&mut self) {
+        let current = self.selected_target_id();
+        self.target_selection = self
+            .targets
+            .iter()
+            .position(|target| target.id == current)
+            .unwrap_or(0);
+        self.show_targets = true;
+        self.status = i18n::t("targets.status").to_string();
+    }
+
     fn announce_mode_saved(&mut self) {
         let pending = self.mode_label(&self.mode);
         if self.new_task || self.selected_task_id().is_none() {
@@ -2910,6 +3064,84 @@ impl DaemonApp {
                 .unwrap_or(fallback)
                 .to_string()
         }
+    }
+
+    fn target_info(&self, id: &str) -> Option<&TargetInfo> {
+        self.targets.iter().find(|target| target.id == id)
+    }
+
+    fn target_label_for(&self, id: &str) -> String {
+        self.target_info(id)
+            .map(|target| {
+                if target.label.is_empty() {
+                    target.id.clone()
+                } else {
+                    target.label.clone()
+                }
+            })
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    fn selected_target_id(&self) -> String {
+        if self.new_task || self.selected_task_id().is_none() {
+            return self.target.clone();
+        }
+        self.tasks
+            .get(self.selected_task)
+            .and_then(|task| task.get("target"))
+            .and_then(Value::as_str)
+            .filter(|target| !target.is_empty())
+            .unwrap_or(&self.target)
+            .to_string()
+    }
+
+    fn selected_target_kind(&self) -> String {
+        if self.new_task || self.selected_task_id().is_none() {
+            return self
+                .target_info(&self.target)
+                .map(|target| target.kind.clone())
+                .unwrap_or_else(|| "none".into());
+        }
+        self.tasks
+            .get(self.selected_task)
+            .and_then(|task| task.get("target_kind"))
+            .and_then(Value::as_str)
+            .unwrap_or("none")
+            .to_string()
+    }
+
+    fn selected_target_attached(&self) -> bool {
+        if self.new_task || self.selected_task_id().is_none() {
+            return self.target != "none";
+        }
+        self.tasks
+            .get(self.selected_task)
+            .and_then(|task| task.get("target_attached"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || self
+                .tasks
+                .get(self.selected_task)
+                .and_then(|task| task.get("state"))
+                .and_then(Value::as_str)
+                .is_some_and(|state| matches!(state, "running" | "waiting_input"))
+                && self.selected_target_id() != "none"
+    }
+
+    fn target_badge(&self) -> (char, String) {
+        let id = self.selected_target_id();
+        let kind = self.selected_target_kind();
+        let attached = self.selected_target_attached();
+        let symbol = if id == "none" || kind == "none" {
+            '⊘'
+        } else if !attached {
+            '◇'
+        } else if kind == "service" {
+            '☁'
+        } else {
+            '⌂'
+        };
+        (symbol, self.target_label_for(&id))
     }
 
     fn display_provider(&self) -> String {
@@ -2994,6 +3226,19 @@ impl DaemonApp {
             self.run_command(&text);
             return;
         }
+        let mut text = text;
+        let mut explicit_target = false;
+        if let Some((target, rest)) = extract_target_prefix(&text, &self.targets) {
+            if !self.bind_target(&target) {
+                return;
+            }
+            explicit_target = true;
+            text = rest.to_string();
+            if text.is_empty() {
+                self.status = i18n::t("targets.no_message").to_string();
+                return;
+            }
+        }
         if self.new_task || self.selected_task_id().is_none() {
             self.start_new_task(&text);
             return;
@@ -3005,9 +3250,16 @@ impl DaemonApp {
             // Continue with the mode shown for the saved session, not whatever
             // was last chosen for new sessions.
             let requested = self.selected_requested_mode();
+            let saved_target = if explicit_target {
+                self.target.clone()
+            } else {
+                self.selected_target_id()
+            };
             let previous = std::mem::replace(&mut self.mode, requested);
+            let previous_target = std::mem::replace(&mut self.target, saved_target);
             self.create_task_with_options(&text, true, Some(&checkpoint));
             self.mode = previous;
+            self.target = previous_target;
             return;
         }
         let Some(task_id) = self.selected_task_id() else {
@@ -3069,6 +3321,10 @@ impl DaemonApp {
                 self.mode_selection = self.mode_index(&self.mode);
                 self.show_modes = true;
                 self.status = "agent mode · ↑/↓ choose · Enter apply · Esc cancel".into();
+            }
+            "/target" | "/envd" if argument.is_empty() => self.open_targets(),
+            "/target" | "/envd" => {
+                self.bind_target(argument);
             }
             "/mode" => {
                 if let Some(mode) = self.find_mode(argument) {
@@ -3264,6 +3520,7 @@ impl DaemonApp {
                     "provider": self.provider,
                     "mode": self.mode,
                     "permission": self.permission,
+                    "target": self.target,
                     "interactive": true,
                     "stream": true,
                     "approvals": "ask"
@@ -3706,7 +3963,7 @@ impl DaemonApp {
                 self.settings_selection = self.settings_selection.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.settings_selection = (self.settings_selection + 1).min(4);
+                self.settings_selection = (self.settings_selection + 1).min(5);
             }
             KeyCode::Enter => match self.settings_selection {
                 0 => {
@@ -3725,9 +3982,13 @@ impl DaemonApp {
                 }
                 3 => {
                     self.show_settings = false;
-                    self.open_providers();
+                    self.open_targets();
                 }
                 4 => {
+                    self.show_settings = false;
+                    self.open_providers();
+                }
+                5 => {
                     self.show_settings = false;
                     self.open_setup();
                 }
@@ -3909,6 +4170,32 @@ impl DaemonApp {
         false
     }
 
+    fn targets_key(&mut self, key: KeyEvent) -> bool {
+        if self.targets.is_empty() {
+            self.show_targets = false;
+            return false;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.show_targets = false;
+                self.status.clear();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.target_selection = self.target_selection.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.target_selection = (self.target_selection + 1).min(self.targets.len() - 1);
+            }
+            KeyCode::Enter => {
+                let requested = self.targets[self.target_selection].id.clone();
+                self.show_targets = false;
+                self.bind_target(&requested);
+            }
+            _ => {}
+        }
+        false
+    }
+
     fn mode_key(&mut self, key: KeyEvent) -> bool {
         if self.modes.is_empty() {
             self.show_modes = false;
@@ -4017,6 +4304,10 @@ impl DaemonApp {
 
         if self.show_findings {
             return self.findings_key(key);
+        }
+
+        if self.show_targets {
+            return self.targets_key(key);
         }
 
         if self.show_modes {
@@ -4349,6 +4640,7 @@ impl DaemonApp {
             && !self.show_sessions
             && !self.show_findings
             && !self.show_modes
+            && !self.show_targets
             && !self.show_providers
             && !self.show_permissions
             && !self.show_settings
@@ -4387,6 +4679,9 @@ impl DaemonApp {
         }
         if self.show_findings {
             self.draw_findings(frame, area);
+        }
+        if self.show_targets {
+            self.draw_targets(frame, area);
         }
         if self.show_modes {
             self.draw_modes(frame, area);
@@ -5170,6 +5465,23 @@ impl DaemonApp {
                 Style::default().fg(permission_color(&self.display_permission())),
             ),
         ];
+        let (target_symbol, target_label) = self.target_badge();
+        let target_text = format!("{target_symbol} {target_label}");
+        let target_width = UnicodeWidthStr::width(target_text.as_str());
+        if used + 5 + target_width <= left_width {
+            let color = if self.selected_target_id() == "none" {
+                FAINT
+            } else if !self.selected_target_attached() {
+                YELLOW
+            } else if self.selected_target_kind() == "service" {
+                ACCENT
+            } else {
+                GREEN
+            };
+            spans.push(Span::styled("  ·  ", Style::default().fg(FAINT)));
+            spans.push(Span::styled(target_text, Style::default().fg(color)));
+            used += 5 + target_width;
+        }
         if self.selected_task_id().is_some() {
             let (tokens, tools) = self.selected_usage();
             if tokens > 0 {
@@ -5770,7 +6082,7 @@ impl DaemonApp {
 
     fn draw_settings(&self, frame: &mut ratatui::Frame, area: Rect) {
         let width = 72.min(area.width.saturating_sub(6)).max(34);
-        let height = 13.min(area.height.saturating_sub(2)).max(9);
+        let height = 14.min(area.height.saturating_sub(2)).max(9);
         let area = Rect {
             x: area.x + area.width.saturating_sub(width) / 2,
             y: area.y + area.height.saturating_sub(height) / 2,
@@ -5814,6 +6126,16 @@ impl DaemonApp {
         } else {
             self.mode_label(&self.mode)
         };
+        let target_id = self.selected_target_id();
+        let target_value = if self.target != target_id && !self.new_task {
+            format!(
+                "{}  ({})",
+                self.target_label_for(&self.target),
+                i18n::tf("settings.current", &[&self.target_label_for(&target_id)])
+            )
+        } else {
+            self.target_label_for(&target_id)
+        };
         let rows = [
             (
                 i18n::t("settings.language"),
@@ -5821,6 +6143,7 @@ impl DaemonApp {
             ),
             (i18n::t("settings.permission"), permission_value),
             (i18n::t("settings.mode"), mode_value),
+            (i18n::t("settings.target"), target_value),
             (i18n::t("settings.providers"), String::new()),
             (i18n::t("settings.setup"), String::new()),
         ];
@@ -5990,6 +6313,94 @@ impl DaemonApp {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             i18n::t("modes.keys"),
+            Style::default().fg(ACCENT),
+        )));
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            Rect {
+                x: inner.x + 1,
+                y: inner.y,
+                width: inner.width.saturating_sub(2),
+                height: inner.height,
+            },
+        );
+    }
+
+    fn draw_targets(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let width = 82.min(area.width.saturating_sub(6)).max(36);
+        let height = (self.targets.len() as u16 + 8)
+            .min(area.height.saturating_sub(4))
+            .max(11);
+        let area = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, area);
+        let block = panel_block(i18n::t("targets.title"), ACCENT);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let current = self.selected_target_id();
+        let mut lines = vec![
+            Line::from(Span::styled(
+                i18n::t("targets.intro"),
+                Style::default().fg(DIM),
+            )),
+            Line::from(""),
+        ];
+        for (index, target) in self.targets.iter().enumerate() {
+            let selected = index == self.target_selection;
+            let active = target.id == current;
+            let kind = match target.kind.as_str() {
+                "embedded" => i18n::t("targets.kind.embedded"),
+                "service" => i18n::t("targets.kind.service"),
+                _ => i18n::t("targets.kind.none"),
+            };
+            let mut detail = if target.profile.is_empty() {
+                kind.to_string()
+            } else {
+                format!("{kind} · {}", target.profile)
+            };
+            if target.is_default {
+                detail.push_str(&format!(" · {}", i18n::t("targets.default")));
+            }
+            if active {
+                detail.push_str(&format!(" · {}", i18n::t("targets.current")));
+            }
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { "❯ " } else { "  " },
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled(
+                    format!("{:<12}", target.id),
+                    if selected {
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(TEXT)
+                    },
+                ),
+                Span::styled(
+                    {
+                        let label = if target.label.is_empty() {
+                            target.id.clone()
+                        } else {
+                            target.label.clone()
+                        };
+                        let padding = 20usize
+                            .saturating_sub(UnicodeWidthStr::width(label.as_str()))
+                            .max(1);
+                        format!("{label}{}", " ".repeat(padding))
+                    },
+                    Style::default().fg(if active { GREEN } else { FAINT }),
+                ),
+                Span::styled(detail, Style::default().fg(DIM)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            i18n::t("targets.keys"),
             Style::default().fg(ACCENT),
         )));
         frame.render_widget(
@@ -6474,6 +6885,7 @@ fn main() -> Result<()> {
             cli.snapshot_sessions,
             cli.snapshot_findings,
             cli.snapshot_modes,
+            cli.snapshot_targets,
             cli.snapshot_providers,
             cli.snapshot_permissions,
             cli.snapshot_settings,
@@ -6552,6 +6964,7 @@ fn snapshot_daemon(
     sessions: bool,
     findings: bool,
     modes: bool,
+    targets: bool,
     providers: bool,
     permissions: bool,
     settings: bool,
@@ -6559,7 +6972,15 @@ fn snapshot_daemon(
 ) -> Result<()> {
     let mut app = DaemonApp::connect(root.to_path_buf(), 100, provider)?;
     let _ = app.refresh();
-    if palette || sessions || findings || modes || providers || permissions || settings || language
+    if palette
+        || sessions
+        || findings
+        || modes
+        || targets
+        || providers
+        || permissions
+        || settings
+        || language
     {
         app.setup = None;
     }
@@ -6580,6 +7001,9 @@ fn snapshot_daemon(
     if modes {
         app.mode_selection = app.mode_index(&app.mode);
         app.show_modes = true;
+    }
+    if targets {
+        app.open_targets();
     }
     if providers {
         app.open_providers();
@@ -7437,6 +7861,25 @@ fn pad_display(text: &str, width: usize) -> String {
     format!("{text}{}", " ".repeat(width.saturating_sub(used)))
 }
 
+/// Recognises a leading `@target:lab` or `@lab` token when `lab` is a known
+/// target. The token is only honoured at the start of the message, so email
+/// addresses and ordinary prose are left alone.
+fn extract_target_prefix<'a>(text: &'a str, targets: &[TargetInfo]) -> Option<(String, &'a str)> {
+    let rest = text.strip_prefix('@')?;
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let token = parts.next()?;
+    let tail = parts.next().unwrap_or("").trim_start();
+    let id = token.strip_prefix("target:").unwrap_or(token);
+    if id.is_empty() {
+        return None;
+    }
+    if targets.iter().any(|target| target.id == id) {
+        Some((id.to_string(), tail))
+    } else {
+        None
+    }
+}
+
 fn char_boundary_at_or_before(text: &str, index: usize) -> usize {
     let mut index = index.min(text.len());
     while index > 0 && !text.is_char_boundary(index) {
@@ -7580,6 +8023,47 @@ mod tests {
     fn time_and_truncate_helpers() {
         assert_eq!(short_time("2026-11-14T08:01:09.123Z"), "08:01:09");
         assert_eq!(truncate("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn target_prefix_only_matches_known_targets_at_the_start() {
+        let targets = vec![
+            TargetInfo {
+                id: "local".into(),
+                label: "Local".into(),
+                kind: "embedded".into(),
+                is_default: true,
+                profile: "dev".into(),
+                attached: false,
+            },
+            TargetInfo {
+                id: "lab".into(),
+                label: "Lab".into(),
+                kind: "service".into(),
+                is_default: false,
+                profile: "dev".into(),
+                attached: false,
+            },
+            TargetInfo {
+                id: "none".into(),
+                label: "None".into(),
+                kind: "none".into(),
+                is_default: false,
+                profile: "none".into(),
+                attached: false,
+            },
+        ];
+        assert_eq!(
+            extract_target_prefix("@lab scan 10.0.0.5", &targets),
+            Some(("lab".into(), "scan 10.0.0.5"))
+        );
+        assert_eq!(
+            extract_target_prefix("@target:none summarize", &targets),
+            Some(("none".into(), "summarize"))
+        );
+        assert!(extract_target_prefix("@unknown do it", &targets).is_none());
+        assert!(extract_target_prefix("mail @lab now", &targets).is_none());
+        assert!(extract_target_prefix("user@example.com", &targets).is_none());
     }
 
     #[test]
@@ -8549,6 +9033,116 @@ mod tests {
         assert_eq!(app.selected_mode(), "plan");
         assert_eq!(app.mode, "plan");
         assert!(!app.status.is_empty());
+        app.cancel_task();
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd with a lab target; set MSK_TUI_TEST_ROOT"]
+    fn target_switch_applies_to_the_open_session() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let mut app =
+            DaemonApp::connect(PathBuf::from(root), 100, Some("scripted".into())).unwrap();
+        app.setup = None;
+        app.target = "local".into();
+        app.save_config();
+        app.create_task_with_goal("target switch test", false);
+        for _ in 0..100 {
+            let _ = app.refresh();
+            let _ = app.reload_tasks();
+            if app.selected_state() == "waiting_input" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(app.selected_state(), "waiting_input");
+        let replacement = app
+            .targets
+            .iter()
+            .position(|target| target.id == "lab")
+            .expect("lab target");
+        app.target_selection = replacement;
+        app.show_targets = true;
+        assert_eq!(app.selected_target_id(), "local");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.new_task);
+        assert_eq!(
+            app.selected_target_id(),
+            "lab",
+            "status={} selected={:?} tasks={:?}",
+            app.status,
+            app.selected_task_id(),
+            app.tasks
+                .iter()
+                .map(|task| (
+                    task.get("task_id").and_then(Value::as_str).unwrap_or("?"),
+                    task.get("target").and_then(Value::as_str).unwrap_or("?")
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(app.selected_target_attached());
+        assert!(!app.status.is_empty());
+        app.cancel_task();
+    }
+
+    #[test]
+    #[ignore = "requires a running mskd with a lab target; set MSK_TUI_TEST_ROOT"]
+    fn target_prefix_switches_and_is_stripped_before_send() {
+        let Ok(root) = std::env::var("MSK_TUI_TEST_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let mut app = DaemonApp::connect(root.clone(), 100, Some("scripted".into())).unwrap();
+        app.setup = None;
+        app.target = "local".into();
+        app.save_config();
+        app.create_task_with_goal("target prefix test", false);
+        for _ in 0..100 {
+            let _ = app.refresh();
+            let _ = app.reload_tasks();
+            if app.selected_state() == "waiting_input" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(app.selected_state(), "waiting_input");
+        app.enter_compose();
+        app.input = "@lab hello from a prefixed message".into();
+        app.input_cursor = app.input.len();
+        app.send_message();
+        for _ in 0..100 {
+            let _ = app.refresh();
+            let _ = app.reload_tasks();
+            if app.selected_state() == "waiting_input"
+                && app.selected_target_id() == "lab"
+                && app.input.is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(app.selected_target_id(), "lab");
+        assert!(app.input.is_empty(), "send failed: {}", app.status);
+        let task_id = app.selected_task_id().expect("task id");
+        let events =
+            std::fs::read_to_string(root.join("tasks").join(&task_id).join("events.jsonl"))
+                .expect("events");
+        let mut saw_message = false;
+        for line in events.lines() {
+            let Ok(event) = serde_json::from_str::<Event>(line) else {
+                continue;
+            };
+            if event.kind == "turn.start" {
+                let user = event.data.get("user").and_then(Value::as_str).unwrap_or("");
+                assert!(
+                    !user.starts_with('@'),
+                    "target prefix was sent to the model: {user}"
+                );
+                saw_message |= user == "hello from a prefixed message";
+            }
+        }
+        assert!(saw_message, "the stripped message did not reach the agent");
         app.cancel_task();
     }
 

@@ -448,6 +448,7 @@ pub mod methods {
     pub const TASK_MESSAGE: &str = "task.message";
     pub const TASK_INTERRUPT: &str = "task.interrupt";
     pub const TASK_MODE: &str = "task.mode";
+    pub const TASK_TARGET: &str = "task.target";
     pub const TASK_CANCEL: &str = "task.cancel";
     pub const TASK_STATE: &str = "task.state";
     pub const TASK_LIST: &str = "task.list";

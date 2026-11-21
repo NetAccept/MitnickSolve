@@ -15,6 +15,7 @@ use msk_core::ToolCall;
 use msk_core::context::{ContextLimits, ContextManager, Role, summarize_output};
 use msk_data::{FileObjectStore, ObjectStore};
 use msk_events::{Event, EventSink, JsonlSink};
+use msk_kernel::envd_target::{NONE_TARGET, TargetKind, TargetRegistry, TargetSpec};
 use msk_kernel::mode::ModeRegistry;
 use msk_kernel::policy::{self, PermissionMode};
 use msk_llm::{
@@ -77,6 +78,12 @@ struct Cli {
     /// envd workspace profile: dev, host, or isolated.
     #[arg(long, default_value = "dev", value_parser = ["dev", "host", "isolated"])]
     envd_profile: String,
+    /// Execution target id from the targets file. `none` runs without envd.
+    #[arg(long)]
+    target: Option<String>,
+    /// JSON file listing execution targets (written by mskd or user managed).
+    #[arg(long)]
+    envd_config: Option<PathBuf>,
     /// Kernel state directory (events, envd data).
     #[arg(long, default_value = ".msk")]
     root: PathBuf,
@@ -209,6 +216,7 @@ impl EventSink for TaggedSink {
 enum SessionInput {
     User(String),
     Mode(String),
+    Target { target: String, persist: bool },
     Interrupt,
     Ping,
     Shutdown,
@@ -388,6 +396,23 @@ fn spawn_stdin_reader(
                             let _ = tx.send(SessionInput::Mode(mode));
                         }
                     }
+                    "target" => {
+                        let target = value
+                            .get("target")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
+                        if target.is_empty() {
+                            let _ = tx.send(SessionInput::Invalid("empty target".into()));
+                        } else {
+                            let persist = value
+                                .get("persist")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(true);
+                            let _ = tx.send(SessionInput::Target { target, persist });
+                        }
+                    }
                     "interrupt" => {
                         cancel.cancel();
                         let _ = tx.send(SessionInput::Interrupt);
@@ -455,8 +480,121 @@ struct Backend {
     reused_env: bool,
 }
 
+/// Placeholder transport for sessions that run without an execution backend.
+/// Tool filtering prevents envd-backed calls; this exists so the host bridge
+/// never has to carry an Option and can swap clients by assignment.
+struct DetachedClient;
+
+impl EnvTransport for DetachedClient {
+    fn call_tool(&mut self, name: &str, _arguments: Value) -> io::Result<Value> {
+        Err(io::Error::other(format!(
+            "no execution environment attached (tool {name} needs an envd target)"
+        )))
+    }
+
+    fn request(&mut self, method: &str, _params: Value) -> io::Result<Value> {
+        Err(io::Error::other(format!(
+            "no execution environment attached (request {method})"
+        )))
+    }
+
+    fn shutdown(&mut self) {}
+}
+
+fn legacy_target(cli: &Cli) -> Result<Option<TargetSpec>> {
+    if cli.envd_url.is_some() && cli.envd.is_some() {
+        bail!("use either --envd or --envd-url, not both");
+    }
+    if let Some(url) = &cli.envd_url {
+        let token = cli
+            .envd_token
+            .clone()
+            .or_else(|| std::env::var("ENVD_TOKEN").ok())
+            .context("--envd-token or ENVD_TOKEN is required with --envd-url")?;
+        return Ok(Some(TargetSpec {
+            id: "remote".into(),
+            label: Some("Remote envd".into()),
+            kind: TargetKind::Service,
+            binary: None,
+            url: Some(url.clone()),
+            token_env: None,
+            token: Some(token),
+            ca: cli.envd_ca.clone(),
+            data_addr: None,
+            data_tls: false,
+            data_tls_name: None,
+            profile: cli.envd_profile.clone(),
+            workspace: None,
+        }));
+    }
+    if let Some(envd) = &cli.envd {
+        return Ok(Some(TargetSpec {
+            id: "local".into(),
+            label: Some("Local envd".into()),
+            kind: TargetKind::Embedded,
+            binary: Some(envd.clone()),
+            url: None,
+            token_env: None,
+            token: None,
+            ca: None,
+            data_addr: None,
+            data_tls: false,
+            data_tls_name: None,
+            profile: cli.envd_profile.clone(),
+            workspace: None,
+        }));
+    }
+    Ok(None)
+}
+
+/// Loads the target registry from --envd-config, the daemon control root, or
+/// the session root. A legacy --envd/--envd-url definition is merged as a
+/// target so existing direct invocations keep working.
+fn load_target_registry(cli: &Cli) -> Result<TargetRegistry> {
+    let path = cli
+        .envd_config
+        .clone()
+        .or_else(|| {
+            cli.control_root
+                .as_ref()
+                .map(|root| root.join("envd.json"))
+                .filter(|path| path.exists())
+        })
+        .or_else(|| {
+            let path = cli.root.join("envd.json");
+            path.exists().then_some(path)
+        });
+    let legacy = legacy_target(cli)?;
+    if path.is_none() && legacy.is_none() && cli.target.as_deref() != Some(NONE_TARGET) {
+        bail!("either --envd, --envd-url, --envd-config, or --target none is required");
+    }
+    if path.is_none() && legacy.is_none() && cli.target.as_deref() == Some(NONE_TARGET) {
+        return Ok(TargetRegistry::none_only());
+    }
+    TargetRegistry::load(path.as_deref(), legacy)
+        .and_then(|registry| registry.select_default(cli.target.as_deref()))
+}
+
 fn connect_backend(
     cli: &Cli,
+    sink: &dyn EventSink,
+    name: &str,
+    resume_env: Option<&str>,
+    workspace: Option<&std::path::Path>,
+) -> Result<Backend> {
+    let registry = load_target_registry(cli)?;
+    let target_id = cli
+        .target
+        .clone()
+        .unwrap_or_else(|| registry.default_id().to_string());
+    let target = registry.resolve(&target_id)?.clone();
+    connect_target(cli, &registry, &target, sink, name, resume_env, workspace)
+}
+
+fn connect_target(
+    cli: &Cli,
+    registry: &TargetRegistry,
+    target: &TargetSpec,
     sink: &dyn EventSink,
     name: &str,
     resume_env: Option<&str>,
@@ -468,23 +606,26 @@ fn connect_backend(
     if !cli.wasm.exists() {
         bail!("fallback WASM module not found: {}", cli.wasm.display());
     }
-    if cli.envd_url.is_some() && cli.envd.is_some() {
-        bail!("use either --envd or --envd-url, not both");
-    }
-    if cli.envd.is_some() && cli.envd_profile != "dev" {
-        bail!(
-            "--envd-profile {} requires --envd-url (service mode)",
-            cli.envd_profile
-        );
+    if target.is_none() {
+        emit(
+            sink,
+            "target.select",
+            json!({"target": NONE_TARGET, "label": target.label(), "kind": "none", "attached": false}),
+        )?;
+        human_line(cli, "execution target: none (no execution environment)");
+        return Ok(Backend {
+            client: Box::new(DetachedClient),
+            env_id: String::new(),
+            reused_env: false,
+        });
     }
 
-    if let Some(url) = &cli.envd_url {
-        let token = cli
-            .envd_token
-            .clone()
-            .or_else(|| std::env::var("ENVD_TOKEN").ok())
-            .context("--envd-token or ENVD_TOKEN is required with --envd-url")?;
-        let ca_pem = match &cli.envd_ca {
+    if target.kind == TargetKind::Service {
+        let url = target.url.as_deref().context("service target has no url")?;
+        let token = target
+            .token_value()?
+            .context("service target needs a token (token_env or ENVD_TOKEN)")?;
+        let ca_pem = match &target.ca {
             Some(path) => Some(
                 std::fs::read(path).with_context(|| format!("read envd CA {}", path.display()))?,
             ),
@@ -521,8 +662,7 @@ fn connect_backend(
                             .unwrap_or(false);
                         let data = structured.get("data").cloned().unwrap_or(Value::Null);
                         let profile = data.get("profile").and_then(Value::as_str);
-                        if !is_error && ok && profile.is_none_or(|value| value == cli.envd_profile)
-                        {
+                        if !is_error && ok && profile.is_none_or(|value| value == target.profile) {
                             emit(
                                 sink,
                                 "env.open",
@@ -564,7 +704,7 @@ fn connect_backend(
             None => tool_data(
                 &mut service,
                 "env_create",
-                json!({"name": name, "kind": "managed", "profile": cli.envd_profile}),
+                json!({"name": name, "kind": "managed", "profile": target.profile}),
                 sink,
             )?,
         };
@@ -591,10 +731,16 @@ fn connect_backend(
         });
     }
 
-    let envd = cli
-        .envd
-        .as_ref()
-        .context("either --envd or --envd-url is required")?;
+    let envd = registry
+        .resolve_binary(
+            target,
+            std::env::current_exe()
+                .ok()
+                .as_deref()
+                .and_then(std::path::Path::parent),
+        )
+        .or_else(|| target.binary.clone().filter(|path| path.exists()))
+        .with_context(|| format!("embedded target {} has no usable envd binary", target.id))?;
     let envd_bin = envd.canonicalize().unwrap_or_else(|_| envd.clone());
     if !envd_bin.exists() {
         bail!(
@@ -602,8 +748,10 @@ fn connect_backend(
             envd_bin.display()
         );
     }
-    let envd_root = workspace
-        .map(std::path::Path::to_path_buf)
+    let envd_root = target
+        .workspace
+        .clone()
+        .or_else(|| workspace.map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| cli.root.join("envd"));
     std::fs::create_dir_all(&envd_root)?;
     let mut embedded = EnvClient::spawn(&envd_bin, &envd_root).context("spawn embedded envd")?;
@@ -635,7 +783,7 @@ fn connect_backend(
     let mut env_params = json!({
         "name": name,
         "kind": "managed",
-        "profile": cli.envd_profile
+        "profile": target.profile
     });
     if workspace.is_some() {
         env_params["root"] = json!(".");
@@ -771,6 +919,9 @@ fn main() -> Result<()> {
         task_id: cli.task_id.clone(),
         default_provider: "scripted".into(),
         mode: Arc::new(Mutex::new("investigate".into())),
+        target: Arc::new(Mutex::new(
+            cli.target.clone().unwrap_or_else(|| "local".into()),
+        )),
         modes: Arc::new(ModeRegistry::builtin()?),
         permission: PermissionMode::Bypass,
     });
@@ -992,6 +1143,41 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Connects a new execution target and swaps it into the live host. The old
+/// client is only dropped after the new one is ready, so a failed switch keeps
+/// the session on its current target.
+fn switch_target(
+    cli: &Cli,
+    targets: &TargetRegistry,
+    target: &str,
+    sink: &dyn EventSink,
+    workspace: Option<&std::path::Path>,
+    client: &Arc<Mutex<Box<dyn EnvTransport>>>,
+    session: &mut Session,
+) -> Result<(String, String, String, String)> {
+    let spec = targets.resolve(target)?.clone();
+    let id = if spec.is_none() {
+        NONE_TARGET.to_string()
+    } else {
+        spec.id.clone()
+    };
+    let label = spec.label().to_string();
+    let kind = spec.kind.as_str().to_string();
+    if session.target() == id {
+        return Ok((id, label, kind, session.env_id().to_string()));
+    }
+    let backend = connect_target(cli, targets, &spec, sink, "session", None, workspace)?;
+    let env_id = backend.env_id.clone();
+    {
+        let mut slot = client
+            .lock()
+            .map_err(|_| anyhow::anyhow!("envd client lock poisoned"))?;
+        *slot = backend.client;
+    }
+    session.set_target(&id, &label, &env_id, !spec.is_none());
+    Ok((id, label, kind, env_id))
+}
+
 fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Path) -> Result<()> {
     let checkpoint = match &cli.resume_checkpoint {
         Some(path) => {
@@ -1016,8 +1202,24 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         .workspace
         .clone()
         .or_else(|| std::env::current_dir().ok());
-    let backend = connect_backend(
+    let targets = Arc::new(load_target_registry(cli)?);
+    let requested_target = cli
+        .target
+        .clone()
+        .unwrap_or_else(|| targets.default_id().to_string());
+    let target_spec = targets.resolve(&requested_target)?.clone();
+    let target_id = if target_spec.is_none() {
+        NONE_TARGET.to_string()
+    } else {
+        target_spec.id.clone()
+    };
+    let target_label = target_spec.label().to_string();
+    let target_kind = target_spec.kind.as_str().to_string();
+    let target_attached = !target_spec.is_none();
+    let backend = connect_target(
         cli,
+        &targets,
+        &target_spec,
         sink.as_ref(),
         "session",
         resume_env.as_deref(),
@@ -1025,6 +1227,29 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
     )?;
     let env_id = backend.env_id;
     let env_reused = backend.reused_env;
+    if target_attached {
+        emit(
+            sink.as_ref(),
+            "target.select",
+            json!({
+                "target": target_id,
+                "label": target_label,
+                "kind": target_kind,
+                "attached": true,
+                "env_id": env_id
+            }),
+        )?;
+    }
+    if cli.stdio_json {
+        emit_protocol(json!({
+            "type": "target.updated",
+            "target": target_id,
+            "label": target_label,
+            "kind": target_kind,
+            "env_id": env_id,
+            "attached": target_attached
+        }));
+    }
     let client = backend.client;
 
     let object_store: Arc<dyn ObjectStore> =
@@ -1079,6 +1304,7 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         )?;
     }
     let current_mode = Arc::new(Mutex::new(agent_mode.clone()));
+    let current_target = Arc::new(Mutex::new(target_id.clone()));
     let env_host = Arc::new(EnvHost {
         client,
         artifacts: object_store.clone(),
@@ -1088,6 +1314,7 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         task_id: cli.task_id.clone(),
         default_provider: provider_kind_str(cli.provider).into(),
         mode: current_mode.clone(),
+        target: current_target.clone(),
         modes: modes.clone(),
         permission,
     });
@@ -1173,6 +1400,18 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
     };
     context.push_pinned(
         Role::System,
+        if target_attached {
+            format!(
+                "Execution target: {target_id} ({target_label}), env_id={env_id}. Tools outside this target's capabilities are unavailable."
+            )
+        } else {
+            format!(
+                "Execution target: {target_id} (no execution environment). Commands, workspace files, network tools and PTY sessions are unavailable until a target is attached."
+            )
+        },
+    );
+    context.push_pinned(
+        Role::System,
         format!(
             "Current agent mode: {} ({}). {}",
             agent_mode,
@@ -1228,6 +1467,9 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
         .unwrap_or_else(|| cli.root.join("checkpoint.json"));
     let mut session = Session::new(SessionOptions {
         env_id,
+        target: target_id.clone(),
+        target_attached,
+        target_handle: Some(current_target.clone()),
         registry,
         provider,
         context,
@@ -1336,6 +1578,47 @@ fn run_session(cli: &Cli, sink: Arc<dyn EventSink>, events_path: &std::path::Pat
                             emit_protocol(json!({"type": "error", "message": err}));
                         } else {
                             eprintln!("mode switch: {err}");
+                        }
+                    }
+                }
+                continue;
+            }
+            SessionInput::Target { target, persist } => {
+                // Target attachment is session state; the per-message form is
+                // accepted for forward compatibility but still binds.
+                let _ = persist;
+                match switch_target(
+                    cli,
+                    &targets,
+                    &target,
+                    sink.as_ref(),
+                    workspace.as_deref(),
+                    &env_host.client,
+                    &mut session,
+                ) {
+                    Ok((id, label, kind, env_id)) => {
+                        if cli.stdio_json {
+                            emit_protocol(json!({
+                                "type": "target.updated",
+                                "target": id,
+                                "label": label,
+                                "kind": kind,
+                                "env_id": env_id,
+                                "attached": id != NONE_TARGET
+                            }));
+                        } else {
+                            eprintln!("target: {id} ({kind})");
+                        }
+                    }
+                    Err(err) => {
+                        if cli.stdio_json {
+                            emit_protocol(json!({
+                                "type": "target.error",
+                                "target": target,
+                                "message": err.to_string()
+                            }));
+                        } else {
+                            eprintln!("target switch: {err}");
                         }
                     }
                 }

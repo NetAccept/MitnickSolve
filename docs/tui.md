@@ -67,7 +67,7 @@ This is an actual `--snapshot` frame (120×40):
 
 
 
-  ~  ·  权 限  自 动                                                                                    MitnickSolve 0.1.8
+  ~  ·  权 限  自 动                                                                                    MitnickSolve 0.2.0
 ```
 
 - The large wordmark is drawn from Unicode blocks with a left-to-right gradient.
@@ -84,7 +84,8 @@ This is an actual `--snapshot` frame (120×40):
   between rows instead of scrolling; `Home`/`End` go to the current row's
   start/end.
 - The composer uses a `❯` prompt. Its status line shows the mode, provider,
-  model and effort. The `try` card below suggests starter prompts; `/demo` runs
+  model and effort; the footer shows the execution target (`⌂ local`,
+  `☁ lab`, `◇ saved/detached`, `⊘ none`). The `try` card below suggests starter prompts; `/demo` runs
   the offline tool demo.
 - The footer shows the workspace, permission posture, context tokens with a
   small usage bar, tool count, a scrollback indicator and the version. Optional
@@ -201,6 +202,7 @@ Enter to run, Esc to close.
                       │   Model                     pick a model preset                           │
                       │   Reasoning effort          minimal, low, medium, high                    │
                       │   Agent mode                plan, investigate, exploit, harden, auto       │
+                      │   Execution target          local, remote lab, no execution environment     │
                       │   Offline demo              run a canned tool session                     │
                       │   Terminal                  open the PTY workspace                        │
                       │   Event inspector           show the raw event stream                     │
@@ -236,7 +238,8 @@ replacing the conversation you are reading.
 简体中文, 日本語, Español, Français and Deutsch. The choice is stored in
 `tui-config.json`; `MSK_LANG=zh-CN` overrides it for one run. Missing
 translations fall back to English. `Ctrl+P` → **Settings** (or `/settings`)
-groups language, permission mode, agent mode, provider profiles and the model
+groups language, permission mode, agent mode, execution target, provider
+profiles and the model
 wizard in one place.
 
 ## Conversation
@@ -262,7 +265,7 @@ markdown rendering and the composer at the bottom:
  │                    │   │  攻 击  · scripted                                                                         │
  │tab switch · ctrl+n │   ╰──────────────────────────────────────────────────────────────────────────────────────────╯
  ╰────────────────────╯                                        tab sessions   ctrl+n new   ctrl+p commands   F1 help
-  ~  ·  权 限  手 动   ·  ctx 12.3k ▰▱▱▱▱▱▱▱  ·  tools 7                                              MitnickSolve 0.1.8
+  ~  ·  权 限  手 动   ·  ctx 12.3k ▰▱▱▱▱▱▱▱  ·  tools 7                                              MitnickSolve 0.2.0
 ```
 
 - On wide terminals the left rail lists sessions and the session count; `▌`
@@ -362,7 +365,7 @@ Slash commands still work if you prefer typing them:
 /new [goal]   /demo        /providers      /provider NAME   /models      /model NAME
 /effort NAME  /setup       /resume          /sessions    /terminal
 /events       /approvals   /findings      /interrupt   /cancel      /clear
-/mode         /mode NAME   /status        /help        /quit
+/mode         /mode NAME   /target [NAME]  /status      /help        /quit
 ```
 
 Providers: `scripted`, `scripted-demo`, `openai`, `openai-responses`
@@ -390,6 +393,29 @@ The mode is a tool-level boundary, not a label: `plan`/`investigate` cannot call
 `exec`, `write_file`, `session_*`, `net_dial` or `archive_extract`, and subagents
 cannot escalate. See [`docs/modes.md`](docs/modes.md) for the configurable
 definitions, the full matrix and auto-routing rules.
+
+## Execution targets
+
+A session runs on one execution target at a time. Targets are defined in
+`<root>/envd.json` (see [`docs/targets.md`](targets.md)); `local` is the default
+and `none` runs without an execution environment.
+
+- `Ctrl+P` → **Execution target**, `/target`, or `/envd` opens the picker.
+- On an open session the switch happens between turns and creates a fresh
+  environment; the conversation is preserved, but old shells and PTY sessions
+  are not.
+- `/target lab` binds directly; `/target none` detaches.
+- A message may start with `@target:lab` or `@lab`. The prefix is stripped and
+  the session is bound before the message runs. It is a session-level bind,
+  not a per-tool router, and only known targets are recognised.
+- The footer shows the current target. `◇` means the session is saved or its
+  target is not currently attached; `⊘` means no execution environment.
+- With `none`, only analysis and control-plane tools remain (`artifact_read`,
+  `wasm_eval`, `http_request`, blackboard/findings/flags, reports, subagents).
+  `exec`, file, network and PTY tools disappear from the model's tool list.
+- Saved sessions remember their target and resume on it. A removed target is an
+  error, never a silent fallback to `local`.
+- Subagents inherit the parent's target.
 
 ## Permission modes
 
@@ -421,7 +447,8 @@ second TUI, or finishing a turn all reload the same timeline.
 
 `mskd` writes a small `task.json` beside each event log. On restart it rebuilds
 the session list from `.msk/tasks/*`, shows those entries as `▣ saved`, and
-loads their conversations from `task.history`. Select a saved session in `Tab`
+loads their conversations from `task.history`. The saved entry also remembers
+its execution target, and replying resumes on that target. Select a saved session in `Tab`
 and send a message to continue: the TUI creates a new task from that session's
 checkpoint, so the conversation carries over with a fresh agent process. Task
 directories written by older releases have no `task.json`; their goal and mode

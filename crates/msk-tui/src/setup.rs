@@ -271,6 +271,7 @@ impl DaemonApp {
             effort: self.effort.clone(),
             base_url: self.base_url.clone(),
             mode: self.mode.clone(),
+            target: self.target.clone(),
             permission: self.permission.clone(),
             api_key: self.api_key.clone(),
             profiles: self.profiles.clone(),

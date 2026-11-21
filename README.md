@@ -106,6 +106,11 @@ M0 scaffold plus the P1 session/turn slice:
   log and rebuilds saved sessions after a restart; the TUI marks them `▣ saved`
   and replying resumes from the checkpoint. The composer soft-wraps, grows with
   the draft, and accepts a newline with `Shift+Enter`, `Alt+Enter` or `Ctrl+J`.
+- Session-scoped execution targets: `.msk/envd.json` lists local, remote and
+  `none` backends; each task picks one at creation and can re-bind between turns
+  from `Ctrl+P` → **Execution target**, `/target` or a leading `@target:NAME`.
+  Tools are filtered by mode ∩ target, saved sessions remember their target,
+  and subagents inherit it. See [`docs/targets.md`](docs/targets.md).
 - SQLite event index: `msk-store` indexes events by id/task/kind/seq. Start
   mskd with `--store <path>` and query via `mskctl events` or
   `msk-replay --db <path>`; duplicate ids from log replay are ignored.
@@ -323,6 +328,30 @@ target/debug/mskd --root .msk --envd-url http://127.0.0.1:7800 \
   --envd-token "$ENVD_TOKEN" --envd-data-addr 127.0.0.1:7801 \
   --tools-dir tools/wasm
 ```
+
+To run several backends at once, write `.msk/envd.json` (or pass
+`--targets-file`) and give each task a target. Local, remote and detached
+sessions can coexist in one daemon:
+
+```json
+{
+  "default": "local",
+  "targets": [
+    {"id": "local", "kind": "embedded", "binary": "envd", "profile": "dev"},
+    {"id": "lab", "kind": "service", "url": "https://envd.lab:7800",
+     "token_env": "LAB_TOKEN", "profile": "isolated", "ca": "ca.pem"}
+  ]
+}
+```
+
+```sh
+target/debug/mskd --root .msk --targets-file .msk/envd.json --tools-dir tools/wasm
+target/debug/mskctl --root .msk create --goal "triage" --target lab --interactive
+```
+
+`/target` in the TUI switches a live session between targets, `@target:lab ...`
+does the same for a message, and `/target none` detaches it. See
+[`docs/targets.md`](docs/targets.md) for the full schema and switching rules.
 
 For a TLS service, use an `https://` URL and add `--envd-data-tls` so the
 daemon terminal also speaks TLS 1.3 to the data plane. Both planes trust the

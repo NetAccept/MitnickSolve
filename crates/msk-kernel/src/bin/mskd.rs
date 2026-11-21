@@ -16,6 +16,7 @@ use msk_events::Event;
 use msk_ipc::data::{DATA_MAX_FRAME, DataFrame, DataKind, write_frame};
 use msk_ipc::local::{self, Stream};
 use msk_ipc::{RpcNotification, RpcRequest, RpcResponse, TryClone, methods};
+use msk_kernel::envd_target::{NONE_TARGET, TargetKind, TargetRegistry, TargetSpec};
 use msk_kernel::mode::ModeRegistry;
 use msk_kernel::policy::PermissionMode;
 use msk_mcp::{EnvClient, EnvDataClient, EnvTransport, ServiceClient};
@@ -59,6 +60,13 @@ struct Cli {
     /// envd workspace profile for tasks and the terminal.
     #[arg(long, default_value = "dev", value_parser = ["dev", "host", "isolated"])]
     envd_profile: String,
+    /// JSON file listing execution targets. Defaults to <root>/envd.json when
+    /// that file exists; otherwise --envd/--envd-url define one target.
+    #[arg(long)]
+    targets_file: Option<PathBuf>,
+    /// Default execution target id (must exist in the targets file).
+    #[arg(long)]
+    default_target: Option<String>,
     /// Signed llm.provider manifest forwarded to component-provider tasks.
     #[arg(long)]
     component_manifest: Option<PathBuf>,
@@ -119,6 +127,11 @@ struct Task {
     requested_mode: String,
     mode: String,
     mode_reason: String,
+    target: String,
+    target_label: String,
+    target_kind: String,
+    target_attached: bool,
+    target_env_id: Option<String>,
     headless: bool,
     agent_depth: u32,
     parent_task: Option<String>,
@@ -155,6 +168,11 @@ impl Task {
             "requested_mode": self.requested_mode,
             "mode": self.mode,
             "mode_reason": self.mode_reason,
+            "target": self.target,
+            "target_label": self.target_label,
+            "target_kind": self.target_kind,
+            "target_attached": self.target_attached,
+            "target_env_id": self.target_env_id,
             "headless": self.headless,
             "agent_depth": self.agent_depth,
             "parent_task": self.parent_task,
@@ -191,6 +209,10 @@ impl Task {
             requested_mode: self.requested_mode.clone(),
             mode: self.mode.clone(),
             mode_reason: self.mode_reason.clone(),
+            target: self.target.clone(),
+            target_label: self.target_label.clone(),
+            target_kind: self.target_kind.clone(),
+            target_env_id: self.target_env_id.clone(),
             headless: self.headless,
             agent_depth: self.agent_depth,
             parent_task: self.parent_task.clone(),
@@ -237,6 +259,14 @@ struct TaskMetadata {
     mode: String,
     #[serde(default)]
     mode_reason: String,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    target_label: String,
+    #[serde(default)]
+    target_kind: String,
+    #[serde(default)]
+    target_env_id: Option<String>,
     #[serde(default)]
     headless: bool,
     #[serde(default)]
@@ -450,11 +480,9 @@ struct Daemon {
     envd: Option<PathBuf>,
     envd_url: Option<String>,
     envd_token: Option<String>,
-    envd_data_addr: Option<String>,
-    envd_data_tls: bool,
-    envd_data_tls_name: Option<String>,
     envd_ca: Option<PathBuf>,
-    envd_profile: String,
+    targets: Arc<TargetRegistry>,
+    targets_file: Option<PathBuf>,
     component_manifest: Option<PathBuf>,
     component_trust: Option<PathBuf>,
     component_host: Option<PathBuf>,
@@ -467,6 +495,8 @@ struct Daemon {
     modes_file: Option<PathBuf>,
     inner: Mutex<Inner>,
     subscribers: Mutex<Vec<Subscriber>>,
+    target_waiters:
+        Mutex<HashMap<String, (String, mpsc::Sender<std::result::Result<Value, String>>)>>,
     terminal: Mutex<Option<TerminalSession>>,
     approvals: Mutex<HashMap<String, PendingApproval>>,
     blackboard: Mutex<Blackboard>,
@@ -481,9 +511,6 @@ fn main() -> Result<()> {
     let root = msk_ipc::normalize_root(&cli.root);
 
     let envd = cli.envd.as_ref().map(|path| msk_ipc::normalize_root(path));
-    if envd.is_none() && cli.envd_url.is_none() {
-        bail!("either --envd or --envd-url is required");
-    }
     if envd.is_some() && cli.envd_url.is_some() {
         bail!("use either --envd or --envd-url, not both");
     }
@@ -528,6 +555,59 @@ fn main() -> Result<()> {
             bail!("envd CA bundle not found: {}", path.display());
         }
     }
+    let targets_file = cli
+        .targets_file
+        .as_ref()
+        .map(|path| msk_ipc::normalize_root(path))
+        .or_else(|| {
+            let candidate = root.join("envd.json");
+            candidate.exists().then_some(candidate)
+        });
+    let legacy_target = if let Some(url) = &envd_url {
+        Some(TargetSpec {
+            id: "remote".into(),
+            label: Some("Remote envd".into()),
+            kind: TargetKind::Service,
+            binary: None,
+            url: Some(url.clone()),
+            token_env: None,
+            token: envd_token.clone(),
+            ca: envd_ca.clone(),
+            data_addr: envd_data_addr.clone(),
+            data_tls: cli.envd_data_tls,
+            data_tls_name: cli.envd_data_tls_name.clone(),
+            profile: cli.envd_profile.clone(),
+            workspace: None,
+        })
+    } else {
+        envd.as_ref().map(|binary| TargetSpec {
+            id: "local".into(),
+            label: Some("Local envd".into()),
+            kind: TargetKind::Embedded,
+            binary: Some(binary.clone()),
+            url: None,
+            token_env: None,
+            token: None,
+            ca: None,
+            data_addr: None,
+            data_tls: false,
+            data_tls_name: None,
+            profile: "dev".into(),
+            workspace: None,
+        })
+    };
+    let targets = if targets_file.is_none() && legacy_target.is_none() {
+        if cli.default_target.as_deref() == Some(NONE_TARGET) {
+            Arc::new(TargetRegistry::none_only())
+        } else {
+            bail!("either --envd, --envd-url, or an execution targets file is required");
+        }
+    } else {
+        Arc::new(
+            TargetRegistry::load(targets_file.as_deref(), legacy_target)?
+                .select_default(cli.default_target.as_deref())?,
+        )
+    };
     let component_manifest = cli
         .component_manifest
         .as_ref()
@@ -600,11 +680,9 @@ fn main() -> Result<()> {
         envd,
         envd_url,
         envd_token,
-        envd_data_addr,
-        envd_data_tls: cli.envd_data_tls,
-        envd_data_tls_name: cli.envd_data_tls_name.clone(),
         envd_ca,
-        envd_profile: cli.envd_profile.clone(),
+        targets,
+        targets_file,
         component_manifest,
         component_trust,
         component_host,
@@ -617,6 +695,7 @@ fn main() -> Result<()> {
         modes_file,
         inner: Mutex::new(Inner::default()),
         subscribers: Mutex::new(Vec::new()),
+        target_waiters: Mutex::new(HashMap::new()),
         terminal: Mutex::new(None),
         approvals: Mutex::new(HashMap::new()),
         blackboard: Mutex::new(Blackboard::load(blackboard_path)),
@@ -749,6 +828,8 @@ impl Daemon {
                             "workspace": self.workspace.display().to_string(),
                             "modes": self.modes.infos(),
                             "default_mode": "auto",
+                            "targets": self.targets.list(None),
+                            "default_target": self.targets.default_id(),
                             "llm": {
                                 "api_key": std::env::var("MSK_LLM_API_KEY").is_ok(),
                                 "model": std::env::var("MSK_LLM_MODEL").ok(),
@@ -853,6 +934,12 @@ impl Daemon {
                     .and_then(Value::as_str)
                     .unwrap_or("auto")
                     .to_string();
+                let target = params
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
                 if requested_mode != "auto" && self.modes.spec(&requested_mode).is_none() {
                     return (
                         RpcResponse::err(id, -32602, format!("unknown mode: {requested_mode}")),
@@ -899,6 +986,7 @@ impl Daemon {
                     approvals,
                     permission,
                     requested_mode,
+                    target,
                     headless,
                     agent_depth,
                     max_steps,
@@ -1039,6 +1127,20 @@ impl Daemon {
                     Err(err) => (RpcResponse::err(id, -32602, err.to_string()), None),
                 }
             }
+            methods::TASK_TARGET => {
+                let task_id = params
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let target = params
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                match self.set_task_target(task_id, target) {
+                    Ok(snapshot) => (RpcResponse::ok(id, snapshot), None),
+                    Err(err) => (RpcResponse::err(id, -32002, err.to_string()), None),
+                }
+            }
             methods::EVENTS_QUERY => match self.event_query(&params) {
                 Ok(value) => (RpcResponse::ok(id, value), None),
                 Err(err) => (RpcResponse::err(id, -32000, err.to_string()), None),
@@ -1110,6 +1212,7 @@ impl Daemon {
         approvals: String,
         permission: String,
         requested_mode: String,
+        mut target: Option<String>,
         headless: bool,
         agent_depth: u32,
         max_steps: usize,
@@ -1127,21 +1230,40 @@ impl Daemon {
         if let Some(parent_id) = &parent_task
             && let Ok(inner) = self.inner.lock()
             && let Some(parent) = inner.tasks.get(parent_id)
-            && parent.provider == provider
         {
-            if model.is_none() {
-                model = parent.model.clone();
+            if target.as_deref().is_none_or(str::is_empty) {
+                target = Some(parent.target.clone());
             }
-            if effort.is_none() {
-                effort = parent.effort.clone();
-            }
-            if base_url.is_none() {
-                base_url = parent.base_url.clone();
-            }
-            if api_key.is_none() {
-                api_key = parent.api_key.clone();
+            if parent.provider == provider {
+                if model.is_none() {
+                    model = parent.model.clone();
+                }
+                if effort.is_none() {
+                    effort = parent.effort.clone();
+                }
+                if base_url.is_none() {
+                    base_url = parent.base_url.clone();
+                }
+                if api_key.is_none() {
+                    api_key = parent.api_key.clone();
+                }
             }
         }
+        let requested_target = target
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(self.targets.default_id())
+            .to_string();
+        let target_spec = self.targets.resolve(&requested_target)?.clone();
+        let target_id = if target_spec.is_none() {
+            NONE_TARGET.to_string()
+        } else {
+            target_spec.id.clone()
+        };
+        let target_label = target_spec.label().to_string();
+        let target_kind = target_spec.kind.as_str().to_string();
+        let target_attached = !target_spec.is_none();
         let requested = if requested_mode.trim().is_empty() {
             "auto".to_string()
         } else {
@@ -1241,6 +1363,11 @@ impl Daemon {
             requested_mode: requested.as_str().to_string(),
             mode: resolved_mode.as_str().to_string(),
             mode_reason,
+            target: target_id,
+            target_label,
+            target_kind,
+            target_attached,
+            target_env_id: None,
             headless,
             agent_depth,
             parent_task,
@@ -1315,6 +1442,7 @@ impl Daemon {
             stream,
             permission,
             mode,
+            target,
             headless,
             agent_depth,
             forked_from,
@@ -1342,6 +1470,7 @@ impl Daemon {
                     task.stream,
                     task.permission.clone(),
                     task.mode.clone(),
+                    task.target.clone(),
                     task.headless,
                     task.agent_depth,
                     task.forked_from.clone(),
@@ -1406,18 +1535,30 @@ impl Daemon {
             }
         };
 
-        let mut command = Command::new(&self.agent_bin);
-        if let Some(url) = &self.envd_url {
-            command
-                .arg("--envd-url")
-                .arg(url)
-                .arg("--envd-token")
-                .arg(self.envd_token.as_deref().unwrap_or_default());
-            if let Some(ca) = &self.envd_ca {
-                command.arg("--envd-ca").arg(ca);
+        let target_spec = match self.targets.resolve(&target) {
+            Ok(spec) => spec.clone(),
+            Err(err) => {
+                self.finish_task(&task_id, TaskState::Failed, Some(err.to_string()));
+                return;
             }
-        } else if let Some(envd) = &self.envd {
-            command.arg("--envd").arg(envd);
+        };
+        let mut command = Command::new(&self.agent_bin);
+        command.arg("--target").arg(&target);
+        if !target_spec.is_none() {
+            if let Some(path) = &self.targets_file {
+                command.arg("--envd-config").arg(path);
+            } else if let Some(url) = &self.envd_url {
+                command
+                    .arg("--envd-url")
+                    .arg(url)
+                    .arg("--envd-token")
+                    .arg(self.envd_token.as_deref().unwrap_or_default());
+                if let Some(ca) = &self.envd_ca {
+                    command.arg("--envd-ca").arg(ca);
+                }
+            } else if let Some(envd) = &self.envd {
+                command.arg("--envd").arg(envd);
+            }
         }
         command
             .arg("--root")
@@ -1461,7 +1602,7 @@ impl Daemon {
             .arg("--max-context-tokens")
             .arg(max_context_tokens.to_string())
             .arg("--envd-profile")
-            .arg(&self.envd_profile);
+            .arg(&target_spec.profile);
         if let Some(checkpoint) = &resume_checkpoint {
             command.arg("--resume-checkpoint").arg(checkpoint);
         }
@@ -1705,6 +1846,71 @@ impl Daemon {
                     self.record_approval_request(task_id, &value);
                 }
                 "mode.updated" => {}
+                "target.updated" => {
+                    let target = value
+                        .get("target")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let env_id = value
+                        .get("env_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let label = value
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| target.clone());
+                    let kind = value
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "unknown".into());
+                    let snapshot = {
+                        let mut inner = match self.inner.lock() {
+                            Ok(inner) => inner,
+                            Err(_) => return,
+                        };
+                        let Some(task) = inner.tasks.get_mut(task_id) else {
+                            continue;
+                        };
+                        task.target = target.clone();
+                        task.target_label = label;
+                        task.target_kind = kind;
+                        task.target_env_id = env_id;
+                        task.target_attached = target != NONE_TARGET;
+                        let snapshot = task.snapshot();
+                        let _ = task.write_metadata();
+                        snapshot
+                    };
+                    self.broadcast_state(task_id, &snapshot);
+                    let notify = self.target_waiters.lock().ok().and_then(|mut waiters| {
+                        let matches = waiters
+                            .get(task_id)
+                            .is_some_and(|(requested, _)| requested == &target);
+                        matches.then(|| waiters.remove(task_id)).flatten()
+                    });
+                    if let Some((_, tx)) = notify {
+                        let _ = tx.send(Ok(snapshot));
+                    }
+                }
+                "target.error" => {
+                    let message = value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("target switch failed")
+                        .to_string();
+                    let failed_target = value.get("target").and_then(Value::as_str);
+                    let notify = self.target_waiters.lock().ok().and_then(|mut waiters| {
+                        let matches = waiters.get(task_id).is_some_and(|(requested, _)| {
+                            failed_target.is_none_or(|failed| failed == requested)
+                        });
+                        matches.then(|| waiters.remove(task_id)).flatten()
+                    });
+                    if let Some((_, tx)) = notify {
+                        let _ = tx.send(Err(message));
+                    }
+                }
                 "pong" => {}
                 other => {
                     eprintln!("mskd task {task_id}: unknown protocol frame: {other}");
@@ -1829,6 +2035,84 @@ impl Daemon {
         Ok(snapshot)
     }
 
+    /// Re-binds a live session to another execution target between turns. The
+    /// agent connects (or detaches) and acknowledges with `target.updated`.
+    fn set_task_target(&self, task_id: &str, requested: &str) -> Result<Value> {
+        let requested = requested.trim();
+        if requested.is_empty() {
+            bail!("target is required");
+        }
+        let spec = self.targets.resolve(requested)?.clone();
+        let target_id = if spec.is_none() {
+            NONE_TARGET.to_string()
+        } else {
+            spec.id.clone()
+        };
+        let input = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("task map poisoned"))?;
+            let task = inner
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+            if !task.interactive {
+                bail!("task {task_id} is not interactive");
+            }
+            match task.state {
+                TaskState::Running => {
+                    bail!("wait for the current turn to finish before switching targets")
+                }
+                TaskState::WaitingInput => {}
+                TaskState::Done | TaskState::Failed | TaskState::Cancelled => {
+                    bail!("task {task_id} has exited")
+                }
+            }
+            task.input.clone()
+        };
+        let (tx, rx) = mpsc::channel();
+        self.target_waiters
+            .lock()
+            .map_err(|_| anyhow::anyhow!("target waiters poisoned"))?
+            .insert(task_id.to_string(), (target_id.clone(), tx));
+        let line = serde_json::to_string(&json!({
+            "type": "target",
+            "target": target_id,
+            "persist": true
+        }))?;
+        let write_result = (|| -> Result<()> {
+            let mut slot = input
+                .lock()
+                .map_err(|_| anyhow::anyhow!("task input poisoned"))?;
+            let stdin = slot
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("task {task_id} stdin is not available"))?;
+            writeln!(stdin, "{line}")?;
+            stdin.flush()?;
+            Ok(())
+        })();
+        if let Err(err) = write_result {
+            self.target_waiters
+                .lock()
+                .ok()
+                .and_then(|mut waiters| waiters.remove(task_id));
+            self.set_state(task_id, TaskState::Failed, Some(err.to_string()));
+            return Err(err);
+        }
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(snapshot)) => Ok(snapshot),
+            Ok(Err(message)) => bail!("{message}"),
+            Err(_) => {
+                self.target_waiters
+                    .lock()
+                    .ok()
+                    .and_then(|mut waiters| waiters.remove(task_id));
+                bail!("target switch timed out")
+            }
+        }
+    }
+
     fn message_task(&self, task_id: &str, text: &str) -> Result<Value> {
         if text.trim().is_empty() {
             bail!("message text is empty");
@@ -1943,6 +2227,14 @@ impl Daemon {
                 .as_ref()
                 .map(|value| value.demo.clone())
                 .unwrap_or_default();
+            let mut target = metadata
+                .as_ref()
+                .map(|value| value.target.clone())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_default();
+            let mut target_env_id = metadata
+                .as_ref()
+                .and_then(|value| value.target_env_id.clone());
             for event in &events {
                 match event.kind.as_str() {
                     "kernel.start" if demo.is_empty() => {
@@ -1982,6 +2274,14 @@ impl Daemon {
                     "mode.switch" => {
                         if let Some(switched) = event.data.get("mode").and_then(Value::as_str) {
                             mode = switched.to_string();
+                        }
+                    }
+                    "target.switch" => {
+                        if let Some(switched) = event.data.get("target").and_then(Value::as_str) {
+                            target = switched.to_string();
+                        }
+                        if let Some(env_id) = event.data.get("env_id").and_then(Value::as_str) {
+                            target_env_id = Some(env_id.to_string());
                         }
                     }
                     _ => {}
@@ -2066,6 +2366,18 @@ impl Daemon {
                     None
                 }
             });
+            let target = if target.is_empty() {
+                self.targets.default_id().to_string()
+            } else {
+                target
+            };
+            let target_spec = self.targets.resolve(&target).ok();
+            let target_label = target_spec
+                .map(|spec| spec.label().to_string())
+                .unwrap_or_else(|| target.clone());
+            let target_kind = target_spec
+                .map(|spec| spec.kind.as_str().to_string())
+                .unwrap_or_else(|| "unknown".into());
             let task = Task {
                 id,
                 goal,
@@ -2093,6 +2405,11 @@ impl Daemon {
                 requested_mode,
                 mode,
                 mode_reason,
+                target,
+                target_label,
+                target_kind,
+                target_attached: false,
+                target_env_id,
                 headless: metadata
                     .as_ref()
                     .map(|value| value.headless)
@@ -2559,6 +2876,14 @@ impl Daemon {
     }
 
     fn finish_task(&self, task_id: &str, state: TaskState, error: Option<String>) {
+        if let Some((_, tx)) = self
+            .target_waiters
+            .lock()
+            .ok()
+            .and_then(|mut waiters| waiters.remove(task_id))
+        {
+            let _ = tx.send(Err("task exited before the target switch completed".into()));
+        }
         let snapshot = {
             let mut inner = match self.inner.lock() {
                 Ok(inner) => inner,
@@ -2605,26 +2930,43 @@ impl Daemon {
 
         let cols = terminal_dimension(params.get("cols"), 100);
         let rows = terminal_dimension(params.get("rows"), 30);
-        let mut client: Box<dyn EnvTransport> = if let Some(url) = &self.envd_url {
-            let ca_pem = match &self.envd_ca {
-                Some(path) => Some(
-                    fs::read(path).with_context(|| format!("read envd CA {}", path.display()))?,
-                ),
-                None => None,
-            };
-            let mut service = ServiceClient::new_with_ca(
-                url,
-                self.envd_token.as_deref().unwrap_or_default(),
-                ca_pem,
-            )
-            .context("configure envd TLS")?;
+        let target = self.targets.default_target().clone();
+        if target.is_none() {
+            bail!("the default execution target has no execution environment");
+        }
+        let remote = target.kind == TargetKind::Service;
+        let token = target.token_value()?.unwrap_or_default();
+        let ca_pem = match &target.ca {
+            Some(path) => {
+                Some(fs::read(path).with_context(|| format!("read envd CA {}", path.display()))?)
+            }
+            None => None,
+        };
+        let mut client: Box<dyn EnvTransport> = if remote {
+            let url = target.url.as_deref().context("service target has no url")?;
+            let mut service = ServiceClient::new_with_ca(url, token.clone(), ca_pem.clone())
+                .context("configure envd TLS")?;
             service.initialize()?;
             Box::new(service)
         } else {
-            let envd = self.envd.as_ref().context("envd is not configured")?;
-            let envd_root = self.workspace.clone();
+            let envd = self
+                .targets
+                .resolve_binary(
+                    &target,
+                    std::env::current_exe()
+                        .ok()
+                        .as_deref()
+                        .and_then(Path::parent),
+                )
+                .or_else(|| target.binary.clone().filter(|path| path.exists()))
+                .with_context(|| format!("embedded target {} has no envd binary", target.id))?;
+            let envd_root = target
+                .workspace
+                .clone()
+                .unwrap_or_else(|| self.workspace.clone());
             fs::create_dir_all(&envd_root)?;
-            let mut embedded = EnvClient::spawn(envd, &envd_root).context("spawn terminal envd")?;
+            let mut embedded =
+                EnvClient::spawn(&envd, &envd_root).context("spawn terminal envd")?;
             embedded.handshake("mskd-terminal")?;
             embedded.initialize()?;
             Box::new(embedded)
@@ -2633,9 +2975,9 @@ impl Daemon {
         let mut env_params = json!({
             "name": "terminal",
             "kind": "managed",
-            "profile": self.envd_profile
+            "profile": target.profile
         });
-        if self.envd_url.is_none() {
+        if !remote {
             env_params["root"] = json!(".");
         }
         let env = client.call_tool("env_create", env_params)?;
@@ -2656,18 +2998,11 @@ impl Daemon {
             .context("terminal session_id")?
             .to_string();
 
-        let data = if let (Some(address), Some(_)) = (&self.envd_data_addr, &self.envd_url) {
-            let tls = if self.envd_data_tls {
-                let ca_pem = match &self.envd_ca {
-                    Some(path) => Some(
-                        fs::read(path)
-                            .with_context(|| format!("read envd CA {}", path.display()))?,
-                    ),
-                    None => None,
-                };
+        let data = if let Some(address) = target.data_addr.as_deref().filter(|_| remote) {
+            let tls = if target.data_tls {
                 Some(msk_mcp::TlsOptions {
-                    server_name: self
-                        .envd_data_tls_name
+                    server_name: target
+                        .data_tls_name
                         .clone()
                         .unwrap_or_else(|| host_part(address)),
                     ca_pem,
@@ -2676,23 +3011,10 @@ impl Daemon {
                 None
             };
             let connected = match &tls {
-                Some(tls) => EnvDataClient::connect_tls(
-                    address,
-                    self.envd_token.as_deref().unwrap_or_default(),
-                    &session_id,
-                    cols,
-                    rows,
-                    None,
-                    tls,
-                ),
-                None => EnvDataClient::connect(
-                    address,
-                    self.envd_token.as_deref().unwrap_or_default(),
-                    &session_id,
-                    cols,
-                    rows,
-                    None,
-                ),
+                Some(tls) => {
+                    EnvDataClient::connect_tls(address, &token, &session_id, cols, rows, None, tls)
+                }
+                None => EnvDataClient::connect(address, &token, &session_id, cols, rows, None),
             };
             match connected {
                 Ok(data) => Some(data),
@@ -3187,6 +3509,10 @@ mod tests {
             requested_mode: "investigate".into(),
             mode: "investigate".into(),
             mode_reason: "explicit".into(),
+            target: "local".into(),
+            target_label: "local".into(),
+            target_kind: "embedded".into(),
+            target_env_id: None,
             headless: false,
             agent_depth: 0,
             parent_task: None,
@@ -3200,6 +3526,7 @@ mod tests {
         let decoded: TaskMetadata = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.goal, metadata.goal);
         assert_eq!(decoded.mode, "investigate");
+        assert_eq!(decoded.target, "local");
     }
 
     #[test]

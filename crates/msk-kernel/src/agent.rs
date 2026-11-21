@@ -100,8 +100,41 @@ pub trait ApprovalHandler {
     fn request(&mut self, request: &ApprovalRequest, cancel: &CancelToken) -> bool;
 }
 
+/// Tools that do not need an envd execution backend. Everything else is
+/// filtered out when a session runs detached.
+pub const KERNEL_TOOLS: &[&str] = &[
+    "artifact_read",
+    "wasm_eval",
+    "http_request",
+    "blackboard_get",
+    "blackboard_set",
+    "blackboard_list",
+    "finding_add",
+    "finding_list",
+    "report_generate",
+    "flag_add",
+    "flag_list",
+    "spawn_agent",
+    "agent_result",
+    "echo",
+];
+
+fn allowed_for(modes: &ModeRegistry, mode: &str, attached: bool) -> HashSet<String> {
+    modes
+        .tool_names(mode)
+        .into_iter()
+        .filter(|name| attached || KERNEL_TOOLS.contains(name))
+        .map(str::to_string)
+        .collect()
+}
+
 pub struct SessionOptions {
     pub env_id: String,
+    /// Current execution target id (`none` for a detached session).
+    pub target: String,
+    pub target_attached: bool,
+    /// Shared with `EnvHost` so subagents inherit the current target.
+    pub target_handle: Option<Arc<Mutex<String>>>,
     pub registry: HashMap<String, RegisteredTool>,
     pub provider: Box<dyn LlmProvider>,
     pub context: ContextManager,
@@ -127,6 +160,9 @@ pub struct SessionOptions {
 
 pub struct Session {
     env_id: String,
+    target: String,
+    target_attached: bool,
+    target_handle: Option<Arc<Mutex<String>>>,
     registry: HashMap<String, RegisteredTool>,
     provider: Box<dyn LlmProvider>,
     context: ContextManager,
@@ -153,15 +189,15 @@ pub struct Session {
 impl Session {
     pub fn new(options: SessionOptions) -> Self {
         let mode = options.mode.clone();
-        let allowed_tools = options.modes.as_ref().map(|modes| {
-            modes
-                .tool_names(&mode)
-                .into_iter()
-                .map(str::to_string)
-                .collect()
-        });
+        let allowed_tools = options
+            .modes
+            .as_ref()
+            .map(|modes| allowed_for(modes, &mode, options.target_attached));
         Self {
             env_id: options.env_id,
+            target: options.target,
+            target_attached: options.target_attached,
+            target_handle: options.target_handle,
             registry: options.registry,
             provider: options.provider,
             context: options.context,
@@ -210,7 +246,13 @@ impl Session {
             return Err(format!("unknown mode: {mode}"));
         }
         let names = modes.tool_names(mode);
-        self.allowed_tools = Some(names.iter().map(|name| (*name).to_string()).collect());
+        self.allowed_tools = Some(
+            names
+                .iter()
+                .filter(|name| self.target_attached || KERNEL_TOOLS.contains(name))
+                .map(|name| (*name).to_string())
+                .collect(),
+        );
         self.mode = mode.to_string();
         if let Some(handle) = &self.mode_handle
             && let Ok(mut current) = handle.lock()
@@ -230,6 +272,52 @@ impl Session {
             json!({"mode": mode, "label": label, "tools": names}),
         );
         Ok(())
+    }
+
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    pub fn env_id(&self) -> &str {
+        &self.env_id
+    }
+
+    /// Re-binds the session to another execution target (or detaches it).
+    /// Called between turns after the new backend has been connected.
+    pub fn set_target(&mut self, target: &str, label: &str, env_id: &str, attached: bool) {
+        self.env_id = env_id.to_string();
+        self.target = target.to_string();
+        self.target_attached = attached;
+        // Session IDs belong to the previous envd environment.
+        self.last_session = None;
+        if let Some(handle) = &self.target_handle
+            && let Ok(mut current) = handle.lock()
+        {
+            *current = target.to_string();
+        }
+        if let Some(modes) = &self.modes {
+            self.allowed_tools = Some(allowed_for(modes, &self.mode, attached));
+        }
+        let prompt = if attached {
+            format!(
+                "Execution target is now {target} ({label}), env_id={env_id}. Previous environment and session IDs are stale; create a new session if the transcript refers to them."
+            )
+        } else {
+            format!(
+                "Execution target is now {target} (no execution environment). Commands, workspace files, network tools and PTY sessions are unavailable until a target is attached."
+            )
+        };
+        self.context.push_pinned(Role::System, prompt);
+        self.emit(
+            "target.switch",
+            json!({
+                "target": target,
+                "label": label,
+                "env_id": env_id,
+                "attached": attached,
+                "tools": self.allowed_tools.as_ref().map(|tools| tools.iter().cloned().collect::<Vec<_>>())
+            }),
+        );
     }
 
     pub fn turns(&self) -> u64 {
@@ -380,7 +468,10 @@ impl Session {
             );
             self.push_tool_error(
                 &call,
-                format!("tool {} is not available in {} mode", call.tool, self.mode),
+                format!(
+                    "tool {} is not available for target {} in {} mode",
+                    call.tool, self.target, self.mode
+                ),
             );
             return;
         }
@@ -722,6 +813,9 @@ mod tests {
             modes: None,
             mode: "exploit".into(),
             mode_handle: None,
+            target: "local".into(),
+            target_attached: true,
+            target_handle: None,
             objects: Arc::new(MemoryObjectStore::new()),
             sink: Arc::new(NullSink),
             max_steps: 4,
@@ -877,6 +971,9 @@ mod tests {
             modes: None,
             mode: "exploit".into(),
             mode_handle: None,
+            target: "local".into(),
+            target_attached: true,
+            target_handle: None,
             objects: Arc::new(MemoryObjectStore::new()),
             sink: Arc::new(NullSink),
             max_steps: 4,
@@ -913,6 +1010,21 @@ mod tests {
     }
 
     #[test]
+    fn detached_sessions_keep_only_kernel_tools() {
+        let modes = ModeRegistry::builtin().unwrap();
+        let attached = allowed_for(&modes, "exploit", true);
+        assert!(attached.contains("exec"));
+        assert!(attached.contains("read_file"));
+        let detached = allowed_for(&modes, "exploit", false);
+        assert!(detached.contains("artifact_read"));
+        assert!(detached.contains("finding_add"));
+        assert!(detached.contains("spawn_agent"));
+        assert!(!detached.contains("exec"));
+        assert!(!detached.contains("read_file"));
+        assert!(!detached.contains("web_request"));
+    }
+
+    #[test]
     fn checkpoint_roundtrip_preserves_context() {
         let path = std::env::temp_dir().join(format!(
             "msk-checkpoint-{}.json",
@@ -933,6 +1045,9 @@ mod tests {
             modes: None,
             mode: "exploit".into(),
             mode_handle: None,
+            target: "local".into(),
+            target_attached: true,
+            target_handle: None,
             objects: Arc::new(MemoryObjectStore::new()),
             sink: Arc::new(NullSink),
             max_steps: 4,
@@ -1050,6 +1165,9 @@ mod tests {
             modes: None,
             mode: "exploit".into(),
             mode_handle: None,
+            target: "local".into(),
+            target_attached: true,
+            target_handle: None,
             objects: Arc::new(MemoryObjectStore::new()),
             sink: Arc::new(NullSink),
             max_steps: 4,

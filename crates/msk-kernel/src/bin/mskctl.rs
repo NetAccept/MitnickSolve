@@ -47,6 +47,9 @@ enum Command {
         /// Agent mode id from modes.json; auto routes by goal.
         #[arg(long, default_value = "auto")]
         mode: String,
+        /// Execution target id (defaults to the daemon's default target).
+        #[arg(long)]
+        target: Option<String>,
         /// Resume a previous task checkpoint.
         #[arg(long)]
         resume_checkpoint: Option<PathBuf>,
@@ -91,6 +94,13 @@ enum Command {
         task: String,
         #[arg(long)]
         mode: String,
+    },
+    /// Attach, switch or detach the execution target of an interactive task.
+    Target {
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        target: String,
     },
     /// List pending approval requests.
     Approvals,
@@ -214,6 +224,7 @@ fn main() -> Result<()> {
             effort,
             base_url,
             mode,
+            target,
             resume_checkpoint,
             interactive,
             stream,
@@ -241,6 +252,9 @@ fn main() -> Result<()> {
             }
             if let Some(base_url) = base_url {
                 params["base_url"] = json!(base_url);
+            }
+            if let Some(target) = target {
+                params["target"] = json!(target);
             }
             if let Some(checkpoint) = resume_checkpoint {
                 params["resume_checkpoint"] = json!(checkpoint.display().to_string());
@@ -277,6 +291,13 @@ fn main() -> Result<()> {
         Command::Mode { task, mode } => {
             let result =
                 client.request(methods::TASK_MODE, json!({"task_id": task, "mode": mode}))?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::Target { task, target } => {
+            let result = client.request(
+                methods::TASK_TARGET,
+                json!({"task_id": task, "target": target}),
+            )?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Approvals => {

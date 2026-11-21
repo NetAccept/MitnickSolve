@@ -35,6 +35,7 @@ pub struct EnvHost {
     pub task_id: Option<String>,
     pub default_provider: String,
     pub mode: Arc<Mutex<String>>,
+    pub target: Arc<Mutex<String>>,
     pub modes: Arc<ModeRegistry>,
     pub permission: PermissionMode,
 }
@@ -64,6 +65,7 @@ impl ControlPlane {
         depth: u32,
         mode: &str,
         permission: PermissionMode,
+        target: &str,
     ) -> std::result::Result<Value, String> {
         if depth >= 2 {
             return Err("subagent depth limit reached (max 2)".into());
@@ -85,7 +87,8 @@ impl ControlPlane {
                     "parent_task": parent_task,
                     "max_steps": max_steps,
                     "max_context_tokens": max_context_tokens,
-                    "mode": mode
+                    "mode": mode,
+                    "target": target
                 }),
             )
             .map_err(|err| err.to_string())
@@ -449,6 +452,11 @@ impl ToolHost for EnvHost {
                     .unwrap_or(50_000)
                     .clamp(4_096, 1_000_000) as usize;
                 let current_mode = self.current_mode();
+                let current_target = self
+                    .target
+                    .lock()
+                    .map(|target| target.clone())
+                    .unwrap_or_default();
                 let child_mode = args
                     .get("mode")
                     .and_then(Value::as_str)
@@ -471,6 +479,7 @@ impl ToolHost for EnvHost {
                     self.agent_depth,
                     &child_mode,
                     self.permission,
+                    &current_target,
                 )?
             } else {
                 let task_id = args
@@ -1290,6 +1299,7 @@ mod tests {
                 task_id: None,
                 default_provider: "scripted".into(),
                 mode: Arc::new(Mutex::new("investigate".into())),
+                target: Arc::new(Mutex::new("local".into())),
                 modes: Arc::new(ModeRegistry::builtin().unwrap()),
                 permission: PermissionMode::Bypass,
             },
